@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.env/
+venv/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE settings
+.vs/
+.vscode/
+
+# Profiling outputs
+profile_*.png
+profile_results.json
+llama_diffusion/build/
+llama_diffusion/out/
+__pycache__/
+*.so
+*.pyd
+*.zip
