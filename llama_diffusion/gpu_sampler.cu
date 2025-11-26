@@ -119,28 +119,6 @@ __global__ void softmax_normalize_kernel(float* probs, const float* row_sum,
     }
 }
 
-// Compute cumulative sum for top-p sampling (per row)
-// This is a simple sequential scan - works well for moderate vocab sizes
-__global__ void compute_cumsum_and_cutoff_kernel(const float* sorted_probs, const int* sorted_indices,
-                                                   int* cutoff_counts, float top_p,
-                                                   int vocab_size, int block_length) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= block_length) return;
-    
-    const float* row_probs = sorted_probs + row * vocab_size;
-    float cumsum = 0.0f;
-    int cutoff = vocab_size;
-    
-    for (int i = 0; i < vocab_size; ++i) {
-        cumsum += row_probs[i];
-        if (cumsum > top_p && i > 0) {
-            cutoff = i + 1;
-            break;
-        }
-    }
-    cutoff_counts[row] = cutoff;
-}
-
 bool check_cuda(cudaError_t err, const char* msg) {
     if (err != cudaSuccess) {
         fprintf(stderr, "[GpuSampler] %s failed: %s\n", msg, cudaGetErrorString(err));
@@ -163,7 +141,6 @@ public:
           d_indices_(nullptr),
           d_row_max_(nullptr),
           d_row_sum_(nullptr),
-          d_cutoff_counts_(nullptr),
           initialized_(false) {
         initialized_ = init();
     }
@@ -174,14 +151,15 @@ public:
         if (d_indices_) cudaFree(d_indices_);
         if (d_row_max_) cudaFree(d_row_max_);
         if (d_row_sum_) cudaFree(d_row_sum_);
-        if (d_cutoff_counts_) cudaFree(d_cutoff_counts_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
     bool is_available() const { return initialized_; }
 
-    bool sample(
-        const std::vector<float>& logits,
+    // Core sampling implementation - works with raw pointer
+    bool sample_impl(
+        const float* logits_ptr,
+        size_t logits_size,
         RemaskingStrategy remasking_strategy,
         std::mt19937& rng,
         std::vector<llama_token>& sampled_tokens,
@@ -194,7 +172,7 @@ public:
         }
 
         const size_t expected = static_cast<size_t>(block_length_) * vocab_size_;
-        if (logits.size() != expected) {
+        if (logits_size != expected) {
             return false;
         }
 
@@ -213,7 +191,7 @@ public:
         ProfilerTimer prepare_timer;
         
         const size_t total_bytes = expected * sizeof(float);
-        if (!check_cuda(cudaMemcpyAsync(d_logits_, logits.data(), total_bytes, cudaMemcpyHostToDevice, stream_), "H2D logits")) {
+        if (!check_cuda(cudaMemcpyAsync(d_logits_, logits_ptr, total_bytes, cudaMemcpyHostToDevice, stream_), "H2D logits")) {
             return false;
         }
 
@@ -252,13 +230,13 @@ public:
         }
         double softmax_ms = softmax_timer.elapsed_ms();
 
-        // ========== Stage 3: Sort probabilities (for top-p) ==========
+        // ========== Stage 3: Sort probabilities (only if needed for top-p/top-k) ==========
         ProfilerTimer sort_timer;
         double sort_ms = 0.0;
         
         auto policy = thrust::cuda::par.on(stream_);
         
-        // Only sort if we need top-p filtering
+        // Only sort if we need top-p filtering or top-k filtering
         const bool need_sort = (config_.top_p < 1.0f) || (config_.top_k > 0 && config_.top_k < vocab_size_);
         
         if (need_sort) {
@@ -394,7 +372,9 @@ public:
         
         if (stats) {
             stats->stage_prepare_ms = prepare_ms;
-            stats->stage_sort_ms = sort_ms + softmax_ms;  // Combined GPU compute
+            stats->stage_softmax_ms = softmax_ms;
+            stats->stage_sort_ms = sort_ms;
+            stats->stage_sample_ms = 0.0;  // No separate GPU sample stage in this version
             stats->stage_d2h_ms = d2h_ms;
             stats->stage_cpu_post_ms = cpu_ms;
         }
@@ -404,6 +384,33 @@ public:
         }
 
         return true;
+    }
+
+    bool sample(
+        const std::vector<float>& logits,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        GpuSamplerStats* stats
+    ) {
+        return sample_impl(logits.data(), logits.size(), remasking_strategy, rng,
+                          sampled_tokens, confidences, token_probs, stats);
+    }
+
+    bool sample_from_ptr(
+        const float* logits_ptr,
+        size_t logits_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        GpuSamplerStats* stats
+    ) {
+        return sample_impl(logits_ptr, logits_size, remasking_strategy, rng,
+                          sampled_tokens, confidences, token_probs, stats);
     }
 
 private:
@@ -429,9 +436,6 @@ private:
         if (!check_cuda(cudaMalloc(&d_row_sum_, block_length_ * sizeof(float)), "cudaMalloc row_sum")) {
             return false;
         }
-        if (!check_cuda(cudaMalloc(&d_cutoff_counts_, block_length_ * sizeof(int)), "cudaMalloc cutoff")) {
-            return false;
-        }
         
         return true;
     }
@@ -446,7 +450,6 @@ private:
     int* d_indices_;
     float* d_row_max_;
     float* d_row_sum_;
-    int* d_cutoff_counts_;
     bool initialized_;
 
     std::vector<float> host_probs_;
@@ -476,6 +479,23 @@ bool GpuSampler::sample(
         return false;
     }
     return impl_->sample(logits, remasking_strategy, rng, sampled_tokens, confidences, token_probs, stats);
+}
+
+bool GpuSampler::sample_from_ptr(
+    const float* logits_ptr,
+    size_t logits_size,
+    RemaskingStrategy remasking_strategy,
+    std::mt19937& rng,
+    std::vector<llama_token>& sampled_tokens,
+    std::vector<float>& confidences,
+    std::vector<std::vector<float>>* token_probs,
+    Stats* stats
+) {
+    if (!impl_) {
+        return false;
+    }
+    return impl_->sample_from_ptr(logits_ptr, logits_size, remasking_strategy, rng, 
+                                   sampled_tokens, confidences, token_probs, stats);
 }
 
 } // namespace diffusion

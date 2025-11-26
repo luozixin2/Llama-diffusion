@@ -107,7 +107,9 @@ public:
         add_metric("telemetry_gpu_logit_pack", telemetry.gpu_logit_pack_ms, telemetry.gpu_logit_pack_calls);
         add_metric("telemetry_gpu_invoke", telemetry.gpu_invoke_ms, telemetry.gpu_invoke_calls);
         add_metric("telemetry_gpu_stage_prepare", telemetry.gpu_stage_prepare_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_stage_softmax", telemetry.gpu_stage_softmax_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_sort", telemetry.gpu_stage_sort_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_stage_sample", telemetry.gpu_stage_sample_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_d2h", telemetry.gpu_stage_d2h_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_cpu_post", telemetry.gpu_stage_cpu_post_ms, telemetry.gpu_success);
         add_metric("telemetry_cpu_sampling", telemetry.cpu_sampling_ms, telemetry.cpu_sampling_calls);

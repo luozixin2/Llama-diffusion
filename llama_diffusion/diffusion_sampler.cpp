@@ -527,6 +527,9 @@ bool DiffusionSampler::try_sample_with_gpu(
         return false;
     }
 
+    // Copy logits from llama context to contiguous buffer
+    // Note: We must use llama_get_logits_ith() because the logits buffer
+    // may not be in the same order as the batch tokens (due to output_ids mapping)
     diffusion::ProfilerTimer pack_timer;
     std::vector<float> logits_batch(static_cast<size_t>(config_.block_length) * n_vocab);
     for (int i = 0; i < config_.block_length; ++i) {
@@ -564,6 +567,7 @@ bool DiffusionSampler::try_sample_with_gpu(
         probs_ptr,
         &gpu_stats
     );
+    
     DiffusionProfiler::instance().record_custom(
         "sampler_gpu_invoke_ms",
         gpu_timer.elapsed_ms()
@@ -579,7 +583,9 @@ bool DiffusionSampler::try_sample_with_gpu(
 
     sampler_metrics_.gpu_success++;
     sampler_metrics_.gpu_stage_prepare_ms += gpu_stats.stage_prepare_ms;
+    sampler_metrics_.gpu_stage_softmax_ms += gpu_stats.stage_softmax_ms;
     sampler_metrics_.gpu_stage_sort_ms += gpu_stats.stage_sort_ms;
+    sampler_metrics_.gpu_stage_sample_ms += gpu_stats.stage_sample_ms;
     sampler_metrics_.gpu_stage_d2h_ms += gpu_stats.stage_d2h_ms;
     sampler_metrics_.gpu_stage_cpu_post_ms += gpu_stats.stage_cpu_post_ms;
 
