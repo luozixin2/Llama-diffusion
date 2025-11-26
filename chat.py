@@ -7,12 +7,13 @@ from transformers import AutoTokenizer
 import sys
 
 class ChatSession:
-    def __init__(self, model, tokenizer, mask_token_id, eos_token_id):
+    def __init__(self, model, tokenizer, mask_token_id, eos_token_id, use_gpu_sampler=False):
         self.model = model
         self.tokenizer = tokenizer
         self.mask_token_id = mask_token_id
         self.eos_token_id = eos_token_id
         self.messages = []
+        self.use_gpu_sampler = use_gpu_sampler
         
     def stream_callback(self, token_ids: list[int]):
         """解码并打印新生成的 token"""
@@ -54,7 +55,8 @@ class ChatSession:
                 denoising_steps=denoising_steps,
                 temperature=temperature,
                 top_p=top_p,
-                stop_token_ids=[self.eos_token_id] if self.eos_token_id is not None else []
+                stop_token_ids=[self.eos_token_id] if self.eos_token_id is not None else [],
+                use_gpu_sampler=self.use_gpu_sampler
             )
             print()  # 换行
             
@@ -143,7 +145,7 @@ def main():
         sys.exit(1)
     
     # 创建对话会话
-    session = ChatSession(model, tokenizer, mask_token_id, eos_token_id)
+    session = ChatSession(model, tokenizer, mask_token_id, eos_token_id, use_gpu_sampler=True)
     
     print("=" * 80)
     print("多轮对话系统已启动!")

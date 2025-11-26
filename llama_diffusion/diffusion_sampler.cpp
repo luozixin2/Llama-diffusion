@@ -1,4 +1,6 @@
 ﻿#include "diffusion_sampler.h"
+#include "gpu_sampler.h"
+#include "diffusion_profiler.h"
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -11,9 +13,23 @@ DiffusionSampler::DiffusionSampler(llama_context* ctx, llama_model* model, const
     : ctx_(ctx), model_(model), config_(config) {
     std::random_device rd;
     rng_.seed(rd());
+
+    reset_sampler_metrics();
+
+    if (config_.enable_gpu_sampler) {
+        const int vocab_size = get_vocab_size();
+        gpu_sampler_ = std::make_unique<GpuSampler>(config_.block_length, vocab_size, config_);
+        if (gpu_sampler_ && gpu_sampler_->is_available()) {
+            use_gpu_sampler_ = true;
+        }
+    }
 }
 
 DiffusionSampler::~DiffusionSampler() {}
+
+void DiffusionSampler::reset_sampler_metrics() {
+    sampler_metrics_.reset();
+}
 
 int DiffusionSampler::get_vocab_size() {
     const llama_vocab* vocab = llama_model_get_vocab(model_);
@@ -206,54 +222,15 @@ void DiffusionSampler::denoise_block(
         std::vector<std::vector<float>> all_probs;
 
         const int n_vocab = get_vocab_size();
-
-        for (int i = 0; i < config_.block_length; i++) {
-            float* logits = llama_get_logits_ith(ctx_, i);
-            if (logits == nullptr) {
-                assert(false && "llama_get_logits_ith returned nullptr!");
-                sampled_tokens[i] = config_.mask_token_id;
-                confidences[i] = 0.0f;
-                continue;
-            }
-            std::vector<float> logits_vec(logits, logits + n_vocab);
-
-            // Apply sampling strategies
-            if (config_.temperature != 1.0f) {
-                for (float& l : logits_vec) l /= config_.temperature;
-            }
-            if (config_.top_k > 0) {
-                apply_top_k(logits_vec, config_.top_k);
-            }
-            if (config_.top_p < 1.0f) {
-                apply_top_p(logits_vec, config_.top_p);
-            }
-
-            float prob;
-            sampled_tokens[i] = sample_token(logits_vec, prob);
-            confidences[i] = prob;
-
-            // Store probabilities for entropy-based remasking
-            if (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED) {
-                float max_logit_val = -INFINITY;
-                for(float l : logits_vec) {
-                    if(!std::isinf(l)) max_logit_val = std::max(max_logit_val, l);
-                }
-                float sum_exp = 0.0f;
-                std::vector<float> probs(logits_vec.size());
-                for (size_t j = 0; j < logits_vec.size(); j++) {
-                    if (!std::isinf(logits_vec[j])) {
-                        probs[j] = std::exp(logits_vec[j] - max_logit_val);
-                        sum_exp += probs[j];
-                    } else {
-                        probs[j] = 0.0f;
-                    }
-                }
-                if (sum_exp > 0.0f) {
-                    for (float& p : probs) p /= sum_exp;
-                }
-                all_probs.push_back(probs);
-            }
-        }
+        const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
+        std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &all_probs : nullptr;
+        sample_block_tokens(
+            n_vocab,
+            need_entropy_probs,
+            sampled_tokens,
+            confidences,
+            entropy_ptr
+        );
 
         llama_batch_free(batch);
 
@@ -431,6 +408,185 @@ llama_token DiffusionSampler::sample_token(const std::vector<float>& logits, flo
     llama_token token = dist(rng_);
     prob = probs[token];
     return token;
+}
+
+bool DiffusionSampler::sample_block_tokens(
+    int n_vocab,
+    bool need_entropy_probs,
+    std::vector<llama_token>& sampled_tokens,
+    std::vector<float>& confidences,
+    std::vector<std::vector<float>>* entropy_probs_storage
+) {
+    diffusion::ProfilerTimer total_timer;
+
+    if (try_sample_with_gpu(
+            n_vocab,
+            need_entropy_probs,
+            sampled_tokens,
+            confidences,
+            entropy_probs_storage)) {
+        DiffusionProfiler::instance().record_custom(
+            "sampler_gpu_total_ms",
+            total_timer.elapsed_ms()
+        );
+        return true;
+    }
+
+    sample_block_on_cpu(
+        n_vocab,
+        sampled_tokens,
+        confidences,
+        entropy_probs_storage
+    );
+    DiffusionProfiler::instance().record_custom(
+        "sampler_cpu_sampling_ms",
+        total_timer.elapsed_ms()
+    );
+    sampler_metrics_.cpu_sampling_ms += total_timer.elapsed_ms();
+    sampler_metrics_.cpu_sampling_calls++;
+    return false;
+}
+
+void DiffusionSampler::sample_block_on_cpu(
+    int n_vocab,
+    std::vector<llama_token>& sampled_tokens,
+    std::vector<float>& confidences,
+    std::vector<std::vector<float>>* entropy_probs_storage
+) {
+    diffusion::ProfilerTimer cpu_timer;
+    if (entropy_probs_storage) {
+        entropy_probs_storage->clear();
+        entropy_probs_storage->reserve(config_.block_length);
+    }
+
+    for (int i = 0; i < config_.block_length; i++) {
+        float* logits = llama_get_logits_ith(ctx_, i);
+        if (logits == nullptr) {
+            sampled_tokens[i] = config_.mask_token_id;
+            confidences[i] = 0.0f;
+            continue;
+        }
+        std::vector<float> logits_vec(logits, logits + n_vocab);
+
+        if (config_.temperature != 1.0f) {
+            for (float& l : logits_vec) l /= config_.temperature;
+        }
+        if (config_.top_k > 0) {
+            apply_top_k(logits_vec, config_.top_k);
+        }
+        if (config_.top_p < 1.0f) {
+            apply_top_p(logits_vec, config_.top_p);
+        }
+
+        float prob;
+        sampled_tokens[i] = sample_token(logits_vec, prob);
+        confidences[i] = prob;
+
+        if (entropy_probs_storage) {
+            float max_logit_val = -INFINITY;
+            for (float l : logits_vec) {
+                if (!std::isinf(l)) {
+                    max_logit_val = std::max(max_logit_val, l);
+                }
+            }
+            float sum_exp = 0.0f;
+            std::vector<float> probs(logits_vec.size());
+            for (size_t j = 0; j < logits_vec.size(); j++) {
+                if (!std::isinf(logits_vec[j])) {
+                    probs[j] = std::exp(logits_vec[j] - max_logit_val);
+                    sum_exp += probs[j];
+                } else {
+                    probs[j] = 0.0f;
+                }
+            }
+            if (sum_exp > 0.0f) {
+                for (float& p : probs) {
+                    p /= sum_exp;
+                }
+            }
+            entropy_probs_storage->push_back(std::move(probs));
+        }
+    }
+
+    DiffusionProfiler::instance().record_custom(
+        "sampler_cpu_loop_ms",
+        cpu_timer.elapsed_ms()
+    );
+    sampler_metrics_.cpu_loop_ms += cpu_timer.elapsed_ms();
+    sampler_metrics_.cpu_loop_calls++;
+}
+
+bool DiffusionSampler::try_sample_with_gpu(
+    int n_vocab,
+    bool need_entropy_probs,
+    std::vector<llama_token>& sampled_tokens,
+    std::vector<float>& confidences,
+    std::vector<std::vector<float>>* entropy_probs_storage
+) {
+    if (!use_gpu_sampler_ || !gpu_sampler_) {
+        return false;
+    }
+
+    diffusion::ProfilerTimer pack_timer;
+    std::vector<float> logits_batch(static_cast<size_t>(config_.block_length) * n_vocab);
+    for (int i = 0; i < config_.block_length; ++i) {
+        float* logits = llama_get_logits_ith(ctx_, i);
+        if (logits == nullptr) {
+            use_gpu_sampler_ = false;
+            return false;
+        }
+        std::copy(
+            logits,
+            logits + n_vocab,
+            logits_batch.begin() + static_cast<size_t>(i) * n_vocab
+        );
+    }
+    DiffusionProfiler::instance().record_custom(
+        "sampler_gpu_logit_pack_ms",
+        pack_timer.elapsed_ms()
+    );
+    sampler_metrics_.gpu_logit_pack_ms += pack_timer.elapsed_ms();
+    sampler_metrics_.gpu_logit_pack_calls++;
+
+    std::vector<std::vector<float>> tmp_probs;
+    std::vector<std::vector<float>>* probs_ptr = (need_entropy_probs && entropy_probs_storage)
+        ? &tmp_probs
+        : nullptr;
+
+    diffusion::ProfilerTimer gpu_timer;
+    GpuSampler::Stats gpu_stats{};
+    bool sampled_with_gpu = gpu_sampler_->sample(
+        logits_batch,
+        config_.remasking_strategy,
+        rng_,
+        sampled_tokens,
+        confidences,
+        probs_ptr,
+        &gpu_stats
+    );
+    DiffusionProfiler::instance().record_custom(
+        "sampler_gpu_invoke_ms",
+        gpu_timer.elapsed_ms()
+    );
+    sampler_metrics_.gpu_invoke_ms += gpu_timer.elapsed_ms();
+    sampler_metrics_.gpu_invoke_calls++;
+
+    if (!sampled_with_gpu) {
+        use_gpu_sampler_ = false;
+        sampler_metrics_.gpu_fail++;
+        return false;
+    }
+
+    sampler_metrics_.gpu_success++;
+    sampler_metrics_.gpu_stage_prepare_ms += gpu_stats.stage_prepare_ms;
+    sampler_metrics_.gpu_stage_sort_ms += gpu_stats.stage_sort_ms;
+    sampler_metrics_.gpu_stage_d2h_ms += gpu_stats.stage_d2h_ms;
+    sampler_metrics_.gpu_stage_cpu_post_ms += gpu_stats.stage_cpu_post_ms;
+
+    if (need_entropy_probs && entropy_probs_storage && probs_ptr) {
+        *entropy_probs_storage = std::move(tmp_probs);
+    }
+    return true;
 }
 
 std::vector<bool> DiffusionSampler::get_transfer_indices_sequential(

@@ -77,3 +77,21 @@ print(output_text)
 3. **量化模型** (可选): 减少内存占用
 4. **运行推理**: 使用 Python 接口
 
+## GPU 采样加速
+
+当 `cmake` 配置中开启 `GGML_CUDA=ON` 时，可以在推理阶段将采样步骤下放到 CUDA：
+
+- C++ `DiffusionConfig` 新增 `enable_gpu_sampler` 字段。
+- Python 绑定 `generate` / `generate_stream` / `generate_with_profiling` 增加 `use_gpu_sampler` 形参。
+- 示例：
+
+```python
+output_tokens = model.generate(
+    prompt=prompt_tokens,
+    mask_token_id=mask_token_id,
+    use_gpu_sampler=True,
+)
+```
+
+`test_profiling.py` 中的 `GPU Sampler` 配置可直接用于对比 CPU 与 GPU 采样阶段的耗时差异，并会同步记录在 `profile_results.json`。
+

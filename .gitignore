@@ -26,3 +26,9 @@ __pycache__/
 *.so
 *.pyd
 *.zip
+
+# GPU build
+build-gpu/
+
+# Profile runs
+profile_runs/

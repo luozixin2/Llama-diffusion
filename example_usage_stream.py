@@ -2,6 +2,8 @@
 """
 使用 llama_diffusion 进行流式推理的示例脚本
 """
+from __future__ import annotations
+
 import llama_diffusion
 from transformers import AutoTokenizer
 import sys
@@ -81,7 +83,8 @@ def main():
             denoising_steps=4,
             temperature=0.8,
             top_p=0.95,
-            stop_token_ids=[eos_token_id] if eos_token_id is not None else []
+            stop_token_ids=[eos_token_id] if eos_token_id is not None else [],
+            use_gpu_sampler=True
         )
         print("\n" + "-" * 20)
         print("Generation finished.")

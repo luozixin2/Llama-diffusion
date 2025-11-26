@@ -384,6 +384,14 @@ def main():
             'remasking_strategy': 'low_confidence_dynamic'
         },
         {
+            'name': 'GPU Sampler',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 8,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True
+        },
+        {
             'name': 'Larger Blocks',
             'gen_length': 128,
             'block_length': 16,
@@ -403,6 +411,22 @@ def main():
             'block_length': 8,
             'denoising_steps': 8,
             'remasking_strategy': 'sequential'
+        },
+        {
+            'name': 'GPU + Larger Blocks',
+            'gen_length': 128,
+            'block_length': 16,
+            'denoising_steps': 8,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True
+        },
+        {
+            'name': 'GPU + Fewer Steps',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 4,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True
         }
     ]
     

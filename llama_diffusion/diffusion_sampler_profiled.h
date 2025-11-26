@@ -16,6 +16,7 @@ public:
         PROFILE_SECTION("total_generation");
         
         DiffusionProfiler::instance().reset();
+        reset_sampler_metrics();
         auto result = generate_internal_profiled(prompt);
         
         return result;

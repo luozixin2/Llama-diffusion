@@ -38,9 +38,21 @@ endmacro()
 # -------------------------------------------------------
 # 1) diffusion_sampler 静态库
 # -------------------------------------------------------
-add_library(diffusion_sampler STATIC
+set(DIFFUSION_SAMPLER_SRCS
     diffusion_sampler.cpp
     diffusion_sampler.h
+    diffusion_types.h
+)
+
+if(GGML_CUDA)
+    list(APPEND DIFFUSION_SAMPLER_SRCS
+        gpu_sampler.cu
+        gpu_sampler.h
+    )
+endif()
+
+add_library(diffusion_sampler STATIC
+    ${DIFFUSION_SAMPLER_SRCS}
 )
 set_target_properties(diffusion_sampler PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -53,13 +65,27 @@ target_include_directories(diffusion_sampler PUBLIC
 )
 target_link_libraries(diffusion_sampler PUBLIC llama) # 已经是关键字 PUBLIC
 safe_link_ggml(diffusion_sampler)
+if(GGML_CUDA)
+    target_compile_definitions(diffusion_sampler PUBLIC DIFFUSION_ENABLE_CUDA=1)
+endif()
 
 # -------------------------------------------------------
 # 2) Profiled version (性能分析版)
 # -------------------------------------------------------
-add_library(diffusion_sampler_profiled STATIC
+set(DIFFUSION_SAMPLER_PROFILED_SRCS
     diffusion_sampler_profiled.cpp
     diffusion_sampler.cpp
+)
+
+if(GGML_CUDA)
+    list(APPEND DIFFUSION_SAMPLER_PROFILED_SRCS
+        gpu_sampler.cu
+        gpu_sampler.h
+    )
+endif()
+
+add_library(diffusion_sampler_profiled STATIC
+    ${DIFFUSION_SAMPLER_PROFILED_SRCS}
 )
 set_target_properties(diffusion_sampler_profiled PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -74,6 +100,9 @@ target_include_directories(diffusion_sampler_profiled PUBLIC
 # 【这里是修改点】将 plain signature 改为 keyword signature
 target_link_libraries(diffusion_sampler_profiled PRIVATE llama) 
 safe_link_ggml(diffusion_sampler_profiled)
+if(GGML_CUDA)
+    target_compile_definitions(diffusion_sampler_profiled PUBLIC DIFFUSION_ENABLE_CUDA=1)
+endif()
 
 # -------------------------------------------------------
 # 3) Python Bindings for Profiled Version

@@ -171,67 +171,16 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
         
         {
             PROFILE_SECTION("token_sampling");
-            
             const int n_vocab = get_vocab_size();
-            
-            for (int i = 0; i < config_.block_length; i++) {
-                PROFILE_SECTION("sample_single_token");
-                
-                float* logits = llama_get_logits_ith(ctx_, i);
-                if (logits == nullptr) {
-                    sampled_tokens[i] = config_.mask_token_id;
-                    confidences[i] = 0.0f;
-                    continue;
-                }
-                
-                std::vector<float> logits_vec(logits, logits + n_vocab);
-                
-                // Apply sampling strategies
-                if (config_.temperature != 1.0f) {
-                    PROFILE_SECTION("apply_temperature");
-                    for (float& l : logits_vec) l /= config_.temperature;
-                }
-                
-                if (config_.top_k > 0) {
-                    PROFILE_SECTION("apply_top_k");
-                    apply_top_k(logits_vec, config_.top_k);
-                }
-                
-                if (config_.top_p < 1.0f) {
-                    PROFILE_SECTION("apply_top_p");
-                    apply_top_p(logits_vec, config_.top_p);
-                }
-                
-                float prob;
-                {
-                    PROFILE_SECTION("sample_from_distribution");
-                    sampled_tokens[i] = sample_token(logits_vec, prob);
-                }
-                confidences[i] = prob;
-                
-                // Store probabilities for entropy-based remasking
-                if (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED) {
-                    PROFILE_SECTION("compute_probabilities");
-                    float max_logit_val = -INFINITY;
-                    for(float l : logits_vec) {
-                        if(!std::isinf(l)) max_logit_val = std::max(max_logit_val, l);
-                    }
-                    float sum_exp = 0.0f;
-                    std::vector<float> probs(logits_vec.size());
-                    for (size_t j = 0; j < logits_vec.size(); j++) {
-                        if (!std::isinf(logits_vec[j])) {
-                            probs[j] = std::exp(logits_vec[j] - max_logit_val);
-                            sum_exp += probs[j];
-                        } else {
-                            probs[j] = 0.0f;
-                        }
-                    }
-                    if (sum_exp > 0.0f) {
-                        for (float& p : probs) p /= sum_exp;
-                    }
-                    all_probs.push_back(probs);
-                }
-            }
+            const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
+            std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &all_probs : nullptr;
+            sample_block_tokens(
+                n_vocab,
+                need_entropy_probs,
+                sampled_tokens,
+                confidences,
+                entropy_ptr
+            );
         }
         
         llama_batch_free(batch);

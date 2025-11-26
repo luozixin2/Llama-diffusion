@@ -40,7 +40,8 @@ public:
         const std::string& remasking_strategy = "low_confidence_dynamic",
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
-        const std::vector<int>& stop_token_ids = {}
+        const std::vector<int>& stop_token_ids = {},
+        bool use_gpu_sampler = false
     ) {
         // Convert prompt to llama_token
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
@@ -57,6 +58,7 @@ public:
         config.eb_threshold = eb_threshold;
         config.mask_token_id = mask_token_id;
         config.stop_token_ids.assign(stop_token_ids.begin(), stop_token_ids.end());
+        config.enable_gpu_sampler = use_gpu_sampler;
         
         // Parse remasking strategy
         if (remasking_strategy == "sequential") {
@@ -106,7 +108,8 @@ public:
         const std::string& remasking_strategy = "low_confidence_dynamic",
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
-        const std::vector<int>& stop_token_ids = {}
+        const std::vector<int>& stop_token_ids = {},
+        bool use_gpu_sampler = false
     ) {
         // Convert prompt to llama_token
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
@@ -123,6 +126,7 @@ public:
         config.eb_threshold = eb_threshold;
         config.mask_token_id = mask_token_id;
         config.stop_token_ids.assign(stop_token_ids.begin(), stop_token_ids.end());
+        config.enable_gpu_sampler = use_gpu_sampler;
         
         // Parse remasking strategy
         if (remasking_strategy == "sequential") {
@@ -210,6 +214,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("confidence_threshold") = 0.85f,
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
+             py::arg("use_gpu_sampler") = false,
              "Generate text using block diffusion\n\n"
              "Args:\n"
              "    prompt: List of token IDs for the prompt\n"
@@ -223,7 +228,8 @@ PYBIND11_MODULE(llama_diffusion, m) {
              "    remasking_strategy: Strategy for selecting tokens ('sequential', 'low_confidence_static', 'low_confidence_dynamic', 'entropy_bounded')\n"
              "    confidence_threshold: Threshold for low_confidence_dynamic strategy\n"
              "    eb_threshold: Entropy budget threshold for entropy_bounded strategy\n"
-             "    stop_token_ids: List of token IDs that stop generation\n\n"
+             "    stop_token_ids: List of token IDs that stop generation\n"
+             "    use_gpu_sampler: Enable CUDA sampling kernels when available\n\n"
              "Returns:\n"
              "    List of generated token IDs")
         .def("generate_stream", &LlamaDiffusionWrapper::generate_stream,
@@ -240,6 +246,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("confidence_threshold") = 0.85f,
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
+             py::arg("use_gpu_sampler") = false,
              py::call_guard<py::gil_scoped_release>(),
              "Generate text using block diffusion with streaming output\n\n"
              "Args:\n"
@@ -255,7 +262,8 @@ PYBIND11_MODULE(llama_diffusion, m) {
              "    remasking_strategy: Strategy for selecting tokens\n"
              "    confidence_threshold: Threshold for low_confidence_dynamic strategy\n"
              "    eb_threshold: Entropy budget threshold for entropy_bounded strategy\n"
-             "    stop_token_ids: List of token IDs that stop generation")
+             "    stop_token_ids: List of token IDs that stop generation\n"
+             "    use_gpu_sampler: Enable CUDA sampling kernels when available")
         .def("get_vocab_size", &LlamaDiffusionWrapper::get_vocab_size,
              "Get the vocabulary size")
         .def("token_to_piece", &LlamaDiffusionWrapper::token_to_piece,

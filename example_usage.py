@@ -52,7 +52,8 @@ def main():
         top_p=1.0,
         remasking_strategy="low_confidence_dynamic",
         confidence_threshold=0.85,
-        stop_token_ids=[eos_token_id]
+        stop_token_ids=[eos_token_id],
+        use_gpu_sampler=True
     )
     
     # 解码
