@@ -11,7 +11,7 @@ namespace py = pybind11;
 class LlamaDiffusionProfiledWrapper {
 public:
     LlamaDiffusionProfiledWrapper(const std::string& model_path, int n_ctx = 32768, int n_gpu_layers = 0) 
-        : n_ctx_(n_ctx), n_gpu_layers_(n_gpu_layers) {
+        : n_ctx_(n_ctx), n_gpu_layers_(n_gpu_layers), cached_ctx_(nullptr), cached_block_length_(0) {
         llama_backend_init();
         
         llama_model_params model_params = llama_model_default_params();
@@ -24,8 +24,45 @@ public:
     }
     
     ~LlamaDiffusionProfiledWrapper() {
+        // Free cached context first
+        if (cached_ctx_) {
+            llama_free(cached_ctx_);
+            cached_ctx_ = nullptr;
+        }
         if (model_) llama_model_free(model_);
         llama_backend_free();
+    }
+    
+    // Get or create a context with the specified block_length
+    // Reuses existing context if block_length matches, otherwise creates new one
+    llama_context* get_or_create_context(int block_length) {
+        // If we have a cached context with matching block_length, reuse it
+        if (cached_ctx_ && cached_block_length_ == block_length) {
+            // Clear KV cache for new generation
+            llama_memory_t memory = llama_get_memory(cached_ctx_);
+            llama_memory_clear(memory, true);
+            return cached_ctx_;
+        }
+        
+        // Block length changed or no cached context - need to create new one
+        if (cached_ctx_) {
+            llama_free(cached_ctx_);
+            cached_ctx_ = nullptr;
+        }
+        
+        // Create new context with block_size matching block_length
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = n_ctx_;
+        ctx_params.n_seq_max = 2; // Allow multiple sequences
+        ctx_params.block_size = block_length; // Set block_size from config
+        
+        cached_ctx_ = llama_init_from_model(model_, ctx_params);
+        if (!cached_ctx_) {
+            throw std::runtime_error("Failed to create context");
+        }
+        
+        cached_block_length_ = block_length;
+        return cached_ctx_;
     }
     
     std::pair<std::vector<int>, py::dict> generate_with_profiling(
@@ -68,15 +105,8 @@ public:
             config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
         }
         
-        llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = n_ctx_;
-        ctx_params.n_seq_max = 2;
-        ctx_params.block_size = block_length;
-        
-        llama_context* ctx = llama_init_from_model(model_, ctx_params);
-        if (!ctx) {
-            throw std::runtime_error("Failed to create context");
-        }
+        // Get or create context (reuses if block_length matches)
+        llama_context* ctx = get_or_create_context(block_length);
         
         diffusion::DiffusionSamplerProfiled sampler(ctx, model_, config);
         std::vector<llama_token> result = sampler.generate_with_profiling(llama_prompt);
@@ -84,7 +114,7 @@ public:
         auto profile_summary = sampler.get_profile_summary();
         const auto& custom_metrics = diffusion::DiffusionProfiler::instance().get_custom_metrics();
         
-        llama_free(ctx);
+        // Note: Context is NOT freed here - it's cached for reuse
         
         // Convert profile summary to Python dict
         py::dict py_profile;
@@ -129,6 +159,10 @@ private:
     llama_model* model_ = nullptr;
     int n_ctx_;
     int n_gpu_layers_;
+    
+    // Context caching for reuse across generate calls
+    llama_context* cached_ctx_;
+    int cached_block_length_;
 };
 
 PYBIND11_MODULE(llama_diffusion_profiled, m) {
