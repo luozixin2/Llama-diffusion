@@ -1,0 +1,13 @@
+[
+  {
+    "config_name": "Block1_Step1_GPU",
+    "dataset_name": "GSM8K",
+    "accuracy": 0.0,
+    "total_samples": 10,
+    "correct_samples": 0,
+    "total_time_sec": 123.0947614996694,
+    "avg_time_per_sample_ms": 12309.47614996694,
+    "tokens_generated": 5120,
+    "throughput_tokens_per_sec": 41.59397148686747
+  }
+]

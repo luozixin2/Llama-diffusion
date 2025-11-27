@@ -1,0 +1,2 @@
+    print(f"  Progress: {i+1}/{len(dataset)}, Acc: {correct/total:.2%}", flush=True), flush=True
+SyntaxError: invalid syntax. Maybe you meant '==' or ':=' instead of '='?

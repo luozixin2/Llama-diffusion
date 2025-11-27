@@ -1,0 +1,57 @@
+[
+  {
+    "config_name": "Block1_Step1_GPU",
+    "dataset_name": "GSM8K",
+    "accuracy": 0.0,
+    "total_samples": 3,
+    "correct_samples": 0,
+    "total_time_sec": 22.374855333240703,
+    "avg_time_per_sample_ms": 7458.285111080234,
+    "tokens_generated": 1536,
+    "throughput_tokens_per_sec": 68.64848854321198
+  },
+  {
+    "config_name": "Block2_Step2_GPU",
+    "dataset_name": "GSM8K",
+    "accuracy": 0.0,
+    "total_samples": 3,
+    "correct_samples": 0,
+    "total_time_sec": 67.36586974398233,
+    "avg_time_per_sample_ms": 22455.289914660778,
+    "tokens_generated": 1536,
+    "throughput_tokens_per_sec": 22.800863491222245
+  },
+  {
+    "config_name": "Block3_Step3_GPU",
+    "dataset_name": "GSM8K",
+    "accuracy": 0.0,
+    "total_samples": 3,
+    "correct_samples": 0,
+    "total_time_sec": 76.02484705112875,
+    "avg_time_per_sample_ms": 25341.61568370958,
+    "tokens_generated": 1536,
+    "throughput_tokens_per_sec": 20.203920949252275
+  },
+  {
+    "config_name": "Block4_Step4_GPU",
+    "dataset_name": "GSM8K",
+    "accuracy": 0.0,
+    "total_samples": 3,
+    "correct_samples": 0,
+    "total_time_sec": 74.11037755478173,
+    "avg_time_per_sample_ms": 24703.459184927244,
+    "tokens_generated": 1536,
+    "throughput_tokens_per_sec": 20.725842327069543
+  },
+  {
+    "config_name": "Block4_Step4_CPU",
+    "dataset_name": "GSM8K",
+    "accuracy": 0.0,
+    "total_samples": 3,
+    "correct_samples": 0,
+    "total_time_sec": 65.36373986816034,
+    "avg_time_per_sample_ms": 21787.91328938678,
+    "tokens_generated": 1536,
+    "throughput_tokens_per_sec": 23.499267378184534
+  }
+]

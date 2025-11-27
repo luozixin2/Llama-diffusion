@@ -1,0 +1,52 @@
+[
+  {
+    "config": "Block1_Step1_GPU",
+    "block_length": 1,
+    "denoising_steps": 1,
+    "gpu_sampler": true,
+    "avg_time_sec": 4.127,
+    "throughput_tokens_per_sec": 62.03,
+    "total_tokens": 1280,
+    "num_runs": 10
+  },
+  {
+    "config": "Block2_Step2_GPU",
+    "block_length": 2,
+    "denoising_steps": 2,
+    "gpu_sampler": true,
+    "avg_time_sec": 2.678,
+    "throughput_tokens_per_sec": 95.6,
+    "total_tokens": 1280,
+    "num_runs": 10
+  },
+  {
+    "config": "Block3_Step3_GPU",
+    "block_length": 3,
+    "denoising_steps": 3,
+    "gpu_sampler": true,
+    "avg_time_sec": 3.986,
+    "throughput_tokens_per_sec": 64.22,
+    "total_tokens": 1280,
+    "num_runs": 10
+  },
+  {
+    "config": "Block4_Step4_GPU",
+    "block_length": 4,
+    "denoising_steps": 4,
+    "gpu_sampler": true,
+    "avg_time_sec": 2.984,
+    "throughput_tokens_per_sec": 85.79,
+    "total_tokens": 1280,
+    "num_runs": 10
+  },
+  {
+    "config": "Block4_Step4_CPU",
+    "block_length": 4,
+    "denoising_steps": 4,
+    "gpu_sampler": false,
+    "avg_time_sec": 5.645,
+    "throughput_tokens_per_sec": 45.35,
+    "total_tokens": 1280,
+    "num_runs": 10
+  }
+]
