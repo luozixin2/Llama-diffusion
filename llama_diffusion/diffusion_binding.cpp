@@ -78,6 +78,7 @@ public:
         ctx_params.n_ctx = n_ctx_;
         ctx_params.n_seq_max = 2; // Allow multiple sequences for streaming
         ctx_params.block_size = block_length; // Set block_size from config
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         
         llama_context* ctx = llama_init_from_model(model_, ctx_params);
         if (!ctx) {
