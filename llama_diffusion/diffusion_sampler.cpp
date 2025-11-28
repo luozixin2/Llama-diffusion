@@ -527,22 +527,16 @@ bool DiffusionSampler::try_sample_with_gpu(
         return false;
     }
 
-    // Copy logits from llama context to contiguous buffer
-    // Note: We must use llama_get_logits_ith() because the logits buffer
-    // may not be in the same order as the batch tokens (due to output_ids mapping)
+    // 使用直接指针访问，避免内存拷贝 - Phase 3 优化
     diffusion::ProfilerTimer pack_timer;
-    std::vector<float> logits_batch(static_cast<size_t>(config_.block_length) * n_vocab);
+    std::vector<float*> logits_ptrs(config_.block_length);
     for (int i = 0; i < config_.block_length; ++i) {
         float* logits = llama_get_logits_ith(ctx_, i);
         if (logits == nullptr) {
             use_gpu_sampler_ = false;
             return false;
         }
-        std::copy(
-            logits,
-            logits + n_vocab,
-            logits_batch.begin() + static_cast<size_t>(i) * n_vocab
-        );
+        logits_ptrs[i] = logits;
     }
     DiffusionProfiler::instance().record_custom(
         "sampler_gpu_logit_pack_ms",
@@ -551,6 +545,19 @@ bool DiffusionSampler::try_sample_with_gpu(
     sampler_metrics_.gpu_logit_pack_ms += pack_timer.elapsed_ms();
     sampler_metrics_.gpu_logit_pack_calls++;
 
+    // 使用 sample_from_ptr 直接传递指针数组
+    std::vector<float> logits_flat;
+    if (config_.block_length > 0) {
+        // 将所有 logits 拼接成一个连续数组
+        size_t total_size = static_cast<size_t>(config_.block_length) * n_vocab;
+        logits_flat.resize(total_size);
+        size_t offset = 0;
+        for (int i = 0; i < config_.block_length; ++i) {
+            std::copy(logits_ptrs[i], logits_ptrs[i] + n_vocab, logits_flat.begin() + offset);
+            offset += n_vocab;
+        }
+    }
+
     std::vector<std::vector<float>> tmp_probs;
     std::vector<std::vector<float>>* probs_ptr = (need_entropy_probs && entropy_probs_storage)
         ? &tmp_probs
@@ -558,8 +565,9 @@ bool DiffusionSampler::try_sample_with_gpu(
 
     diffusion::ProfilerTimer gpu_timer;
     GpuSampler::Stats gpu_stats{};
-    bool sampled_with_gpu = gpu_sampler_->sample(
-        logits_batch,
+    bool sampled_with_gpu = gpu_sampler_->sample_from_ptr(
+        logits_flat.data(),  // 直接传递连续内存指针
+        static_cast<size_t>(config_.block_length) * n_vocab,
         config_.remasking_strategy,
         rng_,
         sampled_tokens,
