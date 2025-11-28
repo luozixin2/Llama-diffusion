@@ -16,6 +16,7 @@ public:
         
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = n_gpu_layers;
+        model_params.split_mode = LLAMA_SPLIT_MODE_ROW;
         
         model_ = llama_model_load_from_file(model_path.c_str(), model_params);
         if (!model_) {
@@ -72,6 +73,7 @@ public:
         ctx_params.n_ctx = n_ctx_;
         ctx_params.n_seq_max = 2;
         ctx_params.block_size = block_length;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         
         llama_context* ctx = llama_init_from_model(model_, ctx_params);
         if (!ctx) {
