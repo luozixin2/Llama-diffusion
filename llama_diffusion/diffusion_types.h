@@ -20,6 +20,7 @@ struct DiffusionConfig {
     float temperature = 1.0f;
     int top_k = 0;
     float top_p = 1.0f;
+    float repetition_penalty = 1.0f;  // 重复惩罚：>1.0降低重复token的概率，<1.0增加重复token的概率
     float confidence_threshold = 0.85f;
     float eb_threshold = 0.35f;
     llama_token mask_token_id = 0;

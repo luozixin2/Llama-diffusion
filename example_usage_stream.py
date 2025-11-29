@@ -80,10 +80,13 @@ def main():
             mask_token_id=mask_token_id,
             gen_length=512,
             block_length=4,
-            denoising_steps=4,
-            temperature=0.8,
-            top_p=0.95,
+            denoising_steps=4,  # 去噪步数
+            temperature=0.95,  # 更高的temperature
+            top_p=0.95,  # 标准top_p
+            repetition_penalty=1.05,  # 使用repetition_penalty抑制重复输出（>1.0降低重复概率，值越大抑制越强）
             stop_token_ids=[eos_token_id] if eos_token_id is not None else [],
+            remasking_strategy="low_confidence_dynamic",  # 使用动态低置信度策略
+            confidence_threshold=0.85,  # 标准置信度阈值
             use_gpu_sampler=True
         )
         print("\n" + "-" * 20)

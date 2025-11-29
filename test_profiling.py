@@ -330,8 +330,12 @@ class DiffusionProfiler:
         print(f"\nVisualization saved to {output_file}")
         plt.close()
     
-    def export_results(self, results: List[Dict], output_file: str = 'profile_results.json'):
-        """导出结果到JSON"""
+    def export_results(self, results: List[Dict], output_file: str = 'profile_results.json', archive: bool = True):
+        """导出结果到JSON，并可选择归档到profile_runs目录"""
+        import os
+        from datetime import datetime
+        import shutil
+        
         export_data = []
         
         for result in results:
@@ -360,68 +364,91 @@ class DiffusionProfiler:
             json.dump(export_data, f, indent=2)
         
         print(f"\nResults exported to {output_file}")
+        
+        if archive:
+            archive_dir = 'profile_runs'
+            if not os.path.exists(archive_dir):
+                os.makedirs(archive_dir)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            archive_subdir = os.path.join(archive_dir, timestamp)
+            os.makedirs(archive_subdir, exist_ok=True)
+            
+            # 复制JSON文件
+            archive_json = os.path.join(archive_subdir, output_file)
+            shutil.copy2(output_file, archive_json)
+            
+            # 复制所有profile图片
+            for i in range(len(results)):
+                profile_png = f'profile_{i}.png'
+                if os.path.exists(profile_png):
+                    shutil.copy2(profile_png, os.path.join(archive_subdir, profile_png))
+            
+            print(f"Results archived to {archive_subdir}")
 
 
 def main():
     """示例测试"""
     # 配置
     MODEL_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
-    MASK_TOKEN_ID = 151669  # 根据你的模型调整
+    TOKENIZER_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
     
-    # 示例 prompt
-    prompt = [1, 2, 3, 4, 5]  # 替换为实际的 token IDs
+    # 加载tokenizer获取真实的prompt
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
+    MASK_TOKEN_ID = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+    
+    # 使用真实的prompt
+    messages = [{"role": "user", "content": "写一个关于一个机器人第一次发现音乐的短篇故事。"}]
+    prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
     
     # 初始化 profiler
     profiler = DiffusionProfiler(MODEL_PATH, n_ctx=8192, n_gpu_layers=35)
     
-    # 定义测试配置
+    # 定义测试配置（仅包含质量过关的配置）
     test_configs = [
+        # Baseline配置（用于对比）
         {
-            'name': 'Baseline',
+            'name': 'Baseline (block=8, steps=8)',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic'
         },
         {
-            'name': 'GPU Sampler',
+            'name': 'Baseline (block=4, steps=4)',
             'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
-        },
-        {
-            'name': 'Larger Blocks',
-            'gen_length': 128,
-            'block_length': 16,
-            'denoising_steps': 8,
+            'block_length': 4,
+            'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic'
         },
         {
-            'name': 'Fewer Steps',
+            'name': 'Baseline (block=8, steps=4)',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic'
         },
+        # GPU加速的Baseline
         {
-            'name': 'Sequential Strategy',
+            'name': 'Baseline (block=8, steps=8) + GPU',
             'gen_length': 128,
             'block_length': 8,
-            'denoising_steps': 8,
-            'remasking_strategy': 'sequential'
-        },
-        {
-            'name': 'GPU + Larger Blocks',
-            'gen_length': 128,
-            'block_length': 16,
             'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True
         },
         {
-            'name': 'GPU + Fewer Steps',
+            'name': 'Baseline (block=4, steps=4) + GPU',
+            'gen_length': 128,
+            'block_length': 4,
+            'denoising_steps': 4,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True
+        },
+        {
+            'name': 'Baseline (block=8, steps=4) + GPU',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 4,
