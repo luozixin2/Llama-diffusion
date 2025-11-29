@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cassert>
 #include <vector>
-#include <unordered_map>
 
 namespace diffusion {
 
@@ -222,14 +221,6 @@ void DiffusionSampler::denoise_block(
         std::vector<float> confidences(config_.block_length);
         std::vector<std::vector<float>> all_probs;
 
-        // 收集已生成的token作为repetition_penalty的历史（当前block中非mask的token）
-        std::vector<llama_token> prev_tokens;
-        for (llama_token token : current_block) {
-            if (token != config_.mask_token_id) {
-                prev_tokens.push_back(token);
-            }
-        }
-
         const int n_vocab = get_vocab_size();
         const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
         std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &all_probs : nullptr;
@@ -238,8 +229,7 @@ void DiffusionSampler::denoise_block(
             need_entropy_probs,
             sampled_tokens,
             confidences,
-            entropy_ptr,
-            prev_tokens
+            entropy_ptr
         );
 
         llama_batch_free(batch);
@@ -270,12 +260,6 @@ void DiffusionSampler::denoise_block(
                 break;
             case RemaskingStrategy::ENTROPY_BOUNDED:
                 transfer_indices = get_transfer_indices_entropy_bounded(current_block, all_probs);
-                break;
-            case RemaskingStrategy::ITERATIVE_REFINEMENT:
-                // 迭代细化策略：在一步中进行多轮细化，相当于两步并作一步
-                transfer_indices = get_transfer_indices_iterative_refinement_internal(
-                    current_block, sampled_tokens, confidences, num_transfer, step, 
-                    config_.denoising_steps, block_start, memory);
                 break;
             default:
                 transfer_indices = get_transfer_indices_low_conf_static(current_block, confidences, num_transfer);
@@ -398,33 +382,6 @@ void DiffusionSampler::apply_top_p(std::vector<float>& logits, float p) {
     }
 }
 
-void DiffusionSampler::apply_repetition_penalty(std::vector<float>& logits, const std::vector<llama_token>& prev_tokens, float penalty) {
-    if (penalty == 1.0f || prev_tokens.empty()) {
-        return;  // 无惩罚或没有历史token
-    }
-    
-    // 统计历史token的出现频率
-    std::unordered_map<llama_token, int> token_counts;
-    for (llama_token token : prev_tokens) {
-        token_counts[token]++;
-    }
-    
-    // 对出现过的token应用惩罚
-    for (const auto& pair : token_counts) {
-        llama_token token = pair.first;
-        int count = pair.second;
-        if (token >= 0 && static_cast<size_t>(token) < logits.size()) {
-            // 惩罚公式：logits[token] = logits[token] / (penalty ^ count)
-            // 如果penalty > 1.0，重复次数越多，logits降低越多
-            if (logits[token] > 0.0f) {
-                logits[token] = logits[token] / std::pow(penalty, count);
-            } else {
-                logits[token] = logits[token] * std::pow(penalty, count);
-            }
-        }
-    }
-}
-
 llama_token DiffusionSampler::sample_token(const std::vector<float>& logits, float& prob) {
     float max_logit_val = -INFINITY;
     for(float l : logits) {
@@ -458,8 +415,7 @@ bool DiffusionSampler::sample_block_tokens(
     bool need_entropy_probs,
     std::vector<llama_token>& sampled_tokens,
     std::vector<float>& confidences,
-    std::vector<std::vector<float>>* entropy_probs_storage,
-    const std::vector<llama_token>& prev_tokens
+    std::vector<std::vector<float>>* entropy_probs_storage
 ) {
     diffusion::ProfilerTimer total_timer;
 
@@ -480,8 +436,7 @@ bool DiffusionSampler::sample_block_tokens(
         n_vocab,
         sampled_tokens,
         confidences,
-        entropy_probs_storage,
-        prev_tokens
+        entropy_probs_storage
     );
     DiffusionProfiler::instance().record_custom(
         "sampler_cpu_sampling_ms",
@@ -496,8 +451,7 @@ void DiffusionSampler::sample_block_on_cpu(
     int n_vocab,
     std::vector<llama_token>& sampled_tokens,
     std::vector<float>& confidences,
-    std::vector<std::vector<float>>* entropy_probs_storage,
-    const std::vector<llama_token>& prev_tokens
+    std::vector<std::vector<float>>* entropy_probs_storage
 ) {
     diffusion::ProfilerTimer cpu_timer;
     if (entropy_probs_storage) {
@@ -517,12 +471,6 @@ void DiffusionSampler::sample_block_on_cpu(
         if (config_.temperature != 1.0f) {
             for (float& l : logits_vec) l /= config_.temperature;
         }
-        
-        // 应用repetition_penalty（在top_k和top_p之前应用）
-        if (config_.repetition_penalty != 1.0f && !prev_tokens.empty()) {
-            apply_repetition_penalty(logits_vec, prev_tokens, config_.repetition_penalty);
-        }
-        
         if (config_.top_k > 0) {
             apply_top_k(logits_vec, config_.top_k);
         }
@@ -774,199 +722,6 @@ std::vector<bool> DiffusionSampler::get_transfer_indices_entropy_bounded(
     }
     if (!any_selected && !entropy_indices.empty()) {
         result[entropy_indices[0].second] = true;
-    }
-    
-    return result;
-}
-
-std::vector<bool> DiffusionSampler::get_transfer_indices_iterative_refinement_internal(
-    const std::vector<llama_token>& block,
-    std::vector<llama_token>& sampled_tokens,  // 非const，用于更新细化后的token
-    const std::vector<float>& confidences,
-    int num_transfer,
-    int current_step,
-    int total_steps,
-    int block_start,
-    llama_memory_t memory
-) {
-    std::vector<bool> result(block.size(), false);
-    std::vector<llama_token> working_block = block;
-    int total_transferred = 0;
-    const int max_refinement_rounds = config_.refinement_rounds;  // 使用配置的细化轮数
-    
-    // 动态阈值：根据剩余步骤调整
-    int remaining_steps = total_steps - current_step;
-    float base_threshold = config_.confidence_threshold;
-    float min_threshold = 0.5f;
-    float dynamic_threshold = (remaining_steps == 1) ? min_threshold : 
-                             base_threshold * (static_cast<float>(remaining_steps - 1) / static_cast<float>(total_steps - 1)) + 
-                             min_threshold * (1.0f - static_cast<float>(remaining_steps - 1) / static_cast<float>(total_steps - 1));
-    
-    // 第一轮：转移高置信度token（基于初始预测）
-    std::vector<std::pair<float, size_t>> initial_candidates;
-    for (size_t i = 0; i < block.size(); i++) {
-        if (block[i] == config_.mask_token_id) {
-            initial_candidates.push_back({confidences[i], i});
-        }
-    }
-    std::sort(initial_candidates.begin(), initial_candidates.end(), 
-             [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    // 第一轮转移：转移所有超过阈值的token
-    for (const auto& pair : initial_candidates) {
-        if (total_transferred >= num_transfer) break;
-        if (pair.first >= dynamic_threshold) {
-            result[pair.second] = true;
-            working_block[pair.second] = sampled_tokens[pair.second];
-            total_transferred++;
-        }
-    }
-    
-    // 如果第一轮已经转移了足够的token，直接返回
-    if (total_transferred >= num_transfer) {
-        return result;
-    }
-    
-    // 多轮细化：每轮转移token后，重新评估剩余token
-    std::vector<float> refined_confidences = confidences;  // 存储细化后的置信度
-    for (int round = 1; round < max_refinement_rounds && total_transferred < num_transfer; round++) {
-        // 检查是否还有masked token
-        bool has_remaining = false;
-        for (llama_token token : working_block) {
-            if (token == config_.mask_token_id) {
-                has_remaining = true;
-                break;
-            }
-        }
-        if (!has_remaining) break;
-        
-        // 进行refinement decode以更新剩余token的预测
-        llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
-        
-        llama_batch refinement_batch = llama_batch_init(config_.block_length, 0, 1);
-        for (int i = 0; i < config_.block_length; i++) {
-            refinement_batch.token[i] = working_block[i];
-            refinement_batch.pos[i] = static_cast<llama_pos>(block_start + i);
-            refinement_batch.n_seq_id[i] = 1;
-            refinement_batch.seq_id[i][0] = 0;
-            refinement_batch.logits[i] = (working_block[i] == config_.mask_token_id);
-        }
-        refinement_batch.n_tokens = config_.block_length;
-        
-        if (llama_decode(ctx_, refinement_batch) != 0) {
-            llama_batch_free(refinement_batch);
-            break;
-        }
-        
-        // 重新计算剩余masked token的置信度并重新采样
-        const int n_vocab = get_vocab_size();
-        std::vector<std::pair<float, size_t>> refined_candidates;
-        std::vector<llama_token> refined_tokens(working_block.size(), 0);  // 存储细化后重新采样的token
-        
-        // 收集已转移的token作为repetition_penalty的历史
-        std::vector<llama_token> prev_tokens_refinement;
-        for (size_t i = 0; i < working_block.size(); i++) {
-            if (result[i] && working_block[i] != config_.mask_token_id) {
-                prev_tokens_refinement.push_back(working_block[i]);
-            }
-        }
-        
-        for (size_t i = 0; i < working_block.size(); i++) {
-            if (working_block[i] == config_.mask_token_id && !result[i]) {
-                float* logits = llama_get_logits_ith(ctx_, i);
-                if (logits != nullptr) {
-                    std::vector<float> logits_vec(logits, logits + n_vocab);
-                    if (config_.temperature != 1.0f) {
-                        for (float& l : logits_vec) l /= config_.temperature;
-                    }
-                    
-                    // 应用repetition_penalty（在top_k和top_p之前应用）
-                    if (config_.repetition_penalty != 1.0f && !prev_tokens_refinement.empty()) {
-                        apply_repetition_penalty(logits_vec, prev_tokens_refinement, config_.repetition_penalty);
-                    }
-                    
-                    // 应用top_k和top_p
-                    if (config_.top_k > 0 && config_.top_k < n_vocab) {
-                        apply_top_k(logits_vec, config_.top_k);
-                    }
-                    if (config_.top_p < 1.0f) {
-                        apply_top_p(logits_vec, config_.top_p);
-                    }
-                    
-                    float max_logit = *std::max_element(logits_vec.begin(), logits_vec.end());
-                    float sum_exp = 0.0f;
-                    for (float l : logits_vec) {
-                        sum_exp += std::exp(l - max_logit);
-                    }
-                    
-                    // 重新采样token
-                    float prob;
-                    llama_token new_token = sample_token(logits_vec, prob);
-                    refined_tokens[i] = new_token;
-                    sampled_tokens[i] = new_token;  // 更新sampled_tokens，使其包含细化后的token
-                    
-                    int max_idx = std::max_element(logits_vec.begin(), logits_vec.end()) - logits_vec.begin();
-                    float new_conf = std::exp(logits_vec[max_idx] - max_logit) / sum_exp;
-                    refined_confidences[i] = new_conf;
-                    refined_candidates.push_back({new_conf, i});
-                } else {
-                    refined_candidates.push_back({refined_confidences[i], i});
-                    refined_tokens[i] = sampled_tokens[i];  // 回退到原始采样
-                }
-            }
-        }
-        
-        llama_batch_free(refinement_batch);
-        
-        if (refined_candidates.empty()) break;
-        
-        // 按细化后的置信度降序排序
-        std::sort(refined_candidates.begin(), refined_candidates.end(), 
-                 [](const auto& a, const auto& b) { return a.first > b.first; });
-        
-        // 转移细化后高置信度的token（使用重新采样的token）
-        int transferred_this_round = 0;
-        for (const auto& pair : refined_candidates) {
-            if (total_transferred >= num_transfer) break;
-            // 使用更宽松的阈值，因为这是细化后的预测
-            float round_threshold = dynamic_threshold * 0.8f;  // 稍微降低阈值
-            if (pair.first >= round_threshold || transferred_this_round == 0) {
-                result[pair.second] = true;
-                working_block[pair.second] = refined_tokens[pair.second];  // 使用细化后重新采样的token
-                total_transferred++;
-                transferred_this_round++;
-            }
-        }
-        
-        // 如果这一轮没有转移token，退出循环
-        if (transferred_this_round == 0) break;
-    }
-    
-    // 确保至少转移了num_transfer个token（如果还有剩余）
-    if (total_transferred < num_transfer) {
-        std::vector<std::pair<float, size_t>> remaining;
-        for (size_t i = 0; i < block.size(); i++) {
-            if (block[i] == config_.mask_token_id && !result[i]) {
-                // 使用细化后的置信度（如果可用），否则使用原始置信度
-                float conf = (i < refined_confidences.size()) ? refined_confidences[i] : confidences[i];
-                remaining.push_back({conf, i});
-            }
-        }
-        std::sort(remaining.begin(), remaining.end(), 
-                 [](const auto& a, const auto& b) { return a.first > b.first; });  // 按置信度降序
-        int need_more = num_transfer - total_transferred;
-        for (int i = 0; i < std::min(need_more, static_cast<int>(remaining.size())); i++) {
-            result[remaining[i].second] = true;
-        }
-    }
-    
-    // 在最后一步，确保所有剩余的masked token都被转移
-    if (remaining_steps == 1) {
-        for (size_t i = 0; i < block.size(); i++) {
-            if (block[i] == config_.mask_token_id && !result[i]) {
-                result[i] = true;
-            }
-        }
     }
     
     return result;

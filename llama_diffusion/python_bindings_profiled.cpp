@@ -37,13 +37,11 @@ public:
         float temperature = 1.0f,
         int top_k = 0,
         float top_p = 1.0f,
-        float repetition_penalty = 1.0f,
         const std::string& remasking_strategy = "low_confidence_dynamic",
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
         const std::vector<int>& stop_token_ids = {},
-        bool use_gpu_sampler = false,
-        int refinement_rounds = 3
+        bool use_gpu_sampler = false
     ) {
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
         
@@ -54,10 +52,8 @@ public:
         config.temperature = temperature;
         config.top_k = top_k;
         config.top_p = top_p;
-        config.repetition_penalty = repetition_penalty;
         config.confidence_threshold = confidence_threshold;
         config.eb_threshold = eb_threshold;
-        config.refinement_rounds = refinement_rounds;
         config.mask_token_id = mask_token_id;
         config.stop_token_ids.assign(stop_token_ids.begin(), stop_token_ids.end());
         config.enable_gpu_sampler = use_gpu_sampler;
@@ -70,8 +66,6 @@ public:
             config.remasking_strategy = diffusion::RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC;
         } else if (remasking_strategy == "entropy_bounded") {
             config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
-        } else if (remasking_strategy == "iterative_refinement") {
-            config.remasking_strategy = diffusion::RemaskingStrategy::ITERATIVE_REFINEMENT;
         }
         
         llama_context_params ctx_params = llama_context_default_params();
@@ -155,13 +149,11 @@ PYBIND11_MODULE(llama_diffusion_profiled, m) {
              py::arg("temperature") = 1.0f,
              py::arg("top_k") = 0,
              py::arg("top_p") = 1.0f,
-             py::arg("repetition_penalty") = 1.0f,
              py::arg("remasking_strategy") = "low_confidence_dynamic",
              py::arg("confidence_threshold") = 0.85f,
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
              py::arg("use_gpu_sampler") = false,
-             py::arg("refinement_rounds") = 3,
              "Generate with detailed performance profiling\n\n"
              "Returns:\n"
              "    tuple: (generated_tokens, profile_dict)")

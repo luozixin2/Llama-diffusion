@@ -78,7 +78,6 @@ public:
 
     void apply_top_k(std::vector<float>& logits, int k);
     void apply_top_p(std::vector<float>& logits, float p);
-    void apply_repetition_penalty(std::vector<float>& logits, const std::vector<llama_token>& prev_tokens, float penalty);
     llama_token sample_token(const std::vector<float>& logits, float& prob);
 
     std::vector<bool> get_transfer_indices_sequential(
@@ -104,17 +103,6 @@ public:
         const std::vector<std::vector<float>>& token_probs
     );
 
-    std::vector<bool> get_transfer_indices_iterative_refinement_internal(
-        const std::vector<llama_token>& block,
-        std::vector<llama_token>& sampled_tokens,  // 非const，用于更新细化后的token
-        const std::vector<float>& confidences,
-        int num_transfer,
-        int current_step,
-        int total_steps,
-        int block_start,
-        llama_memory_t memory
-    );
-
     bool should_stop(const std::vector<llama_token>& tokens, size_t start_idx);
 
 protected:
@@ -123,16 +111,14 @@ protected:
         bool need_entropy_probs,
         std::vector<llama_token>& sampled_tokens,
         std::vector<float>& confidences,
-        std::vector<std::vector<float>>* entropy_probs_storage,
-        const std::vector<llama_token>& prev_tokens = {}  // 用于repetition_penalty的历史token
+        std::vector<std::vector<float>>* entropy_probs_storage
     );
 
     void sample_block_on_cpu(
         int n_vocab,
         std::vector<llama_token>& sampled_tokens,
         std::vector<float>& confidences,
-        std::vector<std::vector<float>>* entropy_probs_storage,
-        const std::vector<llama_token>& prev_tokens = {}  // 用于repetition_penalty的历史token
+        std::vector<std::vector<float>>* entropy_probs_storage
     );
 
     bool try_sample_with_gpu(

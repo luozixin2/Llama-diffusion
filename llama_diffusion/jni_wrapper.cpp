@@ -151,10 +151,8 @@ Java_com_yourpackage_LlamaDiffusion_nativeGenerate(
     } else if (strategy == "low_confidence_dynamic") {
         config.remasking_strategy = diffusion::RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC;
     } else if (strategy == "entropy_bounded") {
-            config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
-        } else if (strategy == "iterative_refinement") {
-            config.remasking_strategy = diffusion::RemaskingStrategy::ITERATIVE_REFINEMENT;
-        } else {
+        config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
+    } else {
         LOGE("Unknown remasking strategy: %s", strategy.c_str());
         return nullptr;
     }
@@ -247,10 +245,8 @@ Java_com_yourpackage_LlamaDiffusion_nativeGenerateStream(
     } else if (strategy == "low_confidence_dynamic") {
         config.remasking_strategy = diffusion::RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC;
     } else if (strategy == "entropy_bounded") {
-            config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
-        } else if (strategy == "iterative_refinement") {
-            config.remasking_strategy = diffusion::RemaskingStrategy::ITERATIVE_REFINEMENT;
-        } else {
+        config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
+    } else {
         LOGE("Unknown remasking strategy: %s", strategy.c_str());
         return;
     }
