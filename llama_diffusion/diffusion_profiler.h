@@ -9,6 +9,17 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <sstream>
+#include <cstring>
+
+// Android logging support
+#ifdef __ANDROID__
+#include <android/log.h>
+#define ANDROID_LOG_TAG "LlamaDiffusionProfiler"
+#define PROFILER_LOGI(...) __android_log_print(ANDROID_LOG_INFO, ANDROID_LOG_TAG, __VA_ARGS__)
+#else
+#define PROFILER_LOGI(...) // No-op on non-Android
+#endif
 
 namespace diffusion {
 
@@ -105,6 +116,24 @@ public:
         stats_.clear();
         timers_.clear();
         custom_metrics_.clear();
+    }
+    
+    // Print report to Android log
+    void print_report_android() const {
+#ifdef __ANDROID__
+        std::ostringstream oss;
+        print_report(oss);
+        std::string report = oss.str();
+        
+        // Split into lines and log each line
+        std::istringstream iss(report);
+        std::string line;
+        while (std::getline(iss, line)) {
+            PROFILER_LOGI("%s", line.c_str());
+        }
+#else
+        print_report(std::cout);
+#endif
     }
     
     void print_report(std::ostream& os = std::cout) const {

@@ -113,61 +113,106 @@ void DiffusionSampler::generate_stream(
     const std::vector<llama_token>& prompt,
     std::function<void(const std::vector<int>&)> callback
 ) {
+    PROFILE_SECTION("total_generation_stream");
+    
     const size_t prompt_length = prompt.size();
+    
+    // Get context size limit
+    const uint32_t ctx_size_u = llama_n_ctx(ctx_);
+    const int ctx_size = static_cast<int>(ctx_size_u);
+    if (ctx_size == 0) {
+        return;  // Invalid context
+    }
+    
     const int num_blocks = static_cast<int>((prompt_length + config_.gen_length + config_.block_length - 1) / config_.block_length);
     const size_t total_length = static_cast<size_t>(num_blocks) * config_.block_length;
+    
+    // Ensure total length doesn't exceed context size
+    if (total_length > static_cast<size_t>(ctx_size)) {
+        return;  // Sequence too long for context
+    }
     
     std::vector<llama_token> sequence(total_length, config_.mask_token_id);
     if (prompt_length > total_length) {
         assert(false && "Prompt length is greater than total sequence length!");
+        return;
     }
     std::copy(prompt.begin(), prompt.end(), sequence.begin());
 
     const int prefill_blocks = static_cast<int>(prompt_length / config_.block_length);
     const size_t prefill_length = static_cast<size_t>(prefill_blocks) * config_.block_length;
+    DiffusionProfiler::instance().record_custom("num_blocks", num_blocks);
+    DiffusionProfiler::instance().record_custom("total_length", total_length);
+    DiffusionProfiler::instance().record_custom("prompt_length", prompt_length);
+    DiffusionProfiler::instance().record_custom("prefill_length", prefill_length);
 
+    // Prefill: process all prompt tokens in one batch (llama.cpp will handle internal batching)
     if (prefill_length > 0) {
-        llama_batch batch = llama_batch_init(static_cast<int>(prefill_length), 0, 1);
+        PROFILE_SECTION("prefill_phase");
+        
+        {
+            PROFILE_SECTION("prefill_batch_preparation");
+            llama_batch batch = llama_batch_init(static_cast<int>(prefill_length), 0, 1);
 
-        for (size_t i = 0; i < prefill_length; i++) {
-            batch.token[i] = sequence[i];
-            batch.pos[i] = static_cast<llama_pos>(i);
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = false;
-        }
-        batch.n_tokens = static_cast<int>(prefill_length);
+            for (size_t i = 0; i < prefill_length; i++) {
+                batch.token[i] = sequence[i];
+                batch.pos[i] = static_cast<llama_pos>(i);
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = false;  // No logits needed for prefill
+            }
+            batch.n_tokens = static_cast<int>(prefill_length);
 
-        if (llama_decode(ctx_, batch) != 0) {
-            assert(false && "llama_decode failed in prefill phase!");
+            {
+                PROFILE_SECTION("prefill_llama_decode");
+                if (llama_decode(ctx_, batch) != 0) {
+                    llama_batch_free(batch);
+                    return;  // Decode failed
+                }
+            }
+            
             llama_batch_free(batch);
-            return;
         }
         
-        llama_batch_free(batch);
+        DiffusionProfiler::instance().record_custom("prefill_tokens", prefill_length);
     }
 
     std::vector<int> num_transfer_tokens_per_step = get_num_transfer_tokens(config_.block_length, config_.denoising_steps);
 
-    for (int block_idx = prefill_blocks; block_idx < num_blocks; block_idx++) {
-        const int block_start = block_idx * config_.block_length;
-        const int block_end = block_start + config_.block_length;
+    // Generation phase
+    {
+        PROFILE_SECTION("generation_phase");
         
-        std::vector<llama_token> current_block(
-            sequence.begin() + block_start,
-            sequence.begin() + block_end
-        );
+        for (int block_idx = prefill_blocks; block_idx < num_blocks; block_idx++) {
+            std::string block_section = "block_" + std::to_string(block_idx);
+            PROFILE_SECTION(block_section.c_str());
+            
+            const int block_start = block_idx * config_.block_length;
+            const int block_end = block_start + config_.block_length;
+            
+            std::vector<llama_token> current_block(
+                sequence.begin() + block_start,
+                sequence.begin() + block_end
+            );
 
-        denoise_block(current_block, block_idx, num_transfer_tokens_per_step);
-        finalize_block(current_block, block_idx);
-        
-        std::copy(current_block.begin(), current_block.end(), sequence.begin() + block_start);
-        
-        // Stream callback
-        callback(std::vector<int>(current_block.begin(), current_block.end()));
+            denoise_block(current_block, block_idx, num_transfer_tokens_per_step);
+            
+            {
+                PROFILE_SECTION("finalize_block");
+                finalize_block(current_block, block_idx);
+            }
+            
+            std::copy(current_block.begin(), current_block.end(), sequence.begin() + block_start);
+            
+            {
+                PROFILE_SECTION("stream_callback");
+                callback(std::vector<int>(current_block.begin(), current_block.end()));
+            }
 
-        if (should_stop(sequence, prompt_length)) {
-            return;
+            if (should_stop(sequence, prompt_length)) {
+                DiffusionProfiler::instance().record_custom("early_stop_block", block_idx);
+                break;
+            }
         }
     }
 }
