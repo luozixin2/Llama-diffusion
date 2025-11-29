@@ -69,6 +69,8 @@ public:
             config.remasking_strategy = diffusion::RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC;
         } else if (remasking_strategy == "entropy_bounded") {
             config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
+        } else if (remasking_strategy == "iterative_refinement") {
+            config.remasking_strategy = diffusion::RemaskingStrategy::ITERATIVE_REFINEMENT;
         } else {
             throw std::runtime_error("Unknown remasking strategy: " + remasking_strategy);
         }
@@ -110,7 +112,8 @@ public:
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
         const std::vector<int>& stop_token_ids = {},
-        bool use_gpu_sampler = false
+        bool use_gpu_sampler = false,
+        int refinement_rounds = 3
     ) {
         // Convert prompt to llama_token
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
@@ -138,6 +141,8 @@ public:
             config.remasking_strategy = diffusion::RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC;
         } else if (remasking_strategy == "entropy_bounded") {
             config.remasking_strategy = diffusion::RemaskingStrategy::ENTROPY_BOUNDED;
+        } else if (remasking_strategy == "iterative_refinement") {
+            config.remasking_strategy = diffusion::RemaskingStrategy::ITERATIVE_REFINEMENT;
         } else {
             throw std::runtime_error("Unknown remasking strategy: " + remasking_strategy);
         }
@@ -248,6 +253,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
              py::arg("use_gpu_sampler") = false,
+             py::arg("refinement_rounds") = 3,
              py::call_guard<py::gil_scoped_release>(),
              "Generate text using block diffusion with streaming output\n\n"
              "Args:\n"

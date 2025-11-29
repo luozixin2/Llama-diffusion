@@ -366,25 +366,48 @@ def main():
     """示例测试"""
     # 配置
     MODEL_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
-    MASK_TOKEN_ID = 151669  # 根据你的模型调整
+    TOKENIZER_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
     
-    # 示例 prompt
-    prompt = [1, 2, 3, 4, 5]  # 替换为实际的 token IDs
+    # 加载tokenizer获取真实的prompt
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
+    MASK_TOKEN_ID = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+    
+    # 使用真实的prompt
+    messages = [{"role": "user", "content": "写一个关于一个机器人第一次发现音乐的短篇故事。"}]
+    prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
     
     # 初始化 profiler
     profiler = DiffusionProfiler(MODEL_PATH, n_ctx=8192, n_gpu_layers=35)
     
-    # 定义测试配置
+    # 定义测试配置（仅包含质量过关的配置）
     test_configs = [
+        # Baseline配置（用于对比）
         {
-            'name': 'Baseline',
+            'name': 'Baseline (block=8, steps=8)',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic'
         },
         {
-            'name': 'GPU Sampler',
+            'name': 'Baseline (block=4, steps=4)',
+            'gen_length': 128,
+            'block_length': 4,
+            'denoising_steps': 4,
+            'remasking_strategy': 'low_confidence_dynamic'
+        },
+        {
+            'name': 'Baseline (block=8, steps=4)',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 4,
+            'remasking_strategy': 'low_confidence_dynamic'
+        },
+        # GPU加速的Baseline
+        {
+            'name': 'Baseline (block=8, steps=8) + GPU',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 8,
@@ -392,40 +415,108 @@ def main():
             'use_gpu_sampler': True
         },
         {
-            'name': 'Larger Blocks',
+            'name': 'Baseline (block=4, steps=4) + GPU',
             'gen_length': 128,
-            'block_length': 16,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic'
-        },
-        {
-            'name': 'Fewer Steps',
-            'gen_length': 128,
-            'block_length': 8,
+            'block_length': 4,
             'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic'
-        },
-        {
-            'name': 'Sequential Strategy',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 8,
-            'remasking_strategy': 'sequential'
-        },
-        {
-            'name': 'GPU + Larger Blocks',
-            'gen_length': 128,
-            'block_length': 16,
-            'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True
         },
         {
-            'name': 'GPU + Fewer Steps',
+            'name': 'Baseline (block=8, steps=4) + GPU',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True
+        },
+        # 质量过关的迭代细化策略配置（进一步降低去噪步数）
+        {
+            'name': 'Iterative Refinement (block=4, steps=2, rounds=4)',
+            'gen_length': 128,
+            'block_length': 4,
+            'denoising_steps': 2,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 4
+        },
+        {
+            'name': 'Iterative Refinement (block=8, steps=3, rounds=3)',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 3,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 3
+        },
+        {
+            'name': 'Iterative Refinement (block=8, steps=3, rounds=4)',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 3,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 4
+        },
+        # 原有配置（用于对比）
+        {
+            'name': 'Iterative Refinement (block=4, steps=3, rounds=3)',
+            'gen_length': 128,
+            'block_length': 4,
+            'denoising_steps': 3,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 3
+        },
+        {
+            'name': 'Iterative Refinement (block=8, steps=4, rounds=3)',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 4,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 3
+        },
+        # 质量过关的迭代细化策略 + GPU（进一步降低去噪步数）
+        {
+            'name': 'Iterative Refinement (block=4, steps=2, rounds=4) + GPU',
+            'gen_length': 128,
+            'block_length': 4,
+            'denoising_steps': 2,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 4,
+            'use_gpu_sampler': True
+        },
+        {
+            'name': 'Iterative Refinement (block=8, steps=3, rounds=3) + GPU',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 3,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 3,
+            'use_gpu_sampler': True
+        },
+        {
+            'name': 'Iterative Refinement (block=8, steps=3, rounds=4) + GPU',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 3,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 4,
+            'use_gpu_sampler': True
+        },
+        # 原有配置（用于对比）
+        {
+            'name': 'Iterative Refinement (block=4, steps=3, rounds=3) + GPU',
+            'gen_length': 128,
+            'block_length': 4,
+            'denoising_steps': 3,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 3,
+            'use_gpu_sampler': True
+        },
+        {
+            'name': 'Iterative Refinement (block=8, steps=4, rounds=3) + GPU',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 4,
+            'remasking_strategy': 'iterative_refinement',
+            'refinement_rounds': 3,
             'use_gpu_sampler': True
         }
     ]

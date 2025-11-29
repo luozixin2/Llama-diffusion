@@ -79,11 +79,14 @@ def main():
             callback=stream_callback, # 传入回调函数
             mask_token_id=mask_token_id,
             gen_length=512,
-            block_length=4,
-            denoising_steps=4,
-            temperature=0.8,
-            top_p=0.95,
+            block_length=8,
+            denoising_steps=3,  # 测试多轮细化能否降低去噪步数（从4步降到3步）
+            temperature=0.8,  # 适中的temperature
+            top_p=0.95,  # 标准top_p
             stop_token_ids=[eos_token_id] if eos_token_id is not None else [],
+            remasking_strategy="iterative_refinement",  # 使用迭代细化策略
+            confidence_threshold=0.85,  # 标准置信度阈值
+            refinement_rounds=3,  # 3轮细化（3步并作1步）
             use_gpu_sampler=True
         )
         print("\n" + "-" * 20)

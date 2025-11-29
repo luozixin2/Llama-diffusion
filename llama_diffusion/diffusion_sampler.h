@@ -103,6 +103,17 @@ public:
         const std::vector<std::vector<float>>& token_probs
     );
 
+    std::vector<bool> get_transfer_indices_iterative_refinement_internal(
+        const std::vector<llama_token>& block,
+        std::vector<llama_token>& sampled_tokens,  // 非const，用于更新细化后的token
+        const std::vector<float>& confidences,
+        int num_transfer,
+        int current_step,
+        int total_steps,
+        int block_start,
+        llama_memory_t memory
+    );
+
     bool should_stop(const std::vector<llama_token>& tokens, size_t start_idx);
 
 protected:
