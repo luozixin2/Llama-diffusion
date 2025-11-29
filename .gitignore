@@ -20,6 +20,7 @@ dist/
 # Profiling outputs
 profile_*.png
 profile_results.json
+profiling_output.log
 llama_diffusion/build/
 llama_diffusion/out/
 __pycache__/
