@@ -83,6 +83,7 @@ def main():
             denoising_steps=3,  # 测试多轮细化能否降低去噪步数（从4步降到3步）
             temperature=0.8,  # 适中的temperature
             top_p=0.95,  # 标准top_p
+            repetition_penalty=1.2,  # 使用repetition_penalty抑制重复输出（>1.0降低重复概率，值越大抑制越强）
             stop_token_ids=[eos_token_id] if eos_token_id is not None else [],
             remasking_strategy="iterative_refinement",  # 使用迭代细化策略
             confidence_threshold=0.85,  # 标准置信度阈值

@@ -21,6 +21,7 @@ struct DiffusionConfig {
     float temperature = 1.0f;
     int top_k = 0;
     float top_p = 1.0f;
+    float repetition_penalty = 1.0f;  // 重复惩罚：>1.0降低重复token的概率，<1.0增加重复token的概率
     float confidence_threshold = 0.85f;
     float eb_threshold = 0.35f;
     int refinement_rounds = 3;  // 迭代细化策略的细化轮数（2步并作1步=2轮，3步并作1步=3轮，4步并作1步=4轮）

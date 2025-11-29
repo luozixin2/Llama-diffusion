@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cassert>
 #include <vector>
+#include <unordered_map>
 
 namespace diffusion {
 
@@ -221,6 +222,14 @@ void DiffusionSampler::denoise_block(
         std::vector<float> confidences(config_.block_length);
         std::vector<std::vector<float>> all_probs;
 
+        // 收集已生成的token作为repetition_penalty的历史（当前block中非mask的token）
+        std::vector<llama_token> prev_tokens;
+        for (llama_token token : current_block) {
+            if (token != config_.mask_token_id) {
+                prev_tokens.push_back(token);
+            }
+        }
+
         const int n_vocab = get_vocab_size();
         const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
         std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &all_probs : nullptr;
@@ -229,7 +238,8 @@ void DiffusionSampler::denoise_block(
             need_entropy_probs,
             sampled_tokens,
             confidences,
-            entropy_ptr
+            entropy_ptr,
+            prev_tokens
         );
 
         llama_batch_free(batch);
@@ -388,6 +398,33 @@ void DiffusionSampler::apply_top_p(std::vector<float>& logits, float p) {
     }
 }
 
+void DiffusionSampler::apply_repetition_penalty(std::vector<float>& logits, const std::vector<llama_token>& prev_tokens, float penalty) {
+    if (penalty == 1.0f || prev_tokens.empty()) {
+        return;  // 无惩罚或没有历史token
+    }
+    
+    // 统计历史token的出现频率
+    std::unordered_map<llama_token, int> token_counts;
+    for (llama_token token : prev_tokens) {
+        token_counts[token]++;
+    }
+    
+    // 对出现过的token应用惩罚
+    for (const auto& pair : token_counts) {
+        llama_token token = pair.first;
+        int count = pair.second;
+        if (token >= 0 && static_cast<size_t>(token) < logits.size()) {
+            // 惩罚公式：logits[token] = logits[token] / (penalty ^ count)
+            // 如果penalty > 1.0，重复次数越多，logits降低越多
+            if (logits[token] > 0.0f) {
+                logits[token] = logits[token] / std::pow(penalty, count);
+            } else {
+                logits[token] = logits[token] * std::pow(penalty, count);
+            }
+        }
+    }
+}
+
 llama_token DiffusionSampler::sample_token(const std::vector<float>& logits, float& prob) {
     float max_logit_val = -INFINITY;
     for(float l : logits) {
@@ -421,7 +458,8 @@ bool DiffusionSampler::sample_block_tokens(
     bool need_entropy_probs,
     std::vector<llama_token>& sampled_tokens,
     std::vector<float>& confidences,
-    std::vector<std::vector<float>>* entropy_probs_storage
+    std::vector<std::vector<float>>* entropy_probs_storage,
+    const std::vector<llama_token>& prev_tokens
 ) {
     diffusion::ProfilerTimer total_timer;
 
@@ -442,7 +480,8 @@ bool DiffusionSampler::sample_block_tokens(
         n_vocab,
         sampled_tokens,
         confidences,
-        entropy_probs_storage
+        entropy_probs_storage,
+        prev_tokens
     );
     DiffusionProfiler::instance().record_custom(
         "sampler_cpu_sampling_ms",
@@ -457,7 +496,8 @@ void DiffusionSampler::sample_block_on_cpu(
     int n_vocab,
     std::vector<llama_token>& sampled_tokens,
     std::vector<float>& confidences,
-    std::vector<std::vector<float>>* entropy_probs_storage
+    std::vector<std::vector<float>>* entropy_probs_storage,
+    const std::vector<llama_token>& prev_tokens
 ) {
     diffusion::ProfilerTimer cpu_timer;
     if (entropy_probs_storage) {
@@ -477,6 +517,12 @@ void DiffusionSampler::sample_block_on_cpu(
         if (config_.temperature != 1.0f) {
             for (float& l : logits_vec) l /= config_.temperature;
         }
+        
+        // 应用repetition_penalty（在top_k和top_p之前应用）
+        if (config_.repetition_penalty != 1.0f && !prev_tokens.empty()) {
+            apply_repetition_penalty(logits_vec, prev_tokens, config_.repetition_penalty);
+        }
+        
         if (config_.top_k > 0) {
             apply_top_k(logits_vec, config_.top_k);
         }
@@ -817,6 +863,14 @@ std::vector<bool> DiffusionSampler::get_transfer_indices_iterative_refinement_in
         std::vector<std::pair<float, size_t>> refined_candidates;
         std::vector<llama_token> refined_tokens(working_block.size(), 0);  // 存储细化后重新采样的token
         
+        // 收集已转移的token作为repetition_penalty的历史
+        std::vector<llama_token> prev_tokens_refinement;
+        for (size_t i = 0; i < working_block.size(); i++) {
+            if (result[i] && working_block[i] != config_.mask_token_id) {
+                prev_tokens_refinement.push_back(working_block[i]);
+            }
+        }
+        
         for (size_t i = 0; i < working_block.size(); i++) {
             if (working_block[i] == config_.mask_token_id && !result[i]) {
                 float* logits = llama_get_logits_ith(ctx_, i);
@@ -824,6 +878,11 @@ std::vector<bool> DiffusionSampler::get_transfer_indices_iterative_refinement_in
                     std::vector<float> logits_vec(logits, logits + n_vocab);
                     if (config_.temperature != 1.0f) {
                         for (float& l : logits_vec) l /= config_.temperature;
+                    }
+                    
+                    // 应用repetition_penalty（在top_k和top_p之前应用）
+                    if (config_.repetition_penalty != 1.0f && !prev_tokens_refinement.empty()) {
+                        apply_repetition_penalty(logits_vec, prev_tokens_refinement, config_.repetition_penalty);
                     }
                     
                     // 应用top_k和top_p

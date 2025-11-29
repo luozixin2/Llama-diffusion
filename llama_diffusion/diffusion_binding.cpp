@@ -37,6 +37,7 @@ public:
         float temperature = 1.0f,
         int top_k = 0,
         float top_p = 1.0f,
+        float repetition_penalty = 1.0f,
         const std::string& remasking_strategy = "low_confidence_dynamic",
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
@@ -54,6 +55,7 @@ public:
         config.temperature = temperature;
         config.top_k = top_k;
         config.top_p = top_p;
+        config.repetition_penalty = repetition_penalty;
         config.confidence_threshold = confidence_threshold;
         config.eb_threshold = eb_threshold;
         config.mask_token_id = mask_token_id;
@@ -108,6 +110,7 @@ public:
         float temperature = 1.0f,
         int top_k = 0,
         float top_p = 1.0f,
+        float repetition_penalty = 1.0f,
         const std::string& remasking_strategy = "low_confidence_dynamic",
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
@@ -126,9 +129,11 @@ public:
         config.temperature = temperature;
         config.top_k = top_k;
         config.top_p = top_p;
+        config.repetition_penalty = repetition_penalty;
         config.confidence_threshold = confidence_threshold;
         config.eb_threshold = eb_threshold;
         config.mask_token_id = mask_token_id;
+        config.refinement_rounds = refinement_rounds;
         config.stop_token_ids.assign(stop_token_ids.begin(), stop_token_ids.end());
         config.enable_gpu_sampler = use_gpu_sampler;
         
@@ -216,6 +221,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("temperature") = 1.0f,
              py::arg("top_k") = 0,
              py::arg("top_p") = 1.0f,
+             py::arg("repetition_penalty") = 1.0f,
              py::arg("remasking_strategy") = "low_confidence_dynamic",
              py::arg("confidence_threshold") = 0.85f,
              py::arg("eb_threshold") = 0.35f,
@@ -248,6 +254,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("temperature") = 1.0f,
              py::arg("top_k") = 0,
              py::arg("top_p") = 1.0f,
+             py::arg("repetition_penalty") = 1.0f,
              py::arg("remasking_strategy") = "low_confidence_dynamic",
              py::arg("confidence_threshold") = 0.85f,
              py::arg("eb_threshold") = 0.35f,

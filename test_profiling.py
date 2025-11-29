@@ -330,8 +330,12 @@ class DiffusionProfiler:
         print(f"\nVisualization saved to {output_file}")
         plt.close()
     
-    def export_results(self, results: List[Dict], output_file: str = 'profile_results.json'):
-        """导出结果到JSON"""
+    def export_results(self, results: List[Dict], output_file: str = 'profile_results.json', archive: bool = True):
+        """导出结果到JSON，并可选择归档到profile_runs目录"""
+        import os
+        from datetime import datetime
+        import shutil
+        
         export_data = []
         
         for result in results:
@@ -360,6 +364,27 @@ class DiffusionProfiler:
             json.dump(export_data, f, indent=2)
         
         print(f"\nResults exported to {output_file}")
+        
+        if archive:
+            archive_dir = 'profile_runs'
+            if not os.path.exists(archive_dir):
+                os.makedirs(archive_dir)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            archive_subdir = os.path.join(archive_dir, timestamp)
+            os.makedirs(archive_subdir, exist_ok=True)
+            
+            # 复制JSON文件
+            archive_json = os.path.join(archive_subdir, output_file)
+            shutil.copy2(output_file, archive_json)
+            
+            # 复制所有profile图片
+            for i in range(len(results)):
+                profile_png = f'profile_{i}.png'
+                if os.path.exists(profile_png):
+                    shutil.copy2(profile_png, os.path.join(archive_subdir, profile_png))
+            
+            print(f"Results archived to {archive_subdir}")
 
 
 def main():
