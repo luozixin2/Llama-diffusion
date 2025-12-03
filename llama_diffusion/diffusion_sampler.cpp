@@ -689,8 +689,10 @@ std::vector<bool> DiffusionSampler::get_transfer_indices_low_conf_static(
             conf_indices.push_back({confidences[i], i});
         }
     }
-    // Sort by confidence ascending (lowest first)
-    std::sort(conf_indices.begin(), conf_indices.end());
+    // ✅ 修复：按置信度降序排序，选择最高置信度的 token（与 Python 版本一致）
+    // Python 使用 torch.topk 返回最大的 k 个值
+    std::sort(conf_indices.begin(), conf_indices.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
     for (int i = 0; i < std::min(num_transfer, static_cast<int>(conf_indices.size())); i++) {
         result[conf_indices[i].second] = true;
     }
@@ -717,9 +719,11 @@ std::vector<bool> DiffusionSampler::get_transfer_indices_low_conf_dynamic(
     }
     
     if (high_conf_count < num_transfer) {
-        // Reset and use static strategy
+        // Reset and use static strategy with highest confidence first
         std::fill(result.begin(), result.end(), false);
-        std::sort(conf_indices.begin(), conf_indices.end());
+        // ✅ 修复：按置信度降序排序，选择最高置信度的 token（与 Python 版本一致）
+        std::sort(conf_indices.begin(), conf_indices.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
         for (int i = 0; i < std::min(num_transfer, static_cast<int>(conf_indices.size())); i++) {
             result[conf_indices[i].second] = true;
         }

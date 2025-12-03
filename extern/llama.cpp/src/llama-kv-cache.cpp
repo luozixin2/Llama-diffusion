@@ -1327,42 +1327,51 @@ void llama_kv_cache::set_input_kq_mask(
 
     std::fill(data, data + ggml_nelements(dst), -INFINITY);
 
-    // ✅ 验证 block_size 参数是否正确传递
     const bool is_block_diffusion = block_size > 0;
     
-    // // 检查是否是 prefill 阶段：如果所有 token 的 pos 都是连续的且从 0 开始，可能是 prefill
-    // bool likely_prefill = false;
-    // if (n_tokens > 0 && ubatch->pos) {
-    //     llama_pos first_pos = ubatch->pos[0];
-    //     llama_pos last_pos = ubatch->pos[n_tokens - 1];
-    //     // 如果位置从 0 或接近 0 开始，且是连续的，可能是 prefill
-    //     likely_prefill = (first_pos < 10 && last_pos < static_cast<llama_pos>(first_pos + n_tokens + 5));
-    // }
+    // 调试日志：可通过环境变量 LLAMA_BLOCK_DIFFUSION_DEBUG 启用
+    static const char * debug_env = getenv("LLAMA_BLOCK_DIFFUSION_DEBUG");
+    static const bool debug_block_diffusion = debug_env && atoi(debug_env) > 0;
     
-    // if (is_block_diffusion) {
-    //     // 打印日志验证 block_size 的值（包括 prefill 阶段）
-    //     LLAMA_LOG_INFO("%s: [%s] block_size=%u, causal_attn=%d, n_tokens=%u, is_block_diffusion=true\n", 
-    //                    __func__, likely_prefill ? "PREFILL" : "GENERATION",
-    //                    block_size, causal_attn, n_tokens);
-    // } else {
-    //     // 也打印非 block diffusion 的情况，用于对比
-    //     LLAMA_LOG_INFO("%s: [%s] block_size=%u, causal_attn=%d, n_tokens=%u, is_block_diffusion=false\n", 
-    //                    __func__, likely_prefill ? "PREFILL" : "GENERATION",
-    //                    block_size, causal_attn, n_tokens);
-    // }
+    if (debug_block_diffusion && is_block_diffusion) {
+        bool likely_prefill = false;
+        if (n_tokens > 0 && ubatch->pos) {
+            llama_pos first_pos = ubatch->pos[0];
+            llama_pos last_pos = ubatch->pos[n_tokens - 1];
+            likely_prefill = (first_pos < 10 && last_pos < static_cast<llama_pos>(first_pos + n_tokens + 5));
+        }
+        
+        LLAMA_LOG_INFO("%s: [%s] block_size=%u, causal_attn=%d, n_tokens=%u, n_kv=%lld\n", 
+                       __func__, likely_prefill ? "PREFILL" : "GENERATION",
+                       block_size, causal_attn, n_tokens, (long long)n_kv);
+    }
+    
+    // ✅ Block Diffusion 关键修复：
+    // 预先构建当前 batch 中 token 的位置到 KV cache index 的映射
+    // 这确保即使 cells 顺序与位置不连续，我们也能正确识别当前 batch 的 token
+    std::vector<std::pair<llama_pos, uint32_t>> batch_tokens_info;  // (position, kv_index)
+    if (is_block_diffusion && n_tokens > 0) {
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+        
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            llama_pos pos = ubatch->pos[t];
+            // 在 cells 中查找这个位置对应的 KV cache index
+            for (uint32_t j = 0; j < static_cast<uint32_t>(n_kv); ++j) {
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) == pos) {
+                    batch_tokens_info.push_back({pos, j});
+                    break;
+                }
+            }
+        }
+        
+        if (debug_block_diffusion) {
+            LLAMA_LOG_INFO("%s: found %zu/%u batch tokens in KV cache\n", 
+                           __func__, batch_tokens_info.size(), n_tokens);
+        }
+    }
+    
     // Use only the previous KV cells of the correct sequence for each token of the ubatch.
-    // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
-    // Example with a cache of 10 tokens, 2 tokens populated in cache and 3 tokens in batch:
-    //   Causal mask:
-    //      xxx-------
-    //      xxxx------
-    //      xxxxx-----
-    //   Non-causal mask:
-    //      xxxxx-----
-    //      xxxxx-----
-    //      xxxxx-----
-    // To visualize the mask, see https://github.com/ggml-org/llama.cpp/pull/12615
-    // TODO: optimize this section
     for (uint32_t h = 0; h < 1; ++h) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             for (uint32_t ii = 0; ii < n_tps; ++ii) {
@@ -1379,10 +1388,11 @@ void llama_kv_cache::set_input_kq_mask(
                 const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
                 const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-                const int32_t q_block = is_block_diffusion ? (p1 / block_size) : 0;
+                const int32_t q_block = is_block_diffusion ? (p1 / static_cast<int32_t>(block_size)) : 0;
 
                 const uint64_t idst = n_kv*(h*n_stream*n_tps_pad + s*n_tps_pad + ii);
 
+                // 处理 KV cache 中已有的 cells
                 for (uint32_t j = 0; j < n_kv; ++j) {
                     if (cells.is_empty(j)) {
                         continue;
@@ -1396,8 +1406,8 @@ void llama_kv_cache::set_input_kq_mask(
                     const llama_pos p0 = cells.pos_get(j);
 
                     if (is_block_diffusion) {
-                        // Block diffusion mask
-                        const int32_t k_block = p0 / block_size;
+                        // Block diffusion mask: 同一 block 或之前 block 的 token 可见
+                        const int32_t k_block = p0 / static_cast<int32_t>(block_size);
 
                         if (k_block > q_block) {
                             continue;  // Future blocks not visible
@@ -1414,7 +1424,7 @@ void llama_kv_cache::set_input_kq_mask(
                             continue;
                         }
 
-                    // M-RoPE causal mask
+                        // M-RoPE causal mask
                         if (causal_attn && is_2d && p0 == p1) {
                             const auto & p0_ext = cells.ext_get(j);
                             if (p0_ext.is_2d_gt(p1_x, p1_y)) {
@@ -1422,7 +1432,7 @@ void llama_kv_cache::set_input_kq_mask(
                             }
                         }
                         
-                    // apply SWA if any
+                        // apply SWA if any
                         if (is_masked_swa(p0, p1)) {
                             continue;
                         }
@@ -1430,8 +1440,43 @@ void llama_kv_cache::set_input_kq_mask(
                         data[idst + j] = hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f;
                     }
                 }
+                
+                // ✅ Block Diffusion 关键修复：
+                // 确保当前 batch 中同一 block 的所有 token 可以互相看到
+                // 这是因为在某些情况下，cells 的遍历可能没有正确设置当前 batch 内 token 之间的 mask
+                if (is_block_diffusion && batch_tokens_info.size() > 1) {
+                    for (const auto & [p0, kv_idx] : batch_tokens_info) {
+                        const int32_t k_block = p0 / static_cast<int32_t>(block_size);
+                        
+                        // 只允许看到同一 block 或之前 block
+                        if (k_block > q_block) {
+                            continue;
+                        }
+                        
+                        // 确保 mask 被设置（即使上面的循环已经设置过）
+                        if (kv_idx < static_cast<uint32_t>(n_kv)) {
+                            if (data[idst + kv_idx] == -INFINITY) {
+                                data[idst + kv_idx] = hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f;
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+    
+    // 调试：统计 mask 中有多少位置是可以 attend 的
+    if (debug_block_diffusion && is_block_diffusion) {
+        int64_t total_elements = ggml_nelements(dst);
+        int64_t visible_count = 0;
+        for (int64_t i = 0; i < total_elements; ++i) {
+            if (data[i] > -INFINITY) {
+                visible_count++;
+            }
+        }
+        LLAMA_LOG_INFO("%s: mask stats: %lld/%lld positions visible (%.2f%%)\n", 
+                       __func__, (long long)visible_count, (long long)total_elements, 
+                       100.0 * visible_count / total_elements);
     }
 }
 
