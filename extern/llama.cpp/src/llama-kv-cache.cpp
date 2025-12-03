@@ -1327,7 +1327,29 @@ void llama_kv_cache::set_input_kq_mask(
 
     std::fill(data, data + ggml_nelements(dst), -INFINITY);
 
+    // ✅ 验证 block_size 参数是否正确传递
     const bool is_block_diffusion = block_size > 0;
+    
+    // // 检查是否是 prefill 阶段：如果所有 token 的 pos 都是连续的且从 0 开始，可能是 prefill
+    // bool likely_prefill = false;
+    // if (n_tokens > 0 && ubatch->pos) {
+    //     llama_pos first_pos = ubatch->pos[0];
+    //     llama_pos last_pos = ubatch->pos[n_tokens - 1];
+    //     // 如果位置从 0 或接近 0 开始，且是连续的，可能是 prefill
+    //     likely_prefill = (first_pos < 10 && last_pos < static_cast<llama_pos>(first_pos + n_tokens + 5));
+    // }
+    
+    // if (is_block_diffusion) {
+    //     // 打印日志验证 block_size 的值（包括 prefill 阶段）
+    //     LLAMA_LOG_INFO("%s: [%s] block_size=%u, causal_attn=%d, n_tokens=%u, is_block_diffusion=true\n", 
+    //                    __func__, likely_prefill ? "PREFILL" : "GENERATION",
+    //                    block_size, causal_attn, n_tokens);
+    // } else {
+    //     // 也打印非 block diffusion 的情况，用于对比
+    //     LLAMA_LOG_INFO("%s: [%s] block_size=%u, causal_attn=%d, n_tokens=%u, is_block_diffusion=false\n", 
+    //                    __func__, likely_prefill ? "PREFILL" : "GENERATION",
+    //                    block_size, causal_attn, n_tokens);
+    // }
     // Use only the previous KV cells of the correct sequence for each token of the ubatch.
     // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
     // Example with a cache of 10 tokens, 2 tokens populated in cache and 3 tokens in batch:

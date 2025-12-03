@@ -318,9 +318,9 @@ void DiffusionSampler::denoise_block(
             }
         }
         
-        // ✅ 关键：denoising step 结束后，再次清除当前 block 的 cache
-        // 确保不会保留基于噪声 token 的 KV
-        llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
+        // ❌ 删除这里的 llama_memory_seq_rm
+        // 下一次循环开始时会清除，或者函数结束后 finalize_block 会清除。
+        // 这里清除是多余的。
     }
 }
 
@@ -342,7 +342,11 @@ void DiffusionSampler::finalize_block(
         batch.pos[i] = static_cast<llama_pos>(block_start + i);
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i] = false;  // Don't need logits, just storing KV cache
+        
+        // ✅ 关键修改：改为 true
+        // 即使我们不需要 logits，这也强制 llama.cpp 执行完整的生成路径计算，
+        // 确保 KV Cache 的写入方式与 denoise 阶段完全一致，避免潜在的 Mask 或优化路径差异。
+        batch.logits[i] = true;
     }
     batch.n_tokens = config_.block_length;
 

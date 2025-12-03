@@ -374,10 +374,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    const bool is_block_diffusion = cparams.block_size > 0;
-    const bool causal_attn = !is_block_diffusion;
+    // ✅ 关键修复：保持 causal_attn 为 true，因为 is_block_diffusion 分支会优先处理
+    // 即使 block_size > 0，causal_attn 也应该保持为 true，因为 is_block_diffusion 逻辑会优先处理
+    const bool causal_attn = cparams.causal_attn;
     
-    // 正确传递 block_size
+    // 正确传递 block_size（在 llama_kv_cache::set_input_kq_mask 中会检查 block_size > 0 来决定是否使用 block diffusion）
     mctx->set_input_kq_mask(self_kq_mask, ubatch, causal_attn, cparams.block_size);
 }
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {

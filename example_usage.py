@@ -6,8 +6,8 @@ def main():
     # 配置
     # model_path = "./models/your-diffusion-model.gguf"  # GGUF 格式模型
     # tokenizer_path = "./models/your-diffusion-model"
-    model_path = r"F:\DLLm\MyAPP2\SDAR-1.7B-Chat.gguf"
-    tokenizer_path = r"F:\DLLm\MyAPP2\SDAR-1.7B-Chat"
+    model_path = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
+    tokenizer_path = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
     # 加载 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     
@@ -45,8 +45,8 @@ def main():
         prompt=prompt_tokens,
         mask_token_id=mask_token_id,
         gen_length=2048,
-        block_length=4,
-        denoising_steps=4,
+        block_length=1,
+        denoising_steps=1,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
@@ -56,14 +56,41 @@ def main():
         use_gpu_sampler=True
     )
     
-    # 解码
-    output_text = tokenizer.decode(output_tokens, skip_special_tokens=False)
-    cleaned_text = output_text.replace(tokenizer.mask_token, '')
+    # generate 返回的序列包含 prompt + 生成的内容
+    # 只提取生成的部分（从 prompt_length 开始）
+    generated_tokens = output_tokens[len(prompt_tokens):]
+    
+    # 解码生成的 token
+    try:
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+    except (TypeError, ValueError) as e:
+        # 如果解码失败，尝试逐个 token 解码并过滤 None
+        print(f"Warning: Direct decode failed ({e}), trying token-by-token decode...")
+        decoded_parts = []
+        for token_id in generated_tokens:
+            try:
+                token_str = tokenizer.decode([token_id], skip_special_tokens=False)
+                if token_str is not None:
+                    decoded_parts.append(token_str)
+            except:
+                continue
+        generated_text = "".join(decoded_parts)
+    
+    # 清理 mask token
+    if '<|MASK|>' in generated_text:
+        generated_text = generated_text.replace('<|MASK|>', '')
+    
+    # 移除结束标记
+    generated_part = generated_text.strip()
+    if generated_part.endswith('<|im_end|>'):
+        generated_part = generated_part[:-10].strip()
+    if generated_part.endswith('<|endoftext|>'):
+        generated_part = generated_part[:-13].strip()
     
     print("=" * 80)
     print("Generated Output:")
     print("=" * 80)
-    print(cleaned_text)
+    print(generated_part)
 
 if __name__ == "__main__":
     main()
