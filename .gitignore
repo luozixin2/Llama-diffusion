@@ -33,3 +33,12 @@ build-gpu/
 
 # Profile runs
 profile_runs/
+
+# Benchmark and test outputs
+concurrent_throughput_runs/
+concurrent_throughput_results.json
+
+# Report files (keep only README.md)
+ANDROID_IMPROVEMENTS.md
+CONCURRENT_THROUGHPUT_TEST_SUMMARY.md
+OPTIMIZATION_REPORT.md
