@@ -300,11 +300,18 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     const int64_t n_kv     = ubatch->n_tokens;
     const int64_t n_tokens = ubatch->n_tokens;
 
+    // 检查是否启用 block diffusion
+    const bool is_block_diffusion = cparams.block_size > 0;
+    const uint32_t block_size = cparams.block_size;
+
     const auto fill_mask = [&](float * data, int n_swa, llama_swa_type swa_type) {
         for (int h = 0; h < 1; ++h) {
             for (int i1 = 0; i1 < n_tokens; ++i1) {
                 const llama_seq_id s1 = ubatch->seq_id[i1][0];
                 const llama_pos    p1 = ubatch->pos[i1];
+
+                // Block diffusion: 计算 query 所在的 block
+                const int32_t q_block = is_block_diffusion ? (p1 / block_size) : 0;
 
                 const uint64_t idst = h*(n_kv*n_tokens) + i1*n_kv;
 
@@ -317,9 +324,18 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
                         continue;
                     }
 
-                    // mask future tokens
-                    if (cparams.causal_attn && p0 > p1) {
-                        continue;
+                    if (is_block_diffusion) {
+                        // Block diffusion mask: 同一 block 内的 token 可以相互看到
+                        // 只有当 key 的 block > query 的 block 时才 mask
+                        const int32_t k_block = p0 / block_size;
+                        if (k_block > q_block) {
+                            continue;  // Future blocks not visible
+                        }
+                    } else {
+                        // 标准 causal attention: mask future tokens
+                        if (cparams.causal_attn && p0 > p1) {
+                            continue;
+                        }
                     }
 
                     // apply SWA if any
@@ -401,12 +417,14 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    // 传递 block_size 以支持 block diffusion
+    mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, cparams.block_size);
 
     mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
     mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
 
-    mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+    // 传递 block_size 以支持 block diffusion
+    mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn, cparams.block_size);
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {

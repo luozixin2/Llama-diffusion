@@ -224,40 +224,40 @@ void DiffusionSampler::denoise_block(
 ) {
     const int block_start = block_idx * config_.block_length;
     llama_memory_t memory = llama_get_memory(ctx_);
+    // 记录剩余 mask 数，避免每步全量扫描
+    int remaining_masks = 0;
+    for (llama_token token : current_block) {
+        if (token == config_.mask_token_id) {
+            remaining_masks++;
+        }
+    }
+
+    // 复用 batch，避免每步 init/free 带来的开销
+    llama_batch batch = llama_batch_init(config_.block_length, 0, 1);
+    for (int i = 0; i < config_.block_length; i++) {
+        batch.pos[i] = static_cast<llama_pos>(block_start + i);
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+    }
 
     for (int step = 0; step < config_.denoising_steps; step++) {
-        // Check if there are still masked tokens
-        bool has_mask = false;
-        for (llama_token token : current_block) {
-            if (token == config_.mask_token_id) {
-                has_mask = true;
-                break;
-            }
-        }
-        
-        if (!has_mask) {
-            break;  // Early exit if no masks remain
+        if (remaining_masks == 0) {
+            break;  // 没有 mask 直接提前结束
         }
 
-        // ✅ 关键：每次 denoising 前清除当前 block 的 KV cache
-        // 这样即使我们 decode 了噪声 token，也不会永久污染 cache
+        // 每次 denoising 前清除当前 block 的 KV cache
         llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
 
-        // Create batch for the current block
-        llama_batch batch = llama_batch_init(config_.block_length, 0, 1);
-
+        // 准备 batch：仅对仍为 mask 的位置请求 logits，减少不必要输出
         for (int i = 0; i < config_.block_length; i++) {
             batch.token[i] = current_block[i];
-            batch.pos[i] = static_cast<llama_pos>(block_start + i);
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = true;  // Need logits for sampling
+            batch.logits[i] = (current_block[i] == config_.mask_token_id);
         }
         batch.n_tokens = config_.block_length;
 
         if (llama_decode(ctx_, batch) != 0) {
-            assert(false && "llama_decode failed inside denoise_block!");
             llama_batch_free(batch);
+            assert(false && "llama_decode failed inside denoise_block!");
             return;
         }
 
@@ -277,14 +277,13 @@ void DiffusionSampler::denoise_block(
             entropy_ptr
         );
 
-        llama_batch_free(batch);
-
         // Determine which tokens to transfer (unmask)
         if (step >= static_cast<int>(num_transfer_tokens_per_step.size())) {
             // Should not happen, but handle gracefully
             for (int i = 0; i < config_.block_length; i++) {
                 if (current_block[i] == config_.mask_token_id) {
                     current_block[i] = sampled_tokens[i];
+                    remaining_masks--;
                 }
             }
             continue;
@@ -313,15 +312,16 @@ void DiffusionSampler::denoise_block(
 
         // Update the block with sampled tokens at selected positions
         for (int i = 0; i < config_.block_length; i++) {
-            if (transfer_indices[i]) {
+            if (transfer_indices[i] && current_block[i] == config_.mask_token_id) {
                 current_block[i] = sampled_tokens[i];
+                remaining_masks--;
             }
         }
-        
-        // ❌ 删除这里的 llama_memory_seq_rm
-        // 下一次循环开始时会清除，或者函数结束后 finalize_block 会清除。
-        // 这里清除是多余的。
+
+        // 下一次循环开始时再清理 KV；此处不重复清理
     }
+
+    llama_batch_free(batch);
 }
 
 void DiffusionSampler::finalize_block(
@@ -576,7 +576,7 @@ bool DiffusionSampler::try_sample_with_gpu(
         return false;
     }
 
-    // 使用直接指针访问，避免内存拷贝 - Phase 3 优化
+    // 使用 scatter 指针，直接传递 logits 指针数组，避免 CPU 拼接拷贝
     diffusion::ProfilerTimer pack_timer;
     std::vector<float*> logits_ptrs(config_.block_length);
     for (int i = 0; i < config_.block_length; ++i) {
@@ -594,19 +594,6 @@ bool DiffusionSampler::try_sample_with_gpu(
     sampler_metrics_.gpu_logit_pack_ms += pack_timer.elapsed_ms();
     sampler_metrics_.gpu_logit_pack_calls++;
 
-    // 使用 sample_from_ptr 直接传递指针数组
-    std::vector<float> logits_flat;
-    if (config_.block_length > 0) {
-        // 将所有 logits 拼接成一个连续数组
-        size_t total_size = static_cast<size_t>(config_.block_length) * n_vocab;
-        logits_flat.resize(total_size);
-        size_t offset = 0;
-        for (int i = 0; i < config_.block_length; ++i) {
-            std::copy(logits_ptrs[i], logits_ptrs[i] + n_vocab, logits_flat.begin() + offset);
-            offset += n_vocab;
-        }
-    }
-
     std::vector<std::vector<float>> tmp_probs;
     std::vector<std::vector<float>>* probs_ptr = (need_entropy_probs && entropy_probs_storage)
         ? &tmp_probs
@@ -614,9 +601,9 @@ bool DiffusionSampler::try_sample_with_gpu(
 
     diffusion::ProfilerTimer gpu_timer;
     GpuSampler::Stats gpu_stats{};
-    bool sampled_with_gpu = gpu_sampler_->sample_from_ptr(
-        logits_flat.data(),  // 直接传递连续内存指针
-        static_cast<size_t>(config_.block_length) * n_vocab,
+    bool sampled_with_gpu = gpu_sampler_->sample_from_scatter_ptrs(
+        logits_ptrs,
+        n_vocab,
         config_.remasking_strategy,
         rng_,
         sampled_tokens,
