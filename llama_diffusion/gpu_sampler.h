@@ -50,6 +50,19 @@ public:
         Stats* stats
     );
 
+    // Scatter pointer version - directly transfers from scattered logits pointers
+    // Avoids CPU-side concatenation, uses async H2D with multiple streams
+    bool sample_from_scatter_ptrs(
+        const std::vector<float*>& logits_ptrs,  // Array of pointers to each position's logits
+        int vocab_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        Stats* stats
+    );
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -75,6 +88,16 @@ public:
     bool sample_from_ptr(
         const float*,
         size_t,
+        RemaskingStrategy,
+        std::mt19937&,
+        std::vector<llama_token>&,
+        std::vector<float>&,
+        std::vector<std::vector<float>>*,
+        Stats*
+    ) { return false; }
+    bool sample_from_scatter_ptrs(
+        const std::vector<float*>&,
+        int,
         RemaskingStrategy,
         std::mt19937&,
         std::vector<llama_token>&,

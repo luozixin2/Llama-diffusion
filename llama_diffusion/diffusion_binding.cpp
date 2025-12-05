@@ -78,6 +78,7 @@ public:
         // Create context with block_size matching block_length
         llama_context_params ctx_params = llama_context_default_params();
         ctx_params.n_ctx = n_ctx_;
+        ctx_params.n_batch = 8192; // Increase batch size to support long prompts (max prompt ~2077 tokens)
         ctx_params.n_seq_max = 2; // Allow multiple sequences for streaming
         ctx_params.block_size = block_length; // Set block_size from config
         ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; // Disable flash attention
@@ -149,6 +150,7 @@ public:
         // Create context with block_size matching block_length
         llama_context_params ctx_params = llama_context_default_params();
         ctx_params.n_ctx = n_ctx_;
+        ctx_params.n_batch = 8192; // Increase batch size to support long prompts (max prompt ~2077 tokens)
         ctx_params.n_seq_max = 2; // Allow multiple sequences for streaming
         ctx_params.block_size = block_length; // Set block_size from config
         ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; // Disable flash attention
