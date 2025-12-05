@@ -79,8 +79,8 @@ def main():
             callback=stream_callback, # 传入回调函数
             mask_token_id=mask_token_id,
             gen_length=512,
-            block_length=1,
-            denoising_steps=1,  # 去噪步数
+            block_length=4,
+            denoising_steps=4,  # 去噪步数
             temperature=0.95,  # 更高的temperature
             top_p=0.95,  # 标准top_p
             repetition_penalty=1.05,  # 使用repetition_penalty抑制重复输出（>1.0降低重复概率，值越大抑制越强）

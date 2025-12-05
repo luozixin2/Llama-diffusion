@@ -282,11 +282,13 @@ class DiffusionProfiler:
             print("No critical bottlenecks identified.")
     
     def visualize_profile(self, result: Dict, output_file: str = 'profile_viz.png'):
-        """可视化性能分析结果"""
+        """可视化性能分析结果 - 确保不互相包含，多次调用函数单独展示"""
         import matplotlib.pyplot as plt
         import numpy as np
+        import re
         
         profile = result['profile']
+        total_wall_time = result['wall_time_ms']
         
         # Filter out very small sections
         filtered_profile = {
@@ -298,32 +300,264 @@ class DiffusionProfiler:
             print("No significant sections to visualize")
             return
         
-        # Sort by total time
-        sorted_sections = sorted(
-            filtered_profile.items(),
-            key=lambda x: x[1].get('total_ms', 0),
-            reverse=True
-        )[:15]  # Top 15 sections
+        # 分类阶段
+        top_level_phases = ['prefill_phase', 'generation_phase']
+        block_pattern = re.compile(r'^block_\d+$')
+        denoising_step_pattern = re.compile(r'^denoising_step_\d+$')
         
-        sections = [s[0] for s in sorted_sections]
-        times = [s[1].get('total_ms', 0) for s in sorted_sections]
-  
-        # Create figure with subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        # 识别不同类型的阶段
+        top_level_data = {}  # 顶层阶段
+        block_data = {}  # block_X 阶段
+        denoising_step_data = {}  # denoising_step_X 阶段
+        multi_call_functions = {}  # 多次调用的函数 (call_count > 1)
+        other_sections = {}  # 其他单次调用的阶段
         
-        # Bar chart
-        y_pos = np.arange(len(sections))
-        ax1.barh(y_pos, times)
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(sections, fontsize=8)
-        ax1.invert_yaxis()
-        ax1.set_xlabel('Time (ms)')
-        ax1.set_title('Top Time-Consuming Sections')
-        ax1.grid(axis='x', alpha=0.3)
+        for name, stats in filtered_profile.items():
+            call_count = stats.get('call_count', 0)
+            total_ms = stats.get('total_ms', 0)
+            
+            if name in top_level_phases:
+                top_level_data[name] = stats
+            elif block_pattern.match(name):
+                block_data[name] = stats
+            elif denoising_step_pattern.match(name):
+                denoising_step_data[name] = stats
+            elif call_count > 1:
+                multi_call_functions[name] = stats
+            else:
+                other_sections[name] = stats
         
-        # Pie chart
-        ax2.pie(times, labels=sections, autopct='%1.1f%%', startangle=90)
-        ax2.set_title('Time Distribution')
+        # 计算顶层阶段的"其他时间"（不包含子阶段的时间）
+        # generation_phase 包含所有 block_X，block_X 包含 denoising_step_X
+        # prefill_phase 可能包含 prefill_llama_decode 等
+        
+        # 计算 generation_phase 的子阶段总时间
+        generation_phase_stats = top_level_data.get('generation_phase')
+        if generation_phase_stats:
+            # 计算所有 block 的总时间
+            blocks_total_time = sum(s.get('total_ms', 0) for s in block_data.values())
+            # generation_phase 的其他时间 = generation_phase 总时间 - 所有 block 时间
+            generation_other_time = max(0, generation_phase_stats.get('total_ms', 0) - blocks_total_time)
+        else:
+            generation_other_time = 0
+        
+        # 计算 prefill_phase 的子阶段总时间
+        prefill_phase_stats = top_level_data.get('prefill_phase')
+        prefill_sub_sections = {k: v for k, v in filtered_profile.items() 
+                               if k.startswith('prefill_') and k != 'prefill_phase'}
+        prefill_sub_total = sum(s.get('total_ms', 0) for s in prefill_sub_sections.values())
+        if prefill_phase_stats:
+            prefill_other_time = max(0, prefill_phase_stats.get('total_ms', 0) - prefill_sub_total)
+        else:
+            prefill_other_time = 0
+        
+        # 计算每个 block 的子阶段（denoising_step）总时间
+        # 需要将 denoising_step 按 block 分组（这需要从调用关系推断，这里简化处理）
+        # 由于 denoising_step 是在 block 内调用的，我们计算所有 denoising_step 的总时间
+        denoising_steps_total = sum(s.get('total_ms', 0) for s in denoising_step_data.values())
+        
+        # 构建饼图数据 - 确保不互相包含
+        pie_labels = []
+        pie_values = []
+        pie_colors = []
+        
+        # 1. Top-level phases other time (excluding sub-phases)
+        if generation_other_time > 1.0:
+            pie_labels.append('generation_phase (other)')
+            pie_values.append(generation_other_time)
+            pie_colors.append('#FF6B6B')
+        
+        if prefill_other_time > 1.0:
+            pie_labels.append('prefill_phase (other)')
+            pie_values.append(prefill_other_time)
+            pie_colors.append('#4ECDC4')
+        
+        # 2. All blocks total time (subtract denoising_step time to avoid duplication)
+        # Simplified: show block total time, but not denoising_step (they are included in blocks)
+        blocks_total = sum(s.get('total_ms', 0) for s in block_data.values())
+        blocks_net_time = max(0, blocks_total - denoising_steps_total)
+        if blocks_net_time > 1.0:
+            pie_labels.append('blocks (excl. denoising)')
+            pie_values.append(blocks_net_time)
+            pie_colors.append('#95E1D3')
+        
+        # 3. denoising_step total time
+        if denoising_steps_total > 1.0:
+            pie_labels.append('denoising_steps (total)')
+            pie_values.append(denoising_steps_total)
+            pie_colors.append('#F38181')
+        
+        # 4. Multi-call functions (show total time separately)
+        for name, stats in sorted(multi_call_functions.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True):
+            total_ms = stats.get('total_ms', 0)
+            call_count = int(stats.get('call_count', 0))
+            if total_ms > 1.0:
+                pie_labels.append(f'{name}\n({call_count} calls)')
+                pie_values.append(total_ms)
+                pie_colors.append('#AA96DA')
+        
+        # 5. Other single-call important phases
+        for name, stats in sorted(other_sections.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:5]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                pie_labels.append(name)
+                pie_values.append(total_ms)
+                pie_colors.append('#FCBAD3')
+        
+        # Calculate unclassified time
+        accounted_time = sum(pie_values)
+        unaccounted_time = max(0, total_wall_time - accounted_time)
+        if unaccounted_time > 1.0:
+            pie_labels.append('Other/Unclassified')
+            pie_values.append(unaccounted_time)
+            pie_colors.append('#C7C7C7')
+        
+        # Build bar chart data - categorized display
+        bar_categories = {
+            'Top-level Phases': [],
+            'Block Phases': [],
+            'Denoising Steps': [],
+            'Multi-call Functions': [],
+            'Other Phases': []
+        }
+        
+        # Top-level phases
+        if generation_other_time > 1.0:
+            bar_categories['Top-level Phases'].append(('generation_phase (other)', generation_other_time))
+        if prefill_other_time > 1.0:
+            bar_categories['Top-level Phases'].append(('prefill_phase (other)', prefill_other_time))
+        
+        # Block phases (show top 10)
+        for name, stats in sorted(block_data.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                bar_categories['Block Phases'].append((name, total_ms))
+        
+        # Denoising steps (show top 10)
+        for name, stats in sorted(denoising_step_data.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                call_count = int(stats.get('call_count', 0))
+                bar_categories['Denoising Steps'].append((f'{name} ({call_count} calls)', total_ms))
+        
+        # Multi-call functions
+        for name, stats in sorted(multi_call_functions.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            call_count = int(stats.get('call_count', 0))
+            if total_ms > 1.0:
+                bar_categories['Multi-call Functions'].append((f'{name} ({call_count} calls)', total_ms))
+        
+        # Other phases
+        for name, stats in sorted(other_sections.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                bar_categories['Other Phases'].append((name, total_ms))
+        
+        # 创建图表
+        fig = plt.figure(figsize=(20, 10))
+        
+        # 饼图 - 左侧
+        ax1 = plt.subplot(2, 2, 1)
+        if pie_values:
+            # 只显示占比大于1%的项
+            significant_indices = [i for i, v in enumerate(pie_values) 
+                                 if v / sum(pie_values) * 100 > 1.0]
+            if significant_indices:
+                filtered_labels = [pie_labels[i] for i in significant_indices]
+                filtered_values = [pie_values[i] for i in significant_indices]
+                filtered_colors = [pie_colors[i] for i in significant_indices]
+                
+                wedges, texts, autotexts = ax1.pie(
+                    filtered_values, 
+                    labels=filtered_labels, 
+                    autopct='%1.1f%%', 
+                    startangle=90,
+                    colors=filtered_colors,
+                    textprops={'fontsize': 8}
+                )
+                # Adjust percentage text size
+                for autotext in autotexts:
+                    autotext.set_fontsize(7)
+            else:
+                ax1.text(0.5, 0.5, 'No significant data', ha='center', va='center', transform=ax1.transAxes)
+        ax1.set_title('Time Distribution (Non-overlapping)', fontsize=12, fontweight='bold')
+        
+        # Multi-call functions ratio - top right
+        ax2 = plt.subplot(2, 2, 2)
+        multi_call_total = sum(s.get('total_ms', 0) for s in multi_call_functions.values())
+        multi_call_percentage = (multi_call_total / total_wall_time * 100) if total_wall_time > 0 else 0
+        other_time = max(0, total_wall_time - multi_call_total)
+        other_percentage = 100 - multi_call_percentage
+        
+        if multi_call_total > 1.0 and other_time > 0:
+            ax2.pie(
+                [multi_call_total, other_time],
+                labels=[f'Multi-call Functions\n({multi_call_percentage:.1f}%)', 
+                       f'Other Time\n({other_percentage:.1f}%)'],
+                autopct='%1.1f%%',
+                startangle=90,
+                colors=['#AA96DA', '#E0E0E0'],
+                textprops={'fontsize': 9}
+            )
+        elif multi_call_total > 1.0:
+            # If multi-call functions take all time
+            ax2.pie(
+                [multi_call_total],
+                labels=[f'Multi-call Functions\n({multi_call_percentage:.1f}%)'],
+                autopct='%1.1f%%',
+                startangle=90,
+                colors=['#AA96DA'],
+                textprops={'fontsize': 9}
+            )
+        else:
+            ax2.text(0.5, 0.5, 'No multi-call function data', ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('Multi-call Functions Time Ratio', fontsize=12, fontweight='bold')
+        
+        # Bar chart - bottom (categorized display)
+        ax3 = plt.subplot(2, 1, 2)
+        
+        all_bar_labels = []
+        all_bar_values = []
+        category_colors = {
+            'Top-level Phases': '#FF6B6B',
+            'Block Phases': '#95E1D3',
+            'Denoising Steps': '#F38181',
+            'Multi-call Functions': '#AA96DA',
+            'Other Phases': '#FCBAD3'
+        }
+        bar_colors_list = []
+        
+        y_offset = 0
+        for category, items in bar_categories.items():
+            if items:
+                for label, value in items:
+                    all_bar_labels.append(label)
+                    all_bar_values.append(value)
+                    bar_colors_list.append(category_colors[category])
+                y_offset += len(items) + 1  # Add separator
+        
+        if all_bar_values:
+            y_pos = np.arange(len(all_bar_labels))
+            bars = ax3.barh(y_pos, all_bar_values, color=bar_colors_list)
+            ax3.set_yticks(y_pos)
+            ax3.set_yticklabels(all_bar_labels, fontsize=7)
+            ax3.invert_yaxis()
+            ax3.set_xlabel('Time (ms)', fontsize=10)
+            ax3.set_title('Phase Time Breakdown (Categorized)', fontsize=12, fontweight='bold')
+            ax3.grid(axis='x', alpha=0.3)
+            
+            # Add value labels
+            for i, (bar, value) in enumerate(zip(bars, all_bar_values)):
+                width = bar.get_width()
+                ax3.text(width, bar.get_y() + bar.get_height()/2, 
+                        f'{value:.1f}ms', 
+                        ha='left', va='center', fontsize=6)
         
         plt.tight_layout()
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
