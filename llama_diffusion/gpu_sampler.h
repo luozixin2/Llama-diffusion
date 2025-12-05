@@ -63,6 +63,18 @@ public:
         Stats* stats
     );
 
+    // Device pointer version - when logits already on GPU (D2D copy)
+    bool sample_from_device_ptr(
+        const float* device_logits_ptr,
+        size_t logits_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        Stats* stats
+    );
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

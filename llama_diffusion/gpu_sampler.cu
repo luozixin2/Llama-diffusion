@@ -368,7 +368,8 @@ public:
         std::vector<llama_token>& sampled_tokens,
         std::vector<float>& confidences,
         std::vector<std::vector<float>>* token_probs,
-        GpuSamplerStats* stats
+        GpuSamplerStats* stats,
+        bool logits_on_device = false
     ) {
         if (!initialized_) {
             return false;
@@ -377,6 +378,12 @@ public:
         const size_t expected = static_cast<size_t>(block_length_) * vocab_size_;
         if (logits_size != expected) {
             return false;
+        }
+
+        // Device logits: force single-stream path with D2D copy
+        if (logits_on_device) {
+            return sample_impl_single_stream_device(logits_ptr, logits_size, remasking_strategy,
+                                                    rng, sampled_tokens, confidences, token_probs, stats);
         }
 
         // Use multi-stream path if available and block_length is large enough
@@ -603,6 +610,135 @@ public:
         }
 
         return true;
+    }
+
+    // Single-stream implementation when logits already reside on device (CUDA)
+    bool sample_impl_single_stream_device(
+        const float* logits_ptr,
+        size_t logits_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        GpuSamplerStats* stats
+    ) {
+        const size_t expected = static_cast<size_t>(block_length_) * vocab_size_;
+        cudaStream_t stream = streams_[0];
+
+        const bool need_probs = (remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED) && token_probs;
+        token_probs_cache_.clear();
+        if (need_probs) {
+            token_probs_cache_.reserve(block_length_);
+        }
+
+        sampled_tokens.assign(block_length_, 0);
+        confidences.assign(block_length_, 0.0f);
+
+        DiffusionProfiler& profiler = DiffusionProfiler::instance();
+
+        // ========== Stage 1: D2D transfer + temperature scaling ==========
+        ProfilerTimer prepare_timer;
+
+        const size_t total_bytes = expected * sizeof(float);
+        if (!check_cuda(cudaMemcpyAsync(d_logits_, logits_ptr, total_bytes, cudaMemcpyDeviceToDevice, stream), "D2D logits")) {
+            return false;
+        }
+
+        if (config_.temperature != 1.0f) {
+            const float inv_temp = 1.0f / config_.temperature;
+            const size_t threads = 256;
+            const size_t blocks = (expected + threads - 1) / threads;
+            scale_logits_kernel<<<blocks, threads, 0, stream>>>(d_logits_, inv_temp, expected);
+        }
+
+        if (!check_cuda(cudaStreamSynchronize(stream), "sync after prep")) {
+            return false;
+        }
+        double prepare_ms = prepare_timer.elapsed_ms();
+
+        // ========== Stage 2: GPU Softmax (batched for all rows) ==========
+        ProfilerTimer softmax_timer;
+
+        const int threads_per_block = 256;
+        const size_t smem_size = threads_per_block * sizeof(float);
+        find_row_max_kernel<<<block_length_, threads_per_block, smem_size, stream>>>(
+            d_logits_, d_row_max_, vocab_size_, block_length_);
+
+        softmax_exp_sum_kernel<<<block_length_, threads_per_block, smem_size, stream>>>(
+            d_logits_, d_row_max_, d_probs_, d_row_sum_, vocab_size_, block_length_);
+
+        softmax_normalize_kernel<<<block_length_, threads_per_block, 0, stream>>>(
+            d_probs_, d_row_sum_, vocab_size_, block_length_);
+        double softmax_ms = softmax_timer.elapsed_ms();
+
+        // ========== Fast path: GPU sampling without sort/topk/topp ==========
+        const bool fast_gpu_sample = use_gpu_sampling_ &&
+                                     !need_probs &&
+                                     config_.top_k <= 0 &&
+                                     config_.top_p >= 1.0f;
+        if (fast_gpu_sample) {
+            ProfilerTimer sample_timer;
+
+            // generate randoms on GPU
+            std::uniform_int_distribution<uint64_t> dist64;
+            uint64_t seed = dist64(rng);
+            int threads = 256;
+            int blocks = (block_length_ + threads - 1) / threads;
+            fill_random_kernel<<<blocks, threads, 0, stream>>>(d_random_vals_, seed, block_length_);
+
+            // Choose blockDim based on vocab size to avoid wasted threads
+            int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
+            const size_t sample_smem = sample_threads * sizeof(float) + sample_threads * sizeof(int);
+            sample_tokens_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
+                d_probs_, d_random_vals_,
+                d_sampled_tokens_, d_confidences_,
+                vocab_size_, block_length_,
+                config_.top_k, config_.top_p
+            );
+
+            // Copy back minimal results
+            if (!check_cuda(cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
+                                            block_length_ * sizeof(int),
+                                            cudaMemcpyDeviceToHost, stream),
+                            "D2H sampled_tokens")) {
+                return false;
+            }
+            if (!check_cuda(cudaMemcpyAsync(confidences.data(), d_confidences_,
+                                            block_length_ * sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream),
+                            "D2H confidences")) {
+                return false;
+            }
+
+            if (!check_cuda(cudaStreamSynchronize(stream), "sync after gpu sample")) {
+                return false;
+            }
+
+            double sample_ms = sample_timer.elapsed_ms();
+
+            // Record stats
+            profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
+            profiler.record_custom("sampler_gpu_stage_softmax_ms", softmax_ms);
+            profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
+            profiler.record_custom("sampler_gpu_stage_d2h_ms", sample_ms);
+            profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
+
+            if (stats) {
+                stats->stage_prepare_ms = prepare_ms;
+                stats->stage_softmax_ms = softmax_ms;
+                stats->stage_sort_ms = 0.0;
+                stats->stage_sample_ms = sample_ms;
+                stats->stage_d2h_ms = sample_ms;
+                stats->stage_cpu_post_ms = 0.0;
+            }
+
+            return true;
+        }
+
+        // For need_probs/top-k/p we currently don't support device logits path
+        // Signal caller to fall back to host logits path.
+        return false;
     }
 
     // Multi-stream implementation - overlaps H2D, compute, and D2H for different rows
@@ -985,7 +1121,21 @@ public:
         GpuSamplerStats* stats
     ) {
         return sample_impl(logits_ptr, logits_size, remasking_strategy, rng,
-                          sampled_tokens, confidences, token_probs, stats);
+                          sampled_tokens, confidences, token_probs, stats, false);
+    }
+
+    bool sample_from_device_ptr(
+        const float* logits_ptr,
+        size_t logits_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        GpuSamplerStats* stats
+    ) {
+        return sample_impl(logits_ptr, logits_size, remasking_strategy, rng,
+                          sampled_tokens, confidences, token_probs, stats, true);
     }
 
     // Scatter pointer version - avoids CPU-side concatenation
@@ -1377,6 +1527,23 @@ bool GpuSampler::sample_from_scatter_ptrs(
     }
     return impl_->sample_from_scatter_ptrs(logits_ptrs, vocab_size, remasking_strategy, rng,
                                             sampled_tokens, confidences, token_probs, stats);
+}
+
+bool GpuSampler::sample_from_device_ptr(
+    const float* logits_ptr,
+    size_t logits_size,
+    RemaskingStrategy remasking_strategy,
+    std::mt19937& rng,
+    std::vector<llama_token>& sampled_tokens,
+    std::vector<float>& confidences,
+    std::vector<std::vector<float>>* token_probs,
+    Stats* stats
+) {
+    if (!impl_) {
+        return false;
+    }
+    return impl_->sample_from_device_ptr(logits_ptr, logits_size, remasking_strategy, rng,
+                                         sampled_tokens, confidences, token_probs, stats);
 }
 
 } // namespace diffusion

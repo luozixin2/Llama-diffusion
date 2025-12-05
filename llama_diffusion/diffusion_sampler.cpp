@@ -573,7 +573,60 @@ bool DiffusionSampler::try_sample_with_gpu(
     std::vector<std::vector<float>>* entropy_probs_storage
 ) {
     if (!use_gpu_sampler_ || !gpu_sampler_) {
+        sampler_metrics_.gpu_path_device_miss++;
         return false;
+    }
+
+    // Experimental: device logits path (CUDA only, when enabled upstream)
+    int64_t logits_stride = 0;
+    const float* device_logits = llama_get_logits_device(ctx_, &logits_stride);
+    const bool can_use_device_logits =
+        device_logits != nullptr &&
+        logits_stride == n_vocab &&
+        config_.block_length > 0 &&
+        static_cast<size_t>(config_.block_length) * static_cast<size_t>(n_vocab) == static_cast<size_t>(config_.block_length) * n_vocab;
+
+    if (need_entropy_probs) {
+        sampler_metrics_.gpu_path_need_entropy++;
+    }
+
+    if (can_use_device_logits) {
+        diffusion::ProfilerTimer gpu_timer;
+        GpuSampler::Stats gpu_stats{};
+        bool sampled_with_gpu = gpu_sampler_->sample_from_device_ptr(
+            device_logits,
+            static_cast<size_t>(config_.block_length) * static_cast<size_t>(n_vocab),
+            config_.remasking_strategy,
+            rng_,
+            sampled_tokens,
+            confidences,
+            need_entropy_probs ? entropy_probs_storage : nullptr,
+            &gpu_stats
+        );
+        DiffusionProfiler::instance().record_custom(
+            "sampler_gpu_invoke_ms",
+            gpu_timer.elapsed_ms()
+        );
+        sampler_metrics_.gpu_invoke_ms += gpu_timer.elapsed_ms();
+        sampler_metrics_.gpu_invoke_calls++;
+        sampler_metrics_.gpu_path_device_hit++;
+
+        if (sampled_with_gpu) {
+            sampler_metrics_.gpu_success++;
+            sampler_metrics_.gpu_stage_prepare_ms += gpu_stats.stage_prepare_ms;
+            sampler_metrics_.gpu_stage_softmax_ms += gpu_stats.stage_softmax_ms;
+            sampler_metrics_.gpu_stage_sort_ms += gpu_stats.stage_sort_ms;
+            sampler_metrics_.gpu_stage_sample_ms += gpu_stats.stage_sample_ms;
+            sampler_metrics_.gpu_stage_d2h_ms += gpu_stats.stage_d2h_ms;
+            sampler_metrics_.gpu_stage_cpu_post_ms += gpu_stats.stage_cpu_post_ms;
+            if (need_entropy_probs && entropy_probs_storage) {
+                // entropy_probs_storage is unused in device path fast sampling; keep empty
+            }
+            return true;
+        }
+        // fall through to host path on failure
+        sampler_metrics_.gpu_fail++;
+        sampler_metrics_.gpu_path_device_miss++;
     }
 
     // 使用 scatter 指针，直接传递 logits 指针数组，避免 CPU 拼接拷贝

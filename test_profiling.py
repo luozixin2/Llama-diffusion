@@ -1,6 +1,8 @@
 import llama_diffusion.llama_diffusion_profiled as llama_diffusion_profiled
 import json 
 import time
+import os
+import shutil
 from typing import Dict, List
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -109,7 +111,8 @@ class DiffusionProfiler:
         mask_token_id: int,
         configs: List[Dict],
         warmup_before_test: bool = True,
-        runs_per_config: int = 1  # 支持多次运行取平均
+        runs_per_config: int = 1,  # 支持多次运行取平均
+        summary_log_path: str = None  # 可选：将打印的摘要/表格写入文件
     ):
         """运行多配置对比测试"""
         
@@ -118,6 +121,7 @@ class DiffusionProfiler:
             self.warmup(prompt, mask_token_id)
         
         results = []
+        log_lines = []
         
         for i, config in enumerate(configs):
             config_name = config.get('name', f'Config {i+1}')
@@ -149,14 +153,25 @@ class DiffusionProfiler:
                 averaged_result['config_name'] = config_name
                 averaged_result['individual_runs'] = run_results
                 results.append(averaged_result)
-                print(f"\nAverage across {runs_per_config} runs:")
-                self._print_result_summary(averaged_result)
+                summary_text = self._format_result_summary(averaged_result, header=f"Average across {runs_per_config} runs")
+                print(summary_text)
+                log_lines.append(summary_text)
             else:
                 result = run_results[0]
                 result['config_name'] = config_name
                 results.append(result)
-                self._print_result_summary(result)
+                summary_text = self._format_result_summary(result)
+                print(summary_text)
+                log_lines.append(summary_text)
         
+        # 写入汇总日志（包含逐配置摘要 + 综合表格）
+        if summary_log_path:
+            summary_txt = self._format_comparative_table(results)
+            log_lines.append(summary_txt)
+            with open(summary_log_path, 'w') as f:
+                f.write("\n\n".join(log_lines))
+            print(f"\nSummary log saved to {summary_log_path}")
+
         return results
     
     def _average_results(self, run_results: List[Dict]) -> Dict:
@@ -194,32 +209,61 @@ class DiffusionProfiler:
         
         return avg_result
     
-    def _print_result_summary(self, result: Dict):
-        """打印单次测试摘要"""
+    def _format_result_summary(self, result: Dict, header: str = None) -> str:
+        """格式化单次测试摘要，返回字符串"""
         profile = result['profile']
-        
-        print(f"\nWall Time: {result['wall_time_ms']:.2f} ms")
-        print(f"Tokens Generated: {len(result['tokens'])}")
-        print(f"Throughput: {len(result['tokens']) / (result['wall_time_ms'] / 1000):.2f} tokens/sec")
-        
+        lines = []
+        if header:
+            lines.append(header)
+        lines.append(f"Wall Time: {result['wall_time_ms']:.2f} ms")
+        lines.append(f"Tokens Generated: {len(result['tokens'])}")
+        lines.append(f"Throughput: {len(result['tokens']) / (result['wall_time_ms'] / 1000):.2f} tokens/sec")
+
         if 'total_generation' in profile:
             total_gen = profile['total_generation']
-            print(f"Total Generation Time: {total_gen.get('total_ms', 0):.2f} ms")
-        
-        # Top bottlenecks
+            lines.append(f"Total Generation Time: {total_gen.get('total_ms', 0):.2f} ms")
+
         sorted_sections = sorted(
             profile.items(),
             key=lambda x: x[1].get('total_ms', 0),
             reverse=True
         )[:10]
-        
-        print("\nTop 10 Time-Consuming Sections:")
-        print(f"{'Section':<40} {'Total (ms)':<12} {'Avg (ms)':<12} {'Calls':<8}")
-        print("-" * 80)
-        
+
+        lines.append("\nTop 10 Time-Consuming Sections:")
+        lines.append(f"{'Section':<40} {'Total (ms)':<12} {'Avg (ms)':<12} {'Calls':<8}")
+        lines.append("-" * 80)
+
         for section, stats in sorted_sections:
-            print(f"{section:<40} {stats.get('total_ms', 0):<12.2f} "
-                  f"{stats.get('avg_ms', 0):<12.2f} {int(stats.get('call_count', 0)):<8}")
+            lines.append(f"{section:<40} {stats.get('total_ms', 0):<12.2f} "
+                         f"{stats.get('avg_ms', 0):<12.2f} {int(stats.get('call_count', 0)):<8}")
+
+        return "\n".join(lines)
+
+    def _print_result_summary(self, result: Dict):
+        """打印单次测试摘要"""
+        print(self._format_result_summary(result))
+    
+    def _format_comparative_table(self, results: List[Dict]) -> str:
+        """生成最终对比表格字符串"""
+        lines = []
+        lines.append(f"\n{'='*80}")
+        lines.append("COMPARATIVE SUMMARY")
+        lines.append(f"{'='*80}\n")
+        lines.append(f"{'Config':<30} {'Wall Time (ms)':<15} {'Tokens/sec':<15} {'Speedup':<10}")
+        lines.append("-" * 70)
+
+        if not results:
+            return "\n".join(lines)
+
+        baseline_time = results[0]['wall_time_ms']
+        for result in results:
+            tokens_per_sec = len(result['tokens']) / (result['wall_time_ms'] / 1000)
+            speedup = baseline_time / result['wall_time_ms'] if result['wall_time_ms'] > 0 else 0
+            lines.append(f"{result.get('config_name','Unknown'):<30} "
+                         f"{result['wall_time_ms']:<15.2f} "
+                         f"{tokens_per_sec:<15.2f} "
+                         f"{speedup:<10.2f}x")
+        return "\n".join(lines)
     
     def analyze_bottlenecks(self, result: Dict):
         """分析性能瓶颈"""
@@ -599,6 +643,7 @@ class DiffusionProfiler:
         
         print(f"\nResults exported to {output_file}")
         
+        archive_subdir = None
         if archive:
             archive_dir = 'profile_runs'
             if not os.path.exists(archive_dir):
@@ -620,12 +665,15 @@ class DiffusionProfiler:
             
             print(f"Results archived to {archive_subdir}")
 
+        return archive_subdir
+
 
 def main():
     """示例测试"""
     # 配置
     MODEL_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
     TOKENIZER_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
+    SUMMARY_LOG = "profile_summary.txt"
     
     # 加载tokenizer获取真实的prompt
     from transformers import AutoTokenizer
@@ -697,7 +745,8 @@ def main():
         MASK_TOKEN_ID, 
         test_configs,
         warmup_before_test=True,
-        runs_per_config=3  # 每个配置运行3次
+        runs_per_config=3,  # 每个配置运行3次
+        summary_log_path=SUMMARY_LOG
     )
     
     # 详细分析每个结果
@@ -709,7 +758,11 @@ def main():
         profiler.visualize_profile(result, f'profile_{i}.png')
     
     # 导出结果
-    profiler.export_results(results)
+    archive_subdir = profiler.export_results(results)
+
+    # 如果有归档目录，则将 summary 日志也拷贝进去
+    if archive_subdir and os.path.exists(SUMMARY_LOG):
+        shutil.copy2(SUMMARY_LOG, os.path.join(archive_subdir, SUMMARY_LOG))
     
     # 对比总结
     print(f"\n{'='*80}")

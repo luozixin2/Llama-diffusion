@@ -26,6 +26,9 @@ struct SamplerTelemetry {
     double gpu_stage_cpu_post_ms = 0.0;
     int gpu_success = 0;
     int gpu_fail = 0;
+    int gpu_path_device_hit = 0;
+    int gpu_path_device_miss = 0;
+    int gpu_path_need_entropy = 0;
 
     double cpu_sampling_ms = 0.0;
     int cpu_sampling_calls = 0;

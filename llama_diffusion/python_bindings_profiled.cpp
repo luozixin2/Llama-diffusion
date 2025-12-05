@@ -105,6 +105,11 @@ public:
             stats["call_count"] = count;
             py_profile[py::str(key)] = stats;
         };
+        auto add_count = [&](const char* key, int count) {
+            py::dict stats;
+            stats["count"] = count;
+            py_profile[py::str(key)] = stats;
+        };
         add_metric("telemetry_gpu_logit_pack", telemetry.gpu_logit_pack_ms, telemetry.gpu_logit_pack_calls);
         add_metric("telemetry_gpu_invoke", telemetry.gpu_invoke_ms, telemetry.gpu_invoke_calls);
         add_metric("telemetry_gpu_stage_prepare", telemetry.gpu_stage_prepare_ms, telemetry.gpu_success);
@@ -115,8 +120,11 @@ public:
         add_metric("telemetry_gpu_stage_cpu_post", telemetry.gpu_stage_cpu_post_ms, telemetry.gpu_success);
         add_metric("telemetry_cpu_sampling", telemetry.cpu_sampling_ms, telemetry.cpu_sampling_calls);
         add_metric("telemetry_cpu_loop", telemetry.cpu_loop_ms, telemetry.cpu_loop_calls);
-        add_metric("telemetry_gpu_success", static_cast<double>(telemetry.gpu_success), telemetry.gpu_success);
-        add_metric("telemetry_gpu_fail", static_cast<double>(telemetry.gpu_fail), telemetry.gpu_fail);
+        add_count("telemetry_gpu_success", telemetry.gpu_success);
+        add_count("telemetry_gpu_fail", telemetry.gpu_fail);
+        add_count("telemetry_gpu_path_device_hit", telemetry.gpu_path_device_hit);
+        add_count("telemetry_gpu_path_device_miss", telemetry.gpu_path_device_miss);
+        add_count("telemetry_gpu_path_need_entropy", telemetry.gpu_path_need_entropy);
         
         std::vector<int> int_result(result.begin(), result.end());
         return std::make_pair(int_result, py_profile);
