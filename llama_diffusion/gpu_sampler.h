@@ -75,7 +75,8 @@ public:
         std::vector<llama_token>& sampled_tokens,
         std::vector<float>& confidences,
         std::vector<std::vector<float>>* token_probs,
-        Stats* stats
+        Stats* stats,
+        bool force_non_fused = false
     );
 
 private:

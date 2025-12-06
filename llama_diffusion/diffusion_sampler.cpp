@@ -612,6 +612,7 @@ bool DiffusionSampler::try_sample_with_gpu(
     const bool device_available = device_logits != nullptr;
     const bool stride_ok = logits_stride == n_vocab;
     const bool full_logits = last_logits_count_ == config_.block_length;
+    int debug_output_count = -1;
     bool can_use_device_logits =
         device_available &&
         stride_ok &&
@@ -624,6 +625,7 @@ bool DiffusionSampler::try_sample_with_gpu(
     }
 
     double local_gpu_ms = 0.0;
+    const bool debug_device = std::getenv("DIFFUSION_DEBUG_DEVICE_LOGITS") != nullptr;
 
 #if defined(DIFFUSION_ENABLE_CUDA)
     auto ensure_compact_buffer = [&](size_t bytes) -> bool {
@@ -644,10 +646,13 @@ bool DiffusionSampler::try_sample_with_gpu(
     };
 #endif
 
+    if ((can_use_device_logits || debug_device) && device_available) {
+        llama_get_logits_output_ids(ctx_, &debug_output_count); // also triggers output_reorder/sync
+    }
+
     if (can_use_device_logits) {
 #if defined(DIFFUSION_ENABLE_CUDA)
-        int output_count = 0;
-        llama_get_logits_output_ids(ctx_, &output_count); // also triggers output_reorder/sync
+        const int output_count = debug_output_count;
         const size_t expected_rows = static_cast<size_t>(config_.block_length);
         const size_t row_bytes = static_cast<size_t>(n_vocab) * sizeof(float);
         const size_t total_bytes = expected_rows * row_bytes;
@@ -655,24 +660,39 @@ bool DiffusionSampler::try_sample_with_gpu(
 
         if (output_count < static_cast<int>(expected_rows)) {
             compact_ok = false;
+            if (debug_device) {
+                fprintf(stderr, "[device_logits] compact fail: output_count=%d expected=%zu\n",
+                        output_count, expected_rows);
+            }
         } else if (!ensure_compact_buffer(total_bytes)) {
             compact_ok = false;
+            if (debug_device) {
+                fprintf(stderr, "[device_logits] compact fail: ensure buffer %zu bytes\n", total_bytes);
+            }
         } else {
             for (int i = 0; i < config_.block_length; ++i) {
                 float* row_ptr = llama_get_logits_ith(ctx_, i);
                 if (!row_ptr) {
                     compact_ok = false;
+                    if (debug_device) {
+                        fprintf(stderr, "[device_logits] compact fail: logits_ith nullptr at i=%d\n", i);
+                    }
                     break;
                 }
                 float* dst = device_logits_compact_ + static_cast<size_t>(i) * n_vocab;
-                if (cudaMemcpy(dst, row_ptr, row_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                cudaError_t err = cudaMemcpy(dst, row_ptr, row_bytes, cudaMemcpyHostToDevice);
+                if (err != cudaSuccess) {
                     compact_ok = false;
+                    if (debug_device) {
+                        fprintf(stderr, "[device_logits] compact fail: cudaMemcpy H2D row=%d err=%d\n", i, int(err));
+                    }
                     break;
                 }
             }
             if (compact_ok && std::getenv("DIFFUSION_DEBUG_LOGITS_CHECK")) {
                 std::vector<float> host_compact(expected_rows * n_vocab);
-                if (cudaMemcpy(host_compact.data(), device_logits_compact_, total_bytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                cudaError_t err = cudaMemcpy(host_compact.data(), device_logits_compact_, total_bytes, cudaMemcpyDeviceToHost);
+                if (err == cudaSuccess) {
                     double max_abs = 0.0;
                     double sum_abs = 0.0;
                     const size_t count = expected_rows * static_cast<size_t>(n_vocab);
@@ -695,10 +715,16 @@ bool DiffusionSampler::try_sample_with_gpu(
                                 expected_rows, max_abs, sum_abs / count);
                         if (max_abs > 1e-3) {
                             compact_ok = false;
+                            if (debug_device) {
+                                fprintf(stderr, "[device_logits] compact fail: logits_check max_abs=%.6g\n", max_abs);
+                            }
                         }
                     }
                 } else {
                     compact_ok = false;
+                    if (debug_device) {
+                        fprintf(stderr, "[device_logits] compact fail: D2H check err=%d\n", int(err));
+                    }
                 }
             }
         }
@@ -706,6 +732,10 @@ bool DiffusionSampler::try_sample_with_gpu(
         if (!compact_ok) {
             can_use_device_logits = false;
             sampler_metrics_.gpu_fallback_stride++;
+            sampler_metrics_.gpu_fallback_compact_fail++;
+            if (debug_device) {
+                fprintf(stderr, "[device_logits] fallback to host scatter (compact fail)\n");
+            }
         } else {
             device_logits = device_logits_compact_;
         }
@@ -717,40 +747,59 @@ bool DiffusionSampler::try_sample_with_gpu(
     if (can_use_device_logits) {
         diffusion::ProfilerTimer gpu_timer;
         GpuSampler::Stats gpu_stats{};
-        // Fast-path禁用：改用与 scatter 类似的单流路径（保证质量对齐）
+        // Fast-path验证：默认使用 device 非融合路径（GpuSampler 内部 force_non_fused），并可选融合对比
         bool sampled_with_gpu = false;
-        diffusion::ProfilerTimer copy_timer;
-        std::vector<float*> logits_ptrs(config_.block_length);
-        std::vector<std::vector<float>> tmp_rows(config_.block_length, std::vector<float>(n_vocab));
-        bool copy_ok = true;
-        for (int i = 0; i < config_.block_length; ++i) {
-            if (cudaMemcpy(tmp_rows[i].data(),
-                           device_logits + static_cast<size_t>(i) * n_vocab,
-                           static_cast<size_t>(n_vocab) * sizeof(float),
-                           cudaMemcpyDeviceToHost) != cudaSuccess) {
-                copy_ok = false;
-                break;
-            }
-            logits_ptrs[i] = tmp_rows[i].data();
-        }
-        DiffusionProfiler::instance().record_custom("sampler_gpu_device_compact_d2h_ms", copy_timer.elapsed_ms());
-        if (!copy_ok) {
-            can_use_device_logits = false;
-        } else {
-            diffusion::ProfilerTimer gpu_timer2;
-            sampled_with_gpu = gpu_sampler_->sample_from_scatter_ptrs(
-                logits_ptrs,
-                n_vocab,
+        GpuSampler::Stats gpu_stats_device{};
+        diffusion::ProfilerTimer gpu_timer_device;
+        sampled_with_gpu = gpu_sampler_->sample_from_device_ptr(
+            device_logits,
+            static_cast<size_t>(config_.block_length) * static_cast<size_t>(n_vocab),
+            config_.remasking_strategy,
+            rng_,
+            sampled_tokens,
+            confidences,
+            need_entropy_probs ? entropy_probs_storage : nullptr,
+            &gpu_stats_device,
+            /*force_non_fused=*/false);
+        double invoke_ms_device = gpu_timer_device.elapsed_ms();
+        local_gpu_ms += invoke_ms_device;
+        DiffusionProfiler::instance().record_custom("sampler_gpu_invoke_ms", invoke_ms_device);
+
+        // 可选：同时运行 fast-path（融合内核）对比
+        const bool enable_fastpath_compare = std::getenv("DIFFUSION_FASTPATH_COMPARE") != nullptr;
+        bool fastpath_ok = false;
+        std::vector<llama_token> fast_tokens;
+        std::vector<float> fast_conf;
+        if (enable_fastpath_compare && !need_entropy_probs) {
+            auto rng_fast = rng_;
+            GpuSampler::Stats fast_stats{};
+            fast_tokens.resize(config_.block_length);
+            fast_conf.resize(config_.block_length);
+            fastpath_ok = gpu_sampler_->sample_from_device_ptr(
+                device_logits,
+                static_cast<size_t>(config_.block_length) * static_cast<size_t>(n_vocab),
                 config_.remasking_strategy,
-                rng_,
-                sampled_tokens,
-                confidences,
-                need_entropy_probs ? entropy_probs_storage : nullptr,
-                &gpu_stats
+                rng_fast,
+                fast_tokens,
+                fast_conf,
+                nullptr,
+                &fast_stats,
+                /*force_non_fused=*/false
             );
-            double invoke_ms2 = gpu_timer2.elapsed_ms();
-            local_gpu_ms += invoke_ms2;
-            DiffusionProfiler::instance().record_custom("sampler_gpu_invoke_ms", invoke_ms2);
+        }
+
+        // 对比 fast-path 与非融合 device 路径的 token 结果，只记录日志
+        if (enable_fastpath_compare && fastpath_ok && sampled_with_gpu && fast_tokens.size() == sampled_tokens.size()) {
+            int mismatch = 0;
+            for (size_t i = 0; i < fast_tokens.size(); ++i) {
+                if (fast_tokens[i] != sampled_tokens[i]) {
+                    mismatch++;
+                }
+            }
+            DiffusionProfiler::instance().record_custom("sampler_gpu_fastpath_mismatch", mismatch);
+            if (mismatch > 0) {
+                fprintf(stderr, "[fastpath_compare] mismatches=%d / %zu\n", mismatch, fast_tokens.size());
+            }
         }
         double invoke_ms = gpu_timer.elapsed_ms();
         local_gpu_ms += invoke_ms;
@@ -795,8 +844,22 @@ bool DiffusionSampler::try_sample_with_gpu(
             sampler_metrics_.gpu_fallback_device_unavail++;
         } else if (!stride_ok) {
             sampler_metrics_.gpu_fallback_stride++;
+            sampler_metrics_.gpu_fallback_stride_mismatch++;
         } else if (!full_logits) {
             sampler_metrics_.gpu_fallback_stride++;
+            sampler_metrics_.gpu_fallback_partial_logits++;
+        }
+        if (debug_device) {
+            fprintf(stderr,
+                    "[device_logits] fallback: device=%d stride_ok=%d full=%d stride=%lld n_vocab=%d block=%d last=%d output_count=%d\n",
+                    device_available ? 1 : 0,
+                    stride_ok ? 1 : 0,
+                    full_logits ? 1 : 0,
+                    static_cast<long long>(logits_stride),
+                    n_vocab,
+                    config_.block_length,
+                    last_logits_count_,
+                    debug_output_count);
         }
         if (config_.top_k > 0) {
             sampler_metrics_.gpu_fallback_topk++;

@@ -154,6 +154,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                 batch.logits[i] = true;
             }
             batch.n_tokens = config_.block_length;
+            // 记录当前请求的 logits 数，供 device logits 路径校验
+            last_logits_count_ = config_.block_length;
         }
         
         {

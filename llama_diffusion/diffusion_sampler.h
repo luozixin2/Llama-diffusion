@@ -38,6 +38,9 @@ struct SamplerTelemetry {
     int gpu_fallback_topp = 0;
     int gpu_fallback_entropy = 0;
     int gpu_fallback_stride = 0;
+    int gpu_fallback_stride_mismatch = 0;
+    int gpu_fallback_partial_logits = 0;
+    int gpu_fallback_compact_fail = 0;
     int gpu_fallback_device_unavail = 0;
     int gpu_sampler_unavailable = 0;
 

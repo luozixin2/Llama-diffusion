@@ -134,6 +134,9 @@ public:
         add_count("telemetry_gpu_fallback_topp", telemetry.gpu_fallback_topp);
         add_count("telemetry_gpu_fallback_entropy", telemetry.gpu_fallback_entropy);
         add_count("telemetry_gpu_fallback_stride", telemetry.gpu_fallback_stride);
+        add_count("telemetry_gpu_fallback_stride_mismatch", telemetry.gpu_fallback_stride_mismatch);
+        add_count("telemetry_gpu_fallback_partial_logits", telemetry.gpu_fallback_partial_logits);
+        add_count("telemetry_gpu_fallback_compact_fail", telemetry.gpu_fallback_compact_fail);
         add_count("telemetry_gpu_fallback_device_unavail", telemetry.gpu_fallback_device_unavail);
         add_count("telemetry_gpu_sampler_unavailable", telemetry.gpu_sampler_unavailable);
         
