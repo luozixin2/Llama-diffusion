@@ -135,6 +135,121 @@ __global__ void fill_random_kernel(float* out, uint64_t seed, int n) {
     out[idx] = curand_uniform(&state);
 }
 
+// Fused softmax + sampling for fast path (no top-k/p, no probs)
+// One block per row; supports block_length <= gridDim.x
+__global__ void fused_softmax_sample_kernel(
+    const float* logits,       // [block_length, vocab_size]
+    int vocab_size,
+    int block_length,
+    float inv_temp,            // 1.0f when no temperature
+    uint64_t seed,             // base seed
+    int* sampled_tokens,       // [block_length]
+    float* confidences         // [block_length]
+) {
+    const int row = blockIdx.x;
+    if (row >= block_length) return;
+
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const float* row_logits = logits + row * vocab_size;
+
+    // shared layout: [blockDim] max/tmp | [blockDim] chunk_sums | [1] prefix_before | [1] target_chunk (int)
+    extern __shared__ unsigned char shared_raw[];
+    float* sdata = reinterpret_cast<float*>(shared_raw);                    // blockDim
+    float* chunk_sums = sdata + nthreads;                                   // blockDim
+    float* prefix_before = chunk_sums + nthreads;                           // 1 float
+    int* target_chunk_ptr = reinterpret_cast<int*>(prefix_before + 1);      // 1 int
+
+    // 1) reduce max
+    float local_max = -FLT_MAX;
+    for (int i = tid; i < vocab_size; i += nthreads) {
+        float val = row_logits[i] * inv_temp;
+        if (val > local_max) local_max = val;
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s && sdata[tid + s] > sdata[tid]) {
+            sdata[tid] = sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    const float row_max = sdata[0];
+
+    // 2) reduce sum of exp(logit - max)
+    float local_sum = 0.0f;
+    for (int i = tid; i < vocab_size; i += nthreads) {
+        float e = expf(row_logits[i] * inv_temp - row_max);
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    const float row_sum = sdata[0] + 1e-10f;
+
+    // 3) random threshold in [0, row_sum)
+    if (tid == 0) {
+        curandStatePhilox4_32_10_t state;
+        curand_init(seed, row, 0, &state);
+        const float r = curand_uniform(&state) * row_sum;
+        prefix_before[0] = r;
+        target_chunk_ptr[0] = -1;
+    }
+    __syncthreads();
+    const float target_r = prefix_before[0];
+
+    // 4) chunk sums
+    const int chunk_size = (vocab_size + nthreads - 1) / nthreads;
+    const int start_idx = tid * chunk_size;
+    const int end_idx = min(start_idx + chunk_size, vocab_size);
+    float chunk_sum = 0.0f;
+    for (int i = start_idx; i < end_idx; ++i) {
+        chunk_sum += expf(row_logits[i] * inv_temp - row_max);
+    }
+    chunk_sums[tid] = chunk_sum;
+    __syncthreads();
+
+    // 5) find target chunk
+    if (tid == 0) {
+        float prefix = 0.0f;
+        int tgt = -1;
+        for (int c = 0; c < nthreads; ++c) {
+            float old_prefix = prefix;
+            prefix += chunk_sums[c];
+            if (tgt < 0 && prefix >= target_r) {
+                tgt = c;
+                prefix_before[0] = old_prefix; // reuse to store prefix_before target
+            }
+        }
+        if (tgt < 0) tgt = nthreads - 1;
+        target_chunk_ptr[0] = tgt;
+    }
+    __syncthreads();
+
+    const int target_chunk = target_chunk_ptr[0];
+    if (tid == target_chunk) {
+        float prefix = prefix_before[0];
+        int sampled_idx = vocab_size - 1;
+        float sampled_prob = 0.0f;
+        for (int i = start_idx; i < end_idx; ++i) {
+            float p = expf(row_logits[i] * inv_temp - row_max) / row_sum;
+            prefix += p;
+            if (prefix >= target_r / row_sum) {
+                sampled_idx = i;
+                sampled_prob = p;
+                break;
+            }
+        }
+        sampled_tokens[row] = sampled_idx;
+        confidences[row] = sampled_prob;
+    }
+}
+
 // Phase 2 优化: GPU 端并行采样 kernel（可用于融合路径）
 // 使用分块并行累加 + warp-level 规约
 __global__ void sample_tokens_kernel(
@@ -429,6 +544,85 @@ public:
             return false;
         }
 
+        double prepare_ms = 0.0;
+
+        // ========== Fast path: GPU sampling without sort/topk/topp ==========
+        const bool fast_gpu_sample = use_gpu_sampling_ &&
+                                     !need_probs &&
+                                     config_.top_k <= 0 &&
+                                     config_.top_p >= 1.0f;
+        if (fast_gpu_sample) {
+            ProfilerTimer sample_timer;
+            prepare_ms = prepare_timer.elapsed_ms();
+
+            // Fused softmax + sampling kernel (single pass)
+            std::uniform_int_distribution<uint64_t> dist64;
+            uint64_t seed = dist64(rng);
+            int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
+            const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
+            const float inv_temp = (config_.temperature != 1.0f) ? 1.0f / config_.temperature : 1.0f;
+            fused_softmax_sample_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
+                d_logits_,
+                vocab_size_,
+                block_length_,
+                inv_temp,
+                seed,
+                d_sampled_tokens_,
+                d_confidences_
+            );
+
+            // Copy back minimal results with event-based wait (avoid full stream sync)
+            ProfilerTimer d2h_timer;
+            if (!check_cuda(cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
+                                            block_length_ * sizeof(int),
+                                            cudaMemcpyDeviceToHost, stream),
+                            "D2H sampled_tokens")) {
+                return false;
+            }
+            if (!check_cuda(cudaMemcpyAsync(confidences.data(), d_confidences_,
+                                            block_length_ * sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream),
+                            "D2H confidences")) {
+                return false;
+            }
+            cudaEvent_t d2h_event;
+            if (cudaEventCreateWithFlags(&d2h_event, cudaEventDisableTiming) != cudaSuccess) {
+                return false;
+            }
+            cudaEventRecord(d2h_event, stream);
+            ProfilerTimer event_wait_timer;
+            cudaEventSynchronize(d2h_event);
+            double event_wait_ms = event_wait_timer.elapsed_ms();
+            cudaEventDestroy(d2h_event);
+            double d2h_ms = d2h_timer.elapsed_ms();
+
+            double total_ms = sample_timer.elapsed_ms();
+            double fused_ms = std::max(0.0, total_ms - d2h_ms);
+
+            // Record stats (softmax+sample fused)
+            profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
+            profiler.record_custom("sampler_gpu_stage_softmax_ms", fused_ms);
+            profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
+            profiler.record_custom("sampler_gpu_stage_d2h_ms", d2h_ms);
+            profiler.record_custom("sampler_gpu_event_wait_ms", event_wait_ms);
+            profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
+
+            if (stats) {
+                stats->stage_prepare_ms = prepare_ms;
+                stats->stage_softmax_ms = fused_ms;
+                stats->stage_sort_ms = 0.0;
+                stats->stage_sample_ms = fused_ms;
+                stats->stage_d2h_ms = d2h_ms;
+                stats->stage_event_wait_ms = event_wait_ms;
+                stats->stage_cpu_post_ms = 0.0;
+                stats->fast_path = true;
+                stats->device_logits = false;
+            }
+
+            // No token_probs in fast path
+            return true;
+        }
+
         if (config_.temperature != 1.0f) {
             const float inv_temp = 1.0f / config_.temperature;
             const size_t threads = 256;
@@ -436,10 +630,8 @@ public:
             scale_logits_kernel<<<blocks, threads, 0, stream>>>(d_logits_, inv_temp, expected);
         }
         
-        if (!check_cuda(cudaStreamSynchronize(stream), "sync after prep")) {
-            return false;
-        }
-        double prepare_ms = prepare_timer.elapsed_ms();
+        // Rely on stream ordering; avoid extra sync before softmax
+        prepare_ms = prepare_timer.elapsed_ms();
 
         // ========== Stage 2: GPU Softmax (batched for all rows) ==========
         ProfilerTimer softmax_timer;
@@ -456,71 +648,6 @@ public:
         softmax_normalize_kernel<<<block_length_, threads_per_block, 0, stream>>>(
             d_probs_, d_row_sum_, vocab_size_, block_length_);
         double softmax_ms = softmax_timer.elapsed_ms();
-
-        // ========== Fast path: GPU sampling without sort/topk/topp ==========
-        const bool fast_gpu_sample = use_gpu_sampling_ &&
-                                     !need_probs &&
-                                     config_.top_k <= 0 &&
-                                     config_.top_p >= 1.0f;
-        if (fast_gpu_sample) {
-            ProfilerTimer sample_timer;
-
-            // generate randoms on GPU
-            std::uniform_int_distribution<uint64_t> dist64;
-            uint64_t seed = dist64(rng);
-            int threads = 256;
-            int blocks = (block_length_ + threads - 1) / threads;
-            fill_random_kernel<<<blocks, threads, 0, stream>>>(d_random_vals_, seed, block_length_);
-
-            // Choose blockDim based on vocab size to avoid wasted threads
-            int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
-            const size_t sample_smem = sample_threads * sizeof(float) + sample_threads * sizeof(int);
-            sample_tokens_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
-                d_probs_, d_random_vals_,
-                d_sampled_tokens_, d_confidences_,
-                vocab_size_, block_length_,
-                config_.top_k, config_.top_p
-            );
-
-            // Copy back minimal results
-            if (!check_cuda(cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
-                                            block_length_ * sizeof(int),
-                                            cudaMemcpyDeviceToHost, stream),
-                            "D2H sampled_tokens")) {
-                return false;
-            }
-            if (!check_cuda(cudaMemcpyAsync(confidences.data(), d_confidences_,
-                                            block_length_ * sizeof(float),
-                                            cudaMemcpyDeviceToHost, stream),
-                            "D2H confidences")) {
-                return false;
-            }
-
-            if (!check_cuda(cudaStreamSynchronize(stream), "sync after gpu sample")) {
-                return false;
-            }
-
-            double sample_ms = sample_timer.elapsed_ms();
-
-            // Record stats
-            profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
-            profiler.record_custom("sampler_gpu_stage_softmax_ms", softmax_ms);
-            profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
-            profiler.record_custom("sampler_gpu_stage_d2h_ms", sample_ms);
-            profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
-
-            if (stats) {
-                stats->stage_prepare_ms = prepare_ms;
-                stats->stage_softmax_ms = softmax_ms;
-                stats->stage_sort_ms = 0.0;
-                stats->stage_sample_ms = sample_ms;
-                stats->stage_d2h_ms = sample_ms;
-                stats->stage_cpu_post_ms = 0.0;
-            }
-
-            // No token_probs in fast path
-            return true;
-        }
 
         // ========== Stage 3: Sort probabilities (only if needed for top-p/top-k) ==========
         ProfilerTimer sort_timer;
@@ -541,9 +668,6 @@ public:
                 thrust::sort_by_key(policy, prob_ptr, prob_ptr + vocab_size_, idx_ptr, thrust::greater<float>());
             }
             
-            if (!check_cuda(cudaStreamSynchronize(stream), "sync after sort")) {
-                return false;
-            }
         }
         sort_ms = sort_timer.elapsed_ms();
 
@@ -645,6 +769,82 @@ public:
             return false;
         }
 
+        double prepare_ms = 0.0;
+
+        // ========== Fast path: GPU sampling without sort/topk/topp ==========
+        const bool fast_gpu_sample = use_gpu_sampling_ &&
+                                     !need_probs &&
+                                     config_.top_k <= 0 &&
+                                     config_.top_p >= 1.0f;
+        if (fast_gpu_sample) {
+            ProfilerTimer sample_timer;
+            prepare_ms = prepare_timer.elapsed_ms();
+
+            std::uniform_int_distribution<uint64_t> dist64;
+            uint64_t seed = dist64(rng);
+            int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
+            const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
+            const float inv_temp = (config_.temperature != 1.0f) ? 1.0f / config_.temperature : 1.0f;
+            fused_softmax_sample_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
+                d_logits_,
+                vocab_size_,
+                block_length_,
+                inv_temp,
+                seed,
+                d_sampled_tokens_,
+                d_confidences_
+            );
+
+            ProfilerTimer d2h_timer;
+            if (!check_cuda(cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
+                                            block_length_ * sizeof(int),
+                                            cudaMemcpyDeviceToHost, stream),
+                            "D2H sampled_tokens")) {
+                return false;
+            }
+            if (!check_cuda(cudaMemcpyAsync(confidences.data(), d_confidences_,
+                                            block_length_ * sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream),
+                            "D2H confidences")) {
+                return false;
+            }
+            cudaEvent_t d2h_event;
+            if (cudaEventCreateWithFlags(&d2h_event, cudaEventDisableTiming) != cudaSuccess) {
+                return false;
+            }
+            cudaEventRecord(d2h_event, stream);
+            ProfilerTimer event_wait_timer;
+            cudaEventSynchronize(d2h_event);
+            double event_wait_ms = event_wait_timer.elapsed_ms();
+            cudaEventDestroy(d2h_event);
+            double d2h_ms = d2h_timer.elapsed_ms();
+
+            double total_ms = sample_timer.elapsed_ms();
+            double fused_ms = std::max(0.0, total_ms - d2h_ms);
+
+            // Record stats
+            profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
+            profiler.record_custom("sampler_gpu_stage_softmax_ms", fused_ms);
+            profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
+            profiler.record_custom("sampler_gpu_stage_d2h_ms", d2h_ms);
+            profiler.record_custom("sampler_gpu_event_wait_ms", event_wait_ms);
+            profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
+
+            if (stats) {
+                stats->stage_prepare_ms = prepare_ms;
+                stats->stage_softmax_ms = fused_ms;
+                stats->stage_sort_ms = 0.0;
+                stats->stage_sample_ms = fused_ms;
+                stats->stage_d2h_ms = d2h_ms;
+                stats->stage_event_wait_ms = event_wait_ms;
+                stats->stage_cpu_post_ms = 0.0;
+                stats->fast_path = true;
+                stats->device_logits = true;
+            }
+
+            return true;
+        }
+
         if (config_.temperature != 1.0f) {
             const float inv_temp = 1.0f / config_.temperature;
             const size_t threads = 256;
@@ -652,10 +852,8 @@ public:
             scale_logits_kernel<<<blocks, threads, 0, stream>>>(d_logits_, inv_temp, expected);
         }
 
-        if (!check_cuda(cudaStreamSynchronize(stream), "sync after prep")) {
-            return false;
-        }
-        double prepare_ms = prepare_timer.elapsed_ms();
+        // Avoid explicit sync; downstream kernels on the same stream enforce ordering
+        prepare_ms = prepare_timer.elapsed_ms();
 
         // ========== Stage 2: GPU Softmax (batched for all rows) ==========
         ProfilerTimer softmax_timer;
@@ -671,70 +869,6 @@ public:
         softmax_normalize_kernel<<<block_length_, threads_per_block, 0, stream>>>(
             d_probs_, d_row_sum_, vocab_size_, block_length_);
         double softmax_ms = softmax_timer.elapsed_ms();
-
-        // ========== Fast path: GPU sampling without sort/topk/topp ==========
-        const bool fast_gpu_sample = use_gpu_sampling_ &&
-                                     !need_probs &&
-                                     config_.top_k <= 0 &&
-                                     config_.top_p >= 1.0f;
-        if (fast_gpu_sample) {
-            ProfilerTimer sample_timer;
-
-            // generate randoms on GPU
-            std::uniform_int_distribution<uint64_t> dist64;
-            uint64_t seed = dist64(rng);
-            int threads = 256;
-            int blocks = (block_length_ + threads - 1) / threads;
-            fill_random_kernel<<<blocks, threads, 0, stream>>>(d_random_vals_, seed, block_length_);
-
-            // Choose blockDim based on vocab size to avoid wasted threads
-            int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
-            const size_t sample_smem = sample_threads * sizeof(float) + sample_threads * sizeof(int);
-            sample_tokens_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
-                d_probs_, d_random_vals_,
-                d_sampled_tokens_, d_confidences_,
-                vocab_size_, block_length_,
-                config_.top_k, config_.top_p
-            );
-
-            // Copy back minimal results
-            if (!check_cuda(cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
-                                            block_length_ * sizeof(int),
-                                            cudaMemcpyDeviceToHost, stream),
-                            "D2H sampled_tokens")) {
-                return false;
-            }
-            if (!check_cuda(cudaMemcpyAsync(confidences.data(), d_confidences_,
-                                            block_length_ * sizeof(float),
-                                            cudaMemcpyDeviceToHost, stream),
-                            "D2H confidences")) {
-                return false;
-            }
-
-            if (!check_cuda(cudaStreamSynchronize(stream), "sync after gpu sample")) {
-                return false;
-            }
-
-            double sample_ms = sample_timer.elapsed_ms();
-
-            // Record stats
-            profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
-            profiler.record_custom("sampler_gpu_stage_softmax_ms", softmax_ms);
-            profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
-            profiler.record_custom("sampler_gpu_stage_d2h_ms", sample_ms);
-            profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
-
-            if (stats) {
-                stats->stage_prepare_ms = prepare_ms;
-                stats->stage_softmax_ms = softmax_ms;
-                stats->stage_sort_ms = 0.0;
-                stats->stage_sample_ms = sample_ms;
-                stats->stage_d2h_ms = sample_ms;
-                stats->stage_cpu_post_ms = 0.0;
-            }
-
-            return true;
-        }
 
         // For need_probs/top-k/p we currently don't support device logits path
         // Signal caller to fall back to host logits path.

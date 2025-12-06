@@ -183,7 +183,7 @@ class DiffusionProfiler:
             'profile': {}
         }
         
-        # 平均profile数据
+        # 平均/合并 profile 数据（同时支持 total_ms/avg_ms/call_count 以及 count-only 遥测）
         all_sections = set()
         for result in run_results:
             all_sections.update(result['profile'].keys())
@@ -192,19 +192,29 @@ class DiffusionProfiler:
             total_ms_values = []
             avg_ms_values = []
             call_count_values = []
+            count_values = []
             
             for result in run_results:
                 if section in result['profile']:
                     stats = result['profile'][section]
-                    total_ms_values.append(stats.get('total_ms', 0))
-                    avg_ms_values.append(stats.get('avg_ms', 0))
-                    call_count_values.append(stats.get('call_count', 0))
+                    if 'total_ms' in stats or 'avg_ms' in stats or 'call_count' in stats:
+                        total_ms_values.append(stats.get('total_ms', 0))
+                        avg_ms_values.append(stats.get('avg_ms', 0))
+                        call_count_values.append(stats.get('call_count', 0))
+                    if 'count' in stats:
+                        count_values.append(stats.get('count', 0))
             
             if total_ms_values:
                 avg_result['profile'][section] = {
                     'total_ms': sum(total_ms_values) / len(total_ms_values),
                     'avg_ms': sum(avg_ms_values) / len(avg_ms_values),
                     'call_count': sum(call_count_values) / len(call_count_values)
+                }
+                if count_values:
+                    avg_result['profile'][section]['count'] = sum(count_values) / len(count_values)
+            elif count_values:
+                avg_result['profile'][section] = {
+                    'count': sum(count_values) / len(count_values)
                 }
         
         return avg_result
@@ -236,6 +246,28 @@ class DiffusionProfiler:
         for section, stats in sorted_sections:
             lines.append(f"{section:<40} {stats.get('total_ms', 0):<12.2f} "
                          f"{stats.get('avg_ms', 0):<12.2f} {int(stats.get('call_count', 0)):<8}")
+
+        # Telemetry counts (GPU sampling)
+        telemetry_keys = [
+            "telemetry_gpu_fast_path",
+            "telemetry_gpu_device_fast_path",
+            "telemetry_gpu_path_device_hit",
+            "telemetry_gpu_path_device_miss",
+            "telemetry_gpu_path_need_entropy",
+            "telemetry_gpu_fallback_topk",
+            "telemetry_gpu_fallback_topp",
+            "telemetry_gpu_fallback_entropy",
+            "telemetry_gpu_fallback_stride",
+            "telemetry_gpu_fallback_device_unavail",
+            "telemetry_gpu_sampler_unavailable",
+            "telemetry_gpu_total",
+            "telemetry_gpu_overhead",
+        ]
+        present_telemetry = {k: profile[k].get("count", 0) for k in telemetry_keys if k in profile}
+        if present_telemetry:
+            lines.append("\nTelemetry (counts):")
+            for k, v in present_telemetry.items():
+                lines.append(f"{k:<35}: {v}")
 
         return "\n".join(lines)
 

@@ -24,11 +24,22 @@ struct SamplerTelemetry {
     double gpu_stage_sample_ms = 0.0;
     double gpu_stage_d2h_ms = 0.0;
     double gpu_stage_cpu_post_ms = 0.0;
+    double gpu_stage_event_wait_ms = 0.0;
+    double gpu_total_ms = 0.0;
+    double gpu_overhead_ms = 0.0;
     int gpu_success = 0;
     int gpu_fail = 0;
     int gpu_path_device_hit = 0;
     int gpu_path_device_miss = 0;
     int gpu_path_need_entropy = 0;
+    int gpu_fast_path = 0;
+    int gpu_device_fast_path = 0;
+    int gpu_fallback_topk = 0;
+    int gpu_fallback_topp = 0;
+    int gpu_fallback_entropy = 0;
+    int gpu_fallback_stride = 0;
+    int gpu_fallback_device_unavail = 0;
+    int gpu_sampler_unavailable = 0;
 
     double cpu_sampling_ms = 0.0;
     int cpu_sampling_calls = 0;
@@ -63,6 +74,11 @@ public:
     std::unique_ptr<GpuSampler> gpu_sampler_;
     bool use_gpu_sampler_ = false;
     SamplerTelemetry sampler_metrics_;
+    int last_logits_count_ = 0;
+#if defined(DIFFUSION_ENABLE_CUDA)
+    float* device_logits_compact_ = nullptr;
+    size_t device_logits_compact_bytes_ = 0;
+#endif
 
     int get_vocab_size();
 
@@ -129,7 +145,8 @@ protected:
         bool need_entropy_probs,
         std::vector<llama_token>& sampled_tokens,
         std::vector<float>& confidences,
-        std::vector<std::vector<float>>* entropy_probs_storage
+        std::vector<std::vector<float>>* entropy_probs_storage,
+        double* gpu_elapsed_ms = nullptr
     );
 };
 

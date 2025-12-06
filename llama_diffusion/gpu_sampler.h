@@ -15,6 +15,9 @@ struct GpuSamplerStats {
     double stage_sample_ms = 0.0;
     double stage_d2h_ms = 0.0;
     double stage_cpu_post_ms = 0.0;
+    double stage_event_wait_ms = 0.0;
+    bool fast_path = false;
+    bool device_logits = false;
 };
 
 #if defined(DIFFUSION_ENABLE_CUDA)

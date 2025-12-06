@@ -118,6 +118,9 @@ public:
         add_metric("telemetry_gpu_stage_sample", telemetry.gpu_stage_sample_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_d2h", telemetry.gpu_stage_d2h_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_cpu_post", telemetry.gpu_stage_cpu_post_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_event_wait", telemetry.gpu_stage_event_wait_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_total", telemetry.gpu_total_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead", telemetry.gpu_overhead_ms, telemetry.gpu_success + telemetry.gpu_fail);
         add_metric("telemetry_cpu_sampling", telemetry.cpu_sampling_ms, telemetry.cpu_sampling_calls);
         add_metric("telemetry_cpu_loop", telemetry.cpu_loop_ms, telemetry.cpu_loop_calls);
         add_count("telemetry_gpu_success", telemetry.gpu_success);
@@ -125,6 +128,14 @@ public:
         add_count("telemetry_gpu_path_device_hit", telemetry.gpu_path_device_hit);
         add_count("telemetry_gpu_path_device_miss", telemetry.gpu_path_device_miss);
         add_count("telemetry_gpu_path_need_entropy", telemetry.gpu_path_need_entropy);
+        add_count("telemetry_gpu_fast_path", telemetry.gpu_fast_path);
+        add_count("telemetry_gpu_device_fast_path", telemetry.gpu_device_fast_path);
+        add_count("telemetry_gpu_fallback_topk", telemetry.gpu_fallback_topk);
+        add_count("telemetry_gpu_fallback_topp", telemetry.gpu_fallback_topp);
+        add_count("telemetry_gpu_fallback_entropy", telemetry.gpu_fallback_entropy);
+        add_count("telemetry_gpu_fallback_stride", telemetry.gpu_fallback_stride);
+        add_count("telemetry_gpu_fallback_device_unavail", telemetry.gpu_fallback_device_unavail);
+        add_count("telemetry_gpu_sampler_unavailable", telemetry.gpu_sampler_unavailable);
         
         std::vector<int> int_result(result.begin(), result.end());
         return std::make_pair(int_result, py_profile);

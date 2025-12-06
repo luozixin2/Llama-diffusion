@@ -60,6 +60,7 @@ struct llama_context {
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
+    const int32_t * get_logits_output_ids(int * out_count);
     float * get_logits_ith(int32_t i);
     const float * get_logits_device(int64_t * stride_tokens) const;
 

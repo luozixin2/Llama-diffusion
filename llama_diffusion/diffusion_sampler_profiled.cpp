@@ -150,6 +150,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                 batch.pos[i] = static_cast<llama_pos>(block_start + i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
+                // 为保证 device logits 路径一致性，整块请求 logits
                 batch.logits[i] = true;
             }
             batch.n_tokens = config_.block_length;

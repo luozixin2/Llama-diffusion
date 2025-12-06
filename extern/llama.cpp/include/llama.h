@@ -926,6 +926,10 @@ extern "C" {
     // Experimental: device logits pointer (CUDA only, when enabled). Returns NULL if unavailable.
     LLAMA_API const float * llama_get_logits_device(struct llama_context * ctx, int64_t * stride_tokens);
 
+    // Experimental: mapping from requested logits rows to buffer rows.
+    // Returns pointer to array of length n_outputs (via out_count). Pointer lifetime tied to ctx.
+    LLAMA_API const int32_t * llama_get_logits_output_ids(struct llama_context * ctx, int * out_count);
+
     // Logits for the ith token. For positive indices, Equivalent to:
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
     // Negative indicies can be used to access logits in reverse order, -1 is the last logit.

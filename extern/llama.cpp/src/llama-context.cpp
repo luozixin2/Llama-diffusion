@@ -585,6 +585,14 @@ const float * llama_context::get_logits_device(int64_t * stride_tokens) const {
     return logits_device;
 }
 
+const int32_t * llama_context::get_logits_output_ids(int * out_count) {
+    output_reorder();
+    if (out_count) {
+        *out_count = n_outputs;
+    }
+    return output_ids.data();
+}
+
 float * llama_context::get_logits_ith(int32_t i) {
     int64_t j = -1;
 
@@ -1317,6 +1325,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_batch = cparams.n_batch;
     const auto n_vocab = vocab.n_tokens();
     const auto n_embd  = hparams.n_embd;
+    auto * output_dev  = model.dev_output();
 
     bool has_logits = true;
     bool has_embd   = cparams.embeddings;
@@ -1335,14 +1344,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
-    // reset device logits info
-    logits_device = nullptr;
-    logits_device_stride = 0;
-    logits_on_device = false;
-    buf_output_device.reset();
-
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
+    const size_t prev_size_device = buf_output_device ? ggml_backend_buffer_get_size(buf_output_device.get()) : 0;
     const size_t new_size  = (logits_size + embd_size) * sizeof(float);
+    const size_t new_size_device = logits_size * sizeof(float);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1361,7 +1366,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
         auto * buft = ggml_backend_cpu_buffer_type();
         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
 
         if (output_dev_host_buft) {
@@ -1375,15 +1379,31 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
 #if defined(GGML_USE_CUDA)
         // Optional: separate device logits buffer (logits only) to avoid sharing host buffer
-        if (enable_device_logits && output_dev) {
+        if (enable_device_logits && output_dev && logits_size > 0) {
             auto * dev_buft = ggml_backend_dev_buffer_type(output_dev);
-            if (dev_buft && ggml_backend_dev_type(output_dev) == GGML_BACKEND_DEVICE_TYPE_GPU && logits_size > 0) {
-                buf_output_device.reset(ggml_backend_buft_alloc_buffer(dev_buft, logits_size * sizeof(float)));
+            if (dev_buft && ggml_backend_dev_type(output_dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                buf_output_device.reset(ggml_backend_buft_alloc_buffer(dev_buft, new_size_device));
                 if (buf_output_device) {
                     logits_on_device = true;
                 } else {
                     LLAMA_LOG_WARN("%s: failed to allocate device logits buffer, falling back to host only\n", __func__);
                 }
+            }
+        }
+#endif
+    } else {
+#if defined(GGML_USE_CUDA)
+        // keep existing device buffer if large enough; otherwise try to reallocate
+        if (enable_device_logits && output_dev && logits_size > 0) {
+            if (!buf_output_device || prev_size_device < new_size_device) {
+                auto * dev_buft = ggml_backend_dev_buffer_type(output_dev);
+                if (dev_buft && ggml_backend_dev_type(output_dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    buf_output_device.reset(ggml_backend_buft_alloc_buffer(dev_buft, new_size_device));
+                    logits_on_device = buf_output_device != nullptr;
+                }
+            } else {
+                // existing device buffer is sufficient
+                logits_on_device = buf_output_device != nullptr;
             }
         }
 #endif
@@ -1444,16 +1464,6 @@ void llama_context::output_reorder() {
             logits_on_device = false;
             logits_device = nullptr;
             logits_device_stride = 0;
-        } else if (!output_swaps.empty()) {
-            const uint64_t n_rows = logits_size / n_vocab;
-            const int n_swaps = (int) output_swaps.size();
-            const bool ok = llama_gpu_swap_rows(const_cast<float *>(logits_device), n_vocab, n_rows, output_swaps.data(), n_swaps);
-            if (!ok) {
-                LLAMA_LOG_WARN("%s: llama_gpu_swap_rows failed, disabling device logits\n", __func__);
-                logits_on_device = false;
-                logits_device = nullptr;
-                logits_device_stride = 0;
-            }
         }
     }
 #endif
@@ -2559,6 +2569,11 @@ float * llama_get_logits(llama_context * ctx) {
 const float * llama_get_logits_device(llama_context * ctx, int64_t * stride_tokens) {
     ctx->synchronize();
     return ctx->get_logits_device(stride_tokens);
+}
+
+const int32_t * llama_get_logits_output_ids(llama_context * ctx, int * out_count) {
+    ctx->synchronize();
+    return ctx->get_logits_output_ids(out_count);
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
