@@ -1,21 +1,21 @@
 Average across 3 runs
-Wall Time: 1602.56 ms
+Wall Time: 1614.60 ms
 Tokens Generated: 149
-Throughput: 92.98 tokens/sec
+Throughput: 92.28 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         1551.10      1551.10      1       
-token_sampling                           1069.11      8.25         129     
-telemetry_cpu_sampling                   1068.36      8.24         129     
-telemetry_cpu_loop                       1068.08      8.24         129     
-denoising_step_0                         447.65       13.57        33      
-llama_decode                             402.48       3.10         129     
-denoising_step_1                         350.60       10.62        33      
-denoising_step_2                         350.24       10.61        33      
-denoising_step_3                         324.93       9.85         33      
-finalize_block                           77.51        2.35         33      
+generation_phase                         1547.92      1547.92      1       
+token_sampling                           1062.51      8.19         129     
+telemetry_cpu_sampling                   1061.74      8.19         129     
+sampler_cpu_sampling_ms                  1061.72      8.19         129     
+telemetry_cpu_loop                       1061.46      8.19         129     
+sampler_cpu_loop_ms                      1061.43      8.19         129     
+denoising_step_0                         446.48       13.53        33      
+llama_decode                             405.25       3.13         129     
+denoising_step_2                         349.60       10.59        33      
+denoising_step_1                         349.37       10.59        33      
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
@@ -53,23 +53,23 @@ telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=0
 telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=0
 
 Average across 3 runs
-Wall Time: 2256.12 ms
+Wall Time: 2242.17 ms
 Tokens Generated: 149
-Throughput: 66.04 tokens/sec
+Throughput: 66.45 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         2227.28      2227.28      1       
-token_sampling                           1818.95      13.96        130     
-telemetry_cpu_sampling                   1818.19      13.95        130     
-telemetry_cpu_loop                       1817.91      13.95        130     
-llama_decode                             366.27       2.81         130     
-denoising_step_0                         336.18       19.78        17      
-denoising_step_2                         277.19       16.31        17      
-denoising_step_1                         276.95       16.29        17      
-denoising_step_3                         262.16       15.42        17      
-denoising_step_5                         262.08       16.38        16      
+generation_phase                         2212.09      2212.09      1       
+token_sampling                           1800.31      13.81        130     
+telemetry_cpu_sampling                   1799.54      13.81        130     
+sampler_cpu_sampling_ms                  1799.52      13.81        130     
+telemetry_cpu_loop                       1799.25      13.80        130     
+sampler_cpu_loop_ms                      1799.20      13.80        130     
+llama_decode                             369.46       2.83         130     
+denoising_step_0                         333.03       19.59        17      
+denoising_step_2                         275.24       16.19        17      
+denoising_step_1                         274.92       16.17        17      
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
@@ -107,29 +107,29 @@ telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=0
 telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=0
 
 Average across 3 runs
-Wall Time: 3899.64 ms
+Wall Time: 3900.91 ms
 Tokens Generated: 149
-Throughput: 38.21 tokens/sec
+Throughput: 38.20 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         3869.75      3869.75      1       
-token_sampling                           3479.58      25.28        137     
-telemetry_cpu_sampling                   3478.64      25.27        137     
-telemetry_cpu_loop                       3478.29      25.27        137     
-block_6                                  451.38       451.38       1       
-block_9                                  449.85       449.85       1       
-block_5                                  449.78       449.78       1       
-block_7                                  448.85       448.85       1       
-block_2                                  448.25       448.25       1       
-block_8                                  448.18       448.18       1       
+generation_phase                         3868.83      3868.83      1       
+token_sampling                           3468.81      25.14        138     
+telemetry_cpu_sampling                   3467.87      25.13        138     
+sampler_cpu_sampling_ms                  3467.85      25.13        138     
+telemetry_cpu_loop                       3467.49      25.13        138     
+sampler_cpu_loop_ms                      3467.43      25.13        138     
+block_3                                  449.85       449.85       1       
+block_8                                  448.13       448.13       1       
+block_7                                  447.75       447.75       1       
+block_5                                  447.41       447.41       1       
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
 telemetry_gpu_device_fast_path     : 0.0
 telemetry_gpu_path_device_hit      : 0.0
-telemetry_gpu_path_device_miss     : 137.66666666666666
+telemetry_gpu_path_device_miss     : 138.0
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
 telemetry_gpu_fallback_topp        : 0.0
@@ -139,7 +139,7 @@ telemetry_gpu_fallback_stride_mismatch: 0.0
 telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
-telemetry_gpu_sampler_unavailable  : 137.66666666666666
+telemetry_gpu_sampler_unavailable  : 138.0
 telemetry_gpu_total                : total=0.00, avg=0.00, calls=0
 telemetry_gpu_overhead             : total=0.00, avg=0.00, calls=0
 telemetry_gpu_overhead_get_device_logits: total=0.00, avg=0.00, calls=0
@@ -161,29 +161,29 @@ telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=0
 telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=0
 
 Average across 3 runs
-Wall Time: 6194.92 ms
+Wall Time: 6212.85 ms
 Tokens Generated: 149
-Throughput: 24.05 tokens/sec
+Throughput: 23.98 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         6167.19      6167.19      1       
-token_sampling                           5509.54      45.42        121     
-telemetry_cpu_sampling                   5508.05      45.41        121     
-telemetry_cpu_loop                       5507.58      45.40        121     
-block_1                                  1621.20      1621.20      1       
-block_2                                  1453.08      1453.08      1       
-block_4                                  1338.74      1338.74      1       
-block_3                                  1184.70      1184.70      1       
-llama_decode                             627.79       5.18         121     
-block_0                                  569.44       569.44       1       
+generation_phase                         6182.83      6182.83      1       
+token_sampling                           5511.96      45.68        121     
+telemetry_cpu_sampling                   5510.57      45.67        121     
+sampler_cpu_sampling_ms                  5510.50      45.67        121     
+telemetry_cpu_loop                       5510.11      45.67        121     
+sampler_cpu_loop_ms                      5509.86      45.67        121     
+block_1                                  1617.86      1617.86      1       
+block_2                                  1603.07      1603.07      1       
+block_3                                  1255.75      1255.75      1       
+block_4                                  1135.90      1135.90      1       
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
 telemetry_gpu_device_fast_path     : 0.0
 telemetry_gpu_path_device_hit      : 0.0
-telemetry_gpu_path_device_miss     : 121.33333333333333
+telemetry_gpu_path_device_miss     : 121.0
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
 telemetry_gpu_fallback_topp        : 0.0
@@ -193,7 +193,7 @@ telemetry_gpu_fallback_stride_mismatch: 0.0
 telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
-telemetry_gpu_sampler_unavailable  : 121.33333333333333
+telemetry_gpu_sampler_unavailable  : 121.0
 telemetry_gpu_total                : total=0.00, avg=0.00, calls=0
 telemetry_gpu_overhead             : total=0.00, avg=0.00, calls=0
 telemetry_gpu_overhead_get_device_logits: total=0.00, avg=0.00, calls=0
@@ -215,29 +215,29 @@ telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=0
 telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=0
 
 Average across 3 runs
-Wall Time: 5149.50 ms
+Wall Time: 8420.50 ms
 Tokens Generated: 149
-Throughput: 28.93 tokens/sec
+Throughput: 17.69 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         5118.00      5118.00      1       
-token_sampling                           4802.59      91.13        52      
-telemetry_cpu_sampling                   4801.83      91.12        52      
-telemetry_cpu_loop                       4801.61      91.11        52      
-block_0                                  3308.86      3308.86      1       
-block_1                                  1346.95      1346.95      1       
-block_2                                  462.18       462.18       1       
-denoising_step_0                         313.84       104.61       3       
-llama_decode                             295.43       5.68         52      
-denoising_step_2                         293.03       97.68        3       
+generation_phase                         8385.96      8385.96      1       
+token_sampling                           7874.87      90.07        87      
+telemetry_cpu_sampling                   7873.65      90.06        87      
+sampler_cpu_sampling_ms                  7873.58      90.05        87      
+telemetry_cpu_loop                       7873.28      90.05        87      
+sampler_cpu_loop_ms                      7872.94      90.05        87      
+block_0                                  3763.77      3763.77      1       
+block_1                                  2323.18      2323.18      1       
+block_2                                  2299.00      2299.00      1       
+llama_decode                             487.67       5.69         87      
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
 telemetry_gpu_device_fast_path     : 0.0
 telemetry_gpu_path_device_hit      : 0.0
-telemetry_gpu_path_device_miss     : 52.666666666666664
+telemetry_gpu_path_device_miss     : 87.66666666666667
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
 telemetry_gpu_fallback_topp        : 0.0
@@ -247,7 +247,7 @@ telemetry_gpu_fallback_stride_mismatch: 0.0
 telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
-telemetry_gpu_sampler_unavailable  : 52.666666666666664
+telemetry_gpu_sampler_unavailable  : 87.66666666666667
 telemetry_gpu_total                : total=0.00, avg=0.00, calls=0
 telemetry_gpu_overhead             : total=0.00, avg=0.00, calls=0
 telemetry_gpu_overhead_get_device_logits: total=0.00, avg=0.00, calls=0
@@ -269,28 +269,28 @@ telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=0
 telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=0
 
 Average across 3 runs
-Wall Time: 973.17 ms
+Wall Time: 977.62 ms
 Tokens Generated: 149
-Throughput: 153.11 tokens/sec
+Throughput: 152.41 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         925.84       925.84       1       
-token_sampling                           450.63       3.48         129     
-telemetry_gpu_overhead                   425.85       3.29         129     
-telemetry_gpu_overhead_host_pre          425.45       3.29         129     
-llama_decode                             398.75       3.08         129     
-denoising_step_0                         292.56       8.87         33      
-denoising_step_1                         191.41       5.80         33      
-denoising_step_2                         189.39       5.74         33      
-denoising_step_3                         177.71       5.44         32      
-finalize_block                           74.59        2.26         33      
+generation_phase                         928.50       928.50       1       
+sampler_gpu_host_pre_sync_before_get_device_ms 782.39       3.01         260     
+token_sampling                           449.58       3.46         130     
+telemetry_gpu_overhead                   424.65       3.27         130     
+sampler_gpu_overhead_ms                  424.65       3.27         130     
+telemetry_gpu_overhead_host_pre          424.00       3.26         130     
+sampler_gpu_overhead_host_pre_ms         424.00       3.26         130     
+llama_decode                             401.56       3.09         130     
+denoising_step_0                         291.15       8.82         33      
+denoising_step_1                         191.20       5.79         33      
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
-telemetry_gpu_device_fast_path     : 129.33333333333334
-telemetry_gpu_path_device_hit      : 129.33333333333334
+telemetry_gpu_device_fast_path     : 130.0
+telemetry_gpu_path_device_hit      : 130.0
 telemetry_gpu_path_device_miss     : 0.0
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
@@ -302,103 +302,55 @@ telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
 telemetry_gpu_sampler_unavailable  : 0.0
-telemetry_gpu_total                : total=48.06, avg=0.37, calls=129
-telemetry_gpu_overhead             : total=425.85, avg=3.29, calls=129
-telemetry_gpu_overhead_get_device_logits: total=0.31, avg=0.00, calls=129
-telemetry_gpu_overhead_get_output_ids: total=28.68, avg=0.22, calls=129
-telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=129
-telemetry_gpu_overhead_host_pre    : total=425.45, avg=3.29, calls=129
-telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=129
-telemetry_gpu_overhead_host_post   : total=0.14, avg=0.00, calls=129
-telemetry_gpu_stage_prepare        : total=4.43, avg=0.03, calls=129
-telemetry_gpu_prepare_copy         : total=1.29, avg=0.01, calls=129
-telemetry_gpu_prepare_temp         : total=0.91, avg=0.01, calls=129
-telemetry_gpu_prepare_mask         : total=1.19, avg=0.01, calls=129
-telemetry_gpu_prepare_rng          : total=1.05, avg=0.01, calls=129
-telemetry_gpu_stage_softmax        : total=13.14, avg=0.10, calls=129
-telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=129
-telemetry_gpu_stage_sample         : total=13.14, avg=0.10, calls=129
-telemetry_gpu_stage_d2h            : total=2.50, avg=0.02, calls=129
-telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=129
-telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=129
-
-Average across 3 runs
-Wall Time: 927.94 ms
-Tokens Generated: 149
-Throughput: 160.57 tokens/sec
-
-Top 10 Time-Consuming Sections:
-Section                                  Total (ms)   Avg (ms)     Calls   
---------------------------------------------------------------------------------
-generation_phase                         884.55       884.55       1       
-token_sampling                           502.47       3.86         130     
-telemetry_gpu_overhead                   478.15       3.67         130     
-telemetry_gpu_overhead_host_pre          477.77       3.67         130     
-llama_decode                             343.13       2.63         130     
-denoising_step_0                         160.84       9.46         17      
-denoising_step_2                         103.30       6.08         17      
-denoising_step_1                         103.07       6.06         17      
-denoising_step_5                         97.02        6.06         16      
-denoising_step_3                         96.82        5.70         17      
-
-Telemetry:
-telemetry_gpu_fast_path            : 0.0
-telemetry_gpu_device_fast_path     : 130.33333333333334
-telemetry_gpu_path_device_hit      : 130.33333333333334
-telemetry_gpu_path_device_miss     : 0.0
-telemetry_gpu_path_need_entropy    : 0.0
-telemetry_gpu_fallback_topk        : 0.0
-telemetry_gpu_fallback_topp        : 0.0
-telemetry_gpu_fallback_entropy     : 0.0
-telemetry_gpu_fallback_stride      : 0.0
-telemetry_gpu_fallback_stride_mismatch: 0.0
-telemetry_gpu_fallback_partial_logits: 0.0
-telemetry_gpu_fallback_compact_fail: 0.0
-telemetry_gpu_fallback_device_unavail: 0.0
-telemetry_gpu_sampler_unavailable  : 0.0
-telemetry_gpu_total                : total=47.15, avg=0.36, calls=130
-telemetry_gpu_overhead             : total=478.15, avg=3.67, calls=130
-telemetry_gpu_overhead_get_device_logits: total=0.32, avg=0.00, calls=130
-telemetry_gpu_overhead_get_output_ids: total=37.74, avg=0.29, calls=130
+telemetry_gpu_total                : total=48.30, avg=0.37, calls=130
+telemetry_gpu_overhead             : total=424.65, avg=3.27, calls=130
+telemetry_gpu_overhead_get_device_logits: total=0.33, avg=0.00, calls=130
+telemetry_gpu_overhead_get_output_ids: total=28.72, avg=0.22, calls=130
 telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=130
-telemetry_gpu_overhead_host_pre    : total=477.77, avg=3.67, calls=130
+telemetry_gpu_overhead_host_pre    : total=424.00, avg=3.26, calls=130
 telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=130
 telemetry_gpu_overhead_host_post   : total=0.15, avg=0.00, calls=130
-telemetry_gpu_stage_prepare        : total=3.80, avg=0.03, calls=130
-telemetry_gpu_prepare_copy         : total=1.20, avg=0.01, calls=130
-telemetry_gpu_prepare_temp         : total=0.88, avg=0.01, calls=130
-telemetry_gpu_prepare_mask         : total=0.75, avg=0.01, calls=130
-telemetry_gpu_prepare_rng          : total=0.98, avg=0.01, calls=130
-telemetry_gpu_stage_softmax        : total=13.52, avg=0.10, calls=130
+sampler_gpu_host_pre_get_device_ms : total=0.33, avg=0.00, calls=130
+sampler_gpu_host_pre_get_output_ids_ms: total=28.72, avg=0.22, calls=130
+sampler_gpu_host_pre_debug_compare_ms: total=0.00, avg=0.00, calls=130
+sampler_gpu_host_pre_compact_ms    : total=2.57, avg=0.02, calls=130
+sampler_gpu_host_pre_sync_ms       : total=0.00, avg=0.00, calls=130
+sampler_gpu_host_pre_misc_ms       : total=0.05, avg=0.00, calls=130
+telemetry_gpu_stage_prepare        : total=4.56, avg=0.04, calls=130
+telemetry_gpu_prepare_copy         : total=1.33, avg=0.01, calls=130
+telemetry_gpu_prepare_temp         : total=0.93, avg=0.01, calls=130
+telemetry_gpu_prepare_mask         : total=1.22, avg=0.01, calls=130
+telemetry_gpu_prepare_rng          : total=1.07, avg=0.01, calls=130
+telemetry_gpu_stage_softmax        : total=13.14, avg=0.10, calls=130
 telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=130
-telemetry_gpu_stage_sample         : total=13.52, avg=0.10, calls=130
-telemetry_gpu_stage_d2h            : total=2.39, avg=0.02, calls=130
+telemetry_gpu_stage_sample         : total=13.14, avg=0.10, calls=130
+telemetry_gpu_stage_d2h            : total=2.53, avg=0.02, calls=130
 telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=130
 telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=130
 
 Average across 3 runs
-Wall Time: 907.77 ms
+Wall Time: 940.03 ms
 Tokens Generated: 149
-Throughput: 164.14 tokens/sec
+Throughput: 158.51 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         857.66       857.66       1       
-token_sampling                           546.93       4.70         116     
-telemetry_gpu_overhead                   525.07       4.52         116     
-telemetry_gpu_overhead_host_pre          524.72       4.51         116     
-llama_decode                             289.41       2.52         116     
-block_2                                  115.92       115.92       1       
-block_3                                  113.79       113.79       1       
-block_4                                  105.22       105.22       1       
-denoising_step_0                         100.20       11.13        9       
-block_5                                  93.28        93.28        1       
+generation_phase                         893.04       893.04       1       
+sampler_gpu_host_pre_sync_before_get_device_ms 867.70       3.35         259     
+token_sampling                           507.00       3.91         129     
+telemetry_gpu_overhead                   482.55       3.72         129     
+sampler_gpu_overhead_ms                  482.55       3.72         129     
+telemetry_gpu_overhead_host_pre          481.93       3.72         129     
+sampler_gpu_overhead_host_pre_ms         481.93       3.72         129     
+llama_decode                             346.58       2.67         129     
+denoising_step_0                         162.88       9.58         17      
+total_length                             152.00       152.00       1       
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
-telemetry_gpu_device_fast_path     : 116.33333333333333
-telemetry_gpu_path_device_hit      : 116.33333333333333
+telemetry_gpu_device_fast_path     : 129.66666666666666
+telemetry_gpu_path_device_hit      : 129.66666666666666
 telemetry_gpu_path_device_miss     : 0.0
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
@@ -410,49 +362,55 @@ telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
 telemetry_gpu_sampler_unavailable  : 0.0
-telemetry_gpu_total                : total=42.31, avg=0.36, calls=116
-telemetry_gpu_overhead             : total=525.07, avg=4.52, calls=116
-telemetry_gpu_overhead_get_device_logits: total=0.30, avg=0.00, calls=116
-telemetry_gpu_overhead_get_output_ids: total=63.00, avg=0.54, calls=116
-telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=116
-telemetry_gpu_overhead_host_pre    : total=524.72, avg=4.51, calls=116
-telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=116
-telemetry_gpu_overhead_host_post   : total=0.13, avg=0.00, calls=116
-telemetry_gpu_stage_prepare        : total=3.49, avg=0.03, calls=116
-telemetry_gpu_prepare_copy         : total=1.29, avg=0.01, calls=116
-telemetry_gpu_prepare_temp         : total=0.72, avg=0.01, calls=116
-telemetry_gpu_prepare_mask         : total=0.62, avg=0.01, calls=116
-telemetry_gpu_prepare_rng          : total=0.87, avg=0.01, calls=116
-telemetry_gpu_stage_softmax        : total=12.31, avg=0.11, calls=116
-telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=116
-telemetry_gpu_stage_sample         : total=12.31, avg=0.11, calls=116
-telemetry_gpu_stage_d2h            : total=2.02, avg=0.02, calls=116
-telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=116
-telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=116
+telemetry_gpu_total                : total=47.34, avg=0.37, calls=129
+telemetry_gpu_overhead             : total=482.55, avg=3.72, calls=129
+telemetry_gpu_overhead_get_device_logits: total=0.33, avg=0.00, calls=129
+telemetry_gpu_overhead_get_output_ids: total=41.85, avg=0.32, calls=129
+telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=129
+telemetry_gpu_overhead_host_pre    : total=481.93, avg=3.72, calls=129
+telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=129
+telemetry_gpu_overhead_host_post   : total=0.15, avg=0.00, calls=129
+sampler_gpu_host_pre_get_device_ms : total=0.33, avg=0.00, calls=129
+sampler_gpu_host_pre_get_output_ids_ms: total=41.85, avg=0.32, calls=129
+sampler_gpu_host_pre_debug_compare_ms: total=0.00, avg=0.00, calls=129
+sampler_gpu_host_pre_compact_ms    : total=4.66, avg=0.04, calls=129
+sampler_gpu_host_pre_sync_ms       : total=0.00, avg=0.00, calls=129
+sampler_gpu_host_pre_misc_ms       : total=0.06, avg=0.00, calls=129
+telemetry_gpu_stage_prepare        : total=3.87, avg=0.03, calls=129
+telemetry_gpu_prepare_copy         : total=1.22, avg=0.01, calls=129
+telemetry_gpu_prepare_temp         : total=0.90, avg=0.01, calls=129
+telemetry_gpu_prepare_mask         : total=0.75, avg=0.01, calls=129
+telemetry_gpu_prepare_rng          : total=1.00, avg=0.01, calls=129
+telemetry_gpu_stage_softmax        : total=13.50, avg=0.10, calls=129
+telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=129
+telemetry_gpu_stage_sample         : total=13.50, avg=0.10, calls=129
+telemetry_gpu_stage_d2h            : total=2.45, avg=0.02, calls=129
+telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=129
+telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=129
 
 Average across 3 runs
-Wall Time: 1185.50 ms
+Wall Time: 955.01 ms
 Tokens Generated: 149
-Throughput: 125.69 tokens/sec
+Throughput: 156.02 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         1125.66      1125.66      1       
-llama_decode                             576.38       4.65         124     
-token_sampling                           524.58       4.23         124     
-telemetry_gpu_overhead                   500.28       4.03         124     
-telemetry_gpu_overhead_host_pre          499.87       4.03         124     
-block_1                                  286.37       286.37       1       
-block_2                                  278.45       278.45       1       
-block_3                                  257.08       257.08       1       
-block_4                                  194.17       194.17       1       
-block_0                                  109.56       109.56       1       
+sampler_gpu_host_pre_sync_before_get_device_ms 942.98       3.90         242     
+generation_phase                         898.79       898.79       1       
+token_sampling                           572.92       4.74         121     
+telemetry_gpu_overhead                   550.17       4.55         121     
+sampler_gpu_overhead_ms                  550.17       4.55         121     
+telemetry_gpu_overhead_host_pre          549.59       4.54         121     
+sampler_gpu_overhead_host_pre_ms         549.59       4.54         121     
+llama_decode                             304.19       2.51         121     
+total_length                             160.00       160.00       1       
+tokens_transferred_per_step              139.00       1.15         121     
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
-telemetry_gpu_device_fast_path     : 124.0
-telemetry_gpu_path_device_hit      : 124.0
+telemetry_gpu_device_fast_path     : 121.0
+telemetry_gpu_path_device_hit      : 121.0
 telemetry_gpu_path_device_miss     : 0.0
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
@@ -464,49 +422,55 @@ telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
 telemetry_gpu_sampler_unavailable  : 0.0
-telemetry_gpu_total                : total=46.66, avg=0.38, calls=124
-telemetry_gpu_overhead             : total=500.28, avg=4.03, calls=124
-telemetry_gpu_overhead_get_device_logits: total=0.30, avg=0.00, calls=124
-telemetry_gpu_overhead_get_output_ids: total=102.41, avg=0.83, calls=124
-telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=124
-telemetry_gpu_overhead_host_pre    : total=499.87, avg=4.03, calls=124
-telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=124
-telemetry_gpu_overhead_host_post   : total=0.15, avg=0.00, calls=124
-telemetry_gpu_stage_prepare        : total=4.22, avg=0.03, calls=124
-telemetry_gpu_prepare_copy         : total=1.97, avg=0.02, calls=124
-telemetry_gpu_prepare_temp         : total=0.77, avg=0.01, calls=124
-telemetry_gpu_prepare_mask         : total=0.64, avg=0.01, calls=124
-telemetry_gpu_prepare_rng          : total=0.83, avg=0.01, calls=124
-telemetry_gpu_stage_softmax        : total=13.26, avg=0.11, calls=124
-telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=124
-telemetry_gpu_stage_sample         : total=13.26, avg=0.11, calls=124
-telemetry_gpu_stage_d2h            : total=2.18, avg=0.02, calls=124
-telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=124
-telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=124
+telemetry_gpu_total                : total=44.04, avg=0.36, calls=121
+telemetry_gpu_overhead             : total=550.17, avg=4.55, calls=121
+telemetry_gpu_overhead_get_device_logits: total=0.31, avg=0.00, calls=121
+telemetry_gpu_overhead_get_output_ids: total=68.58, avg=0.57, calls=121
+telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=121
+telemetry_gpu_overhead_host_pre    : total=549.59, avg=4.54, calls=121
+telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=121
+telemetry_gpu_overhead_host_post   : total=0.14, avg=0.00, calls=121
+sampler_gpu_host_pre_get_device_ms : total=0.31, avg=0.00, calls=121
+sampler_gpu_host_pre_get_output_ids_ms: total=68.58, avg=0.57, calls=121
+sampler_gpu_host_pre_debug_compare_ms: total=0.00, avg=0.00, calls=121
+sampler_gpu_host_pre_compact_ms    : total=8.08, avg=0.07, calls=121
+sampler_gpu_host_pre_sync_ms       : total=0.00, avg=0.00, calls=121
+sampler_gpu_host_pre_misc_ms       : total=0.05, avg=0.00, calls=121
+telemetry_gpu_stage_prepare        : total=3.65, avg=0.03, calls=121
+telemetry_gpu_prepare_copy         : total=1.37, avg=0.01, calls=121
+telemetry_gpu_prepare_temp         : total=0.78, avg=0.01, calls=121
+telemetry_gpu_prepare_mask         : total=0.66, avg=0.01, calls=121
+telemetry_gpu_prepare_rng          : total=0.85, avg=0.01, calls=121
+telemetry_gpu_stage_softmax        : total=12.70, avg=0.10, calls=121
+telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=121
+telemetry_gpu_stage_sample         : total=12.70, avg=0.10, calls=121
+telemetry_gpu_stage_d2h            : total=2.20, avg=0.02, calls=121
+telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=121
+telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=121
 
 Average across 3 runs
-Wall Time: 516.37 ms
+Wall Time: 1130.23 ms
 Tokens Generated: 149
-Throughput: 288.55 tokens/sec
+Throughput: 131.83 tokens/sec
 
 Top 10 Time-Consuming Sections:
 Section                                  Total (ms)   Avg (ms)     Calls   
 --------------------------------------------------------------------------------
-generation_phase                         431.98       431.98       1       
-block_0                                  321.85       321.85       1       
-token_sampling                           236.35       6.63         35      
-telemetry_gpu_overhead                   228.46       6.41         35      
-telemetry_gpu_overhead_host_pre          228.34       6.40         35      
-llama_decode                             181.39       5.10         35      
-block_2                                  67.77        67.77        1       
-telemetry_gpu_overhead_get_output_ids    59.10        1.66         35      
-denoising_step_0                         57.66        19.22        3       
-block_1                                  42.34        42.34        1       
+generation_phase                         1061.00      1061.00      1       
+sampler_gpu_host_pre_sync_before_get_device_ms 686.93       3.01         228     
+llama_decode                             553.13       4.84         114     
+token_sampling                           482.73       4.22         114     
+telemetry_gpu_overhead                   460.22       4.03         114     
+sampler_gpu_overhead_ms                  460.22       4.03         114     
+telemetry_gpu_overhead_host_pre          459.63       4.02         114     
+sampler_gpu_overhead_host_pre_ms         459.63       4.02         114     
+block_2                                  290.31       290.31       1       
+block_1                                  289.56       289.56       1       
 
 Telemetry:
 telemetry_gpu_fast_path            : 0.0
-telemetry_gpu_device_fast_path     : 35.666666666666664
-telemetry_gpu_path_device_hit      : 35.666666666666664
+telemetry_gpu_device_fast_path     : 114.33333333333333
+telemetry_gpu_path_device_hit      : 114.33333333333333
 telemetry_gpu_path_device_miss     : 0.0
 telemetry_gpu_path_need_entropy    : 0.0
 telemetry_gpu_fallback_topk        : 0.0
@@ -518,25 +482,91 @@ telemetry_gpu_fallback_partial_logits: 0.0
 telemetry_gpu_fallback_compact_fail: 0.0
 telemetry_gpu_fallback_device_unavail: 0.0
 telemetry_gpu_sampler_unavailable  : 0.0
-telemetry_gpu_total                : total=15.17, avg=0.43, calls=35
-telemetry_gpu_overhead             : total=228.46, avg=6.41, calls=35
-telemetry_gpu_overhead_get_device_logits: total=0.10, avg=0.00, calls=35
-telemetry_gpu_overhead_get_output_ids: total=59.10, avg=1.66, calls=35
-telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=35
-telemetry_gpu_overhead_host_pre    : total=228.34, avg=6.40, calls=35
-telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=35
-telemetry_gpu_overhead_host_post   : total=0.04, avg=0.00, calls=35
-telemetry_gpu_stage_prepare        : total=2.10, avg=0.06, calls=35
-telemetry_gpu_prepare_copy         : total=1.45, avg=0.04, calls=35
-telemetry_gpu_prepare_temp         : total=0.23, avg=0.01, calls=35
-telemetry_gpu_prepare_mask         : total=0.18, avg=0.01, calls=35
-telemetry_gpu_prepare_rng          : total=0.24, avg=0.01, calls=35
-telemetry_gpu_stage_softmax        : total=3.77, avg=0.11, calls=35
-telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=35
-telemetry_gpu_stage_sample         : total=3.77, avg=0.11, calls=35
-telemetry_gpu_stage_d2h            : total=0.63, avg=0.02, calls=35
-telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=35
-telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=35
+telemetry_gpu_total                : total=43.23, avg=0.38, calls=114
+telemetry_gpu_overhead             : total=460.22, avg=4.03, calls=114
+telemetry_gpu_overhead_get_device_logits: total=0.29, avg=0.00, calls=114
+telemetry_gpu_overhead_get_output_ids: total=100.30, avg=0.88, calls=114
+telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=114
+telemetry_gpu_overhead_host_pre    : total=459.63, avg=4.02, calls=114
+telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=114
+telemetry_gpu_overhead_host_post   : total=0.14, avg=0.00, calls=114
+sampler_gpu_host_pre_get_device_ms : total=0.29, avg=0.00, calls=114
+sampler_gpu_host_pre_get_output_ids_ms: total=100.30, avg=0.88, calls=114
+sampler_gpu_host_pre_debug_compare_ms: total=0.00, avg=0.00, calls=114
+sampler_gpu_host_pre_compact_ms    : total=14.43, avg=0.13, calls=114
+sampler_gpu_host_pre_sync_ms       : total=0.00, avg=0.00, calls=114
+sampler_gpu_host_pre_misc_ms       : total=0.05, avg=0.00, calls=114
+telemetry_gpu_stage_prepare        : total=3.98, avg=0.03, calls=114
+telemetry_gpu_prepare_copy         : total=1.83, avg=0.02, calls=114
+telemetry_gpu_prepare_temp         : total=0.74, avg=0.01, calls=114
+telemetry_gpu_prepare_mask         : total=0.62, avg=0.01, calls=114
+telemetry_gpu_prepare_rng          : total=0.78, avg=0.01, calls=114
+telemetry_gpu_stage_softmax        : total=12.18, avg=0.11, calls=114
+telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=114
+telemetry_gpu_stage_sample         : total=12.18, avg=0.11, calls=114
+telemetry_gpu_stage_d2h            : total=2.05, avg=0.02, calls=114
+telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=114
+telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=114
+
+Average across 3 runs
+Wall Time: 1250.22 ms
+Tokens Generated: 149
+Throughput: 119.18 tokens/sec
+
+Top 10 Time-Consuming Sections:
+Section                                  Total (ms)   Avg (ms)     Calls   
+--------------------------------------------------------------------------------
+generation_phase                         1150.82      1150.82      1       
+sampler_gpu_host_pre_sync_before_get_device_ms 869.08       4.35         200     
+token_sampling                           655.59       6.56         100     
+telemetry_gpu_overhead                   633.03       6.34         100     
+sampler_gpu_overhead_ms                  633.03       6.34         100     
+telemetry_gpu_overhead_host_pre          632.58       6.33         100     
+sampler_gpu_overhead_host_pre_ms         632.58       6.33         100     
+block_0                                  491.61       491.61       1       
+llama_decode                             479.20       4.84         100     
+block_1                                  419.95       419.95       1       
+
+Telemetry:
+telemetry_gpu_fast_path            : 0.0
+telemetry_gpu_device_fast_path     : 100.0
+telemetry_gpu_path_device_hit      : 100.0
+telemetry_gpu_path_device_miss     : 0.0
+telemetry_gpu_path_need_entropy    : 0.0
+telemetry_gpu_fallback_topk        : 0.0
+telemetry_gpu_fallback_topp        : 0.0
+telemetry_gpu_fallback_entropy     : 0.0
+telemetry_gpu_fallback_stride      : 0.0
+telemetry_gpu_fallback_stride_mismatch: 0.0
+telemetry_gpu_fallback_partial_logits: 0.0
+telemetry_gpu_fallback_compact_fail: 0.0
+telemetry_gpu_fallback_device_unavail: 0.0
+telemetry_gpu_sampler_unavailable  : 0.0
+telemetry_gpu_total                : total=43.53, avg=0.44, calls=100
+telemetry_gpu_overhead             : total=633.03, avg=6.34, calls=100
+telemetry_gpu_overhead_get_device_logits: total=0.26, avg=0.00, calls=100
+telemetry_gpu_overhead_get_output_ids: total=171.92, avg=1.72, calls=100
+telemetry_gpu_overhead_debug_compare: total=0.00, avg=0.00, calls=100
+telemetry_gpu_overhead_host_pre    : total=632.58, avg=6.33, calls=100
+telemetry_gpu_overhead_host_after_output: total=0.00, avg=0.00, calls=100
+telemetry_gpu_overhead_host_post   : total=0.12, avg=0.00, calls=100
+sampler_gpu_host_pre_get_device_ms : total=0.26, avg=0.00, calls=100
+sampler_gpu_host_pre_get_output_ids_ms: total=171.92, avg=1.72, calls=100
+sampler_gpu_host_pre_debug_compare_ms: total=0.00, avg=0.00, calls=100
+sampler_gpu_host_pre_compact_ms    : total=24.79, avg=0.25, calls=100
+sampler_gpu_host_pre_sync_ms       : total=0.00, avg=0.00, calls=100
+sampler_gpu_host_pre_misc_ms       : total=0.10, avg=0.00, calls=100
+telemetry_gpu_stage_prepare        : total=5.99, avg=0.06, calls=100
+telemetry_gpu_prepare_copy         : total=4.13, avg=0.04, calls=100
+telemetry_gpu_prepare_temp         : total=0.66, avg=0.01, calls=100
+telemetry_gpu_prepare_mask         : total=0.52, avg=0.01, calls=100
+telemetry_gpu_prepare_rng          : total=0.68, avg=0.01, calls=100
+telemetry_gpu_stage_softmax        : total=10.82, avg=0.11, calls=100
+telemetry_gpu_stage_sort           : total=0.00, avg=0.00, calls=100
+telemetry_gpu_stage_sample         : total=10.82, avg=0.11, calls=100
+telemetry_gpu_stage_d2h            : total=1.85, avg=0.02, calls=100
+telemetry_gpu_stage_cpu_post       : total=0.00, avg=0.00, calls=100
+telemetry_gpu_event_wait           : total=0.00, avg=0.00, calls=100
 
 
 ================================================================================
@@ -545,13 +575,13 @@ COMPARATIVE SUMMARY
 
 Config                         Wall Time (ms)  Tokens/sec      Speedup   
 ----------------------------------------------------------------------
-CPU (block=4, steps=4)         1602.56         92.98           1.00      x
-CPU (block=8, steps=8)         2256.12         66.04           0.71      x
-CPU (block=16, steps=16)       3899.64         38.21           0.41      x
-CPU (block=32, steps=32)       6194.92         24.05           0.26      x
-CPU (block=64, steps=64)       5149.50         28.93           0.31      x
-GPU (block=4, steps=4)         973.17          153.11          1.65      x
-GPU (block=8, steps=8)         927.94          160.57          1.73      x
-GPU (block=16, steps=16)       907.77          164.14          1.77      x
-GPU (block=32, steps=32)       1185.50         125.69          1.35      x
-GPU (block=64, steps=64)       516.37          288.55          3.10      x
+CPU (block=4, steps=4)         1614.60         92.28           1.00      x
+CPU (block=8, steps=8)         2242.17         66.45           0.72      x
+CPU (block=16, steps=16)       3900.91         38.20           0.41      x
+CPU (block=32, steps=32)       6212.85         23.98           0.26      x
+CPU (block=64, steps=64)       8420.50         17.69           0.19      x
+GPU (block=4, steps=4)         977.62          152.41          1.65      x
+GPU (block=8, steps=8)         940.03          158.51          1.72      x
+GPU (block=16, steps=16)       955.01          156.02          1.69      x
+GPU (block=32, steps=32)       1130.23         131.83          1.43      x
+GPU (block=64, steps=64)       1250.22         119.18          1.29      x

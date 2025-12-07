@@ -96,6 +96,19 @@ public:
             }
             py_profile[py::str(outer.first)] = inner_dict;
         }
+        // Append custom metrics (record_custom)
+        for (const auto& kv : custom_metrics) {
+            const auto& name = kv.first;
+            const auto& values = kv.second;
+            double total = 0.0;
+            for (double v : values) total += v;
+            double avg = values.empty() ? 0.0 : total / values.size();
+            py::dict stats;
+            stats["total_ms"] = total;
+            stats["avg_ms"] = avg;
+            stats["call_count"] = static_cast<int>(values.size());
+            py_profile[py::str(name)] = stats;
+        }
 
         const auto& telemetry = sampler.get_sampler_metrics();
         auto add_metric = [&](const char* key, double total, int count) {
