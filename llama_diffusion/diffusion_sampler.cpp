@@ -660,6 +660,7 @@ bool DiffusionSampler::try_sample_with_gpu(
     const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
 
     const bool device_logits_async = env_flag("LLAMA_DEVICE_LOGITS_ASYNC");
+    const bool skip_sync_after_output_ids = env_flag("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS");
     DIFF_LOGD("[DiffusionSampler][debug] enter try_sample_with_gpu gpu_only=%d device_logits_env=%d block_len=%d need_entropy=%d\n",
               gpu_only_mode ? 1 : 0,
               device_logits_env ? 1 : 0,
@@ -794,7 +795,7 @@ bool DiffusionSampler::try_sample_with_gpu(
         DiffusionProfiler::instance().record_custom("sampler_gpu_get_output_ids_ms", get_output_ids_ms);
         sampler_metrics_.gpu_overhead_get_output_ids_ms += get_output_ids_ms;
 #ifdef LLAMA_CUDA
-        if (device_logits_env) {
+        if (device_logits_env && !skip_sync_after_output_ids) {
             diffusion::ProfilerTimer sync_after_output_ids_timer;
             cudaError_t sync_err_after_output_ids = cudaDeviceSynchronize();
             host_pre_misc_between_device_output_ms += sync_after_output_ids_timer.elapsed_ms();
@@ -805,6 +806,11 @@ bool DiffusionSampler::try_sample_with_gpu(
                 DIFF_LOGW("[DiffusionSampler][warn] cudaDeviceSynchronize after get_output_ids err=%d\n",
                           int(sync_err_after_output_ids));
             }
+        } else if (device_logits_env && skip_sync_after_output_ids && device_logits_async) {
+            // 在异步模式下可选择跳过同步，用于观察开销；风险：可能导致日志或生成乱码
+            DiffusionProfiler::instance().record_custom(
+                "sampler_gpu_host_pre_sync_after_output_ids_ms",
+                0.0);
         }
 #endif
         if (output_ids_ptr && debug_output_count > 0) {
