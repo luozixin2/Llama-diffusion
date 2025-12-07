@@ -239,8 +239,8 @@ void DiffusionSampler::denoise_block(
     llama_memory_t memory = llama_get_memory(ctx_);
     // 记录剩余 mask 数，避免每步全量扫描
     int remaining_masks = 0;
-    for (llama_token token : current_block) {
-        if (token == config_.mask_token_id) {
+        for (llama_token token : current_block) {
+            if (token == config_.mask_token_id) {
             remaining_masks++;
         }
     }
@@ -332,7 +332,7 @@ void DiffusionSampler::denoise_block(
                 remaining_masks--;
             }
         }
-
+        
         // 下一次循环开始时再清理 KV；此处不重复清理
     }
 
@@ -522,7 +522,7 @@ bool DiffusionSampler::sample_block_tokens(
 
     // 设备 logits 模式下回退 CPU，打印告警
     if (device_logits_env) {
-        fprintf(stderr, "[DiffusionSampler][warn] device logits 启用但 GPU 采样未命中，回退 CPU 采样，可能触发 host/device 混用。\n");
+        DIFF_LOGW("[DiffusionSampler][warn] device logits 启用但 GPU 采样未命中，回退 CPU 采样，可能触发 host/device 混用。\n");
     }
 
     sample_block_on_cpu(
@@ -748,13 +748,13 @@ bool DiffusionSampler::try_sample_with_gpu(
         if (output_count < static_cast<int>(expected_rows)) {
             compact_ok = false;
             if (debug_device) {
-                fprintf(stderr, "[device_logits] compact fail: output_count=%d expected=%zu\n",
-                        output_count, expected_rows);
+                DIFF_LOGW("[device_logits] compact fail: output_count=%d expected=%zu\n",
+                          output_count, expected_rows);
             }
         } else if (!ensure_compact_buffer(total_bytes)) {
             compact_ok = false;
             if (debug_device) {
-                fprintf(stderr, "[device_logits] compact fail: ensure buffer %zu bytes\n", total_bytes);
+                DIFF_LOGW("[device_logits] compact fail: ensure buffer %zu bytes\n", total_bytes);
             }
         } else {
             for (int i = 0; i < config_.block_length; ++i) {
@@ -762,7 +762,7 @@ bool DiffusionSampler::try_sample_with_gpu(
                 if (!row_ptr) {
                     compact_ok = false;
                     if (debug_device) {
-                        fprintf(stderr, "[device_logits] compact fail: logits_ith nullptr at i=%d\n", i);
+                        DIFF_LOGW("[device_logits] compact fail: logits_ith nullptr at i=%d\n", i);
                     }
                     break;
                 }
@@ -771,7 +771,7 @@ bool DiffusionSampler::try_sample_with_gpu(
                 if (err != cudaSuccess) {
                     compact_ok = false;
                     if (debug_device) {
-                        fprintf(stderr, "[device_logits] compact fail: cudaMemcpy H2D row=%d err=%d\n", i, int(err));
+                        DIFF_LOGW("[device_logits] compact fail: cudaMemcpy H2D row=%d err=%d\n", i, int(err));
                     }
                     break;
                 }
@@ -801,19 +801,19 @@ bool DiffusionSampler::try_sample_with_gpu(
                         }
                     }
                     if (compact_ok) {
-                        fprintf(stderr, "[logits_check] rows=%zu max_abs_diff=%.6g avg_abs_diff=%.6g\n",
-                                expected_rows, max_abs, sum_abs / count);
+                        DIFF_LOGD("[logits_check] rows=%zu max_abs_diff=%.6g avg_abs_diff=%.6g\n",
+                                  expected_rows, max_abs, sum_abs / count);
                         if (max_abs > 1e-3) {
                             compact_ok = false;
                             if (debug_device) {
-                                fprintf(stderr, "[device_logits] compact fail: logits_check max_abs=%.6g\n", max_abs);
+                                DIFF_LOGW("[device_logits] compact fail: logits_check max_abs=%.6g\n", max_abs);
                             }
                         }
                     }
                 } else {
                     compact_ok = false;
                     if (debug_device) {
-                        fprintf(stderr, "[device_logits] compact fail: D2H check err=%d\n", int(err));
+                        DIFF_LOGW("[device_logits] compact fail: D2H check err=%d\n", int(err));
                     }
                 }
             }
@@ -824,7 +824,7 @@ bool DiffusionSampler::try_sample_with_gpu(
             sampler_metrics_.gpu_fallback_stride++;
             sampler_metrics_.gpu_fallback_compact_fail++;
             if (debug_device) {
-                fprintf(stderr, "[device_logits] fallback to host scatter (compact fail)\n");
+                DIFF_LOGW("[device_logits] fallback to host scatter (compact fail)\n");
             }
         } else {
             device_logits = device_logits_compact_;
@@ -850,9 +850,9 @@ bool DiffusionSampler::try_sample_with_gpu(
         DIFF_LOGD("[DiffusionSampler][debug] calling sample_from_device_ptr\n");
         diffusion::ProfilerTimer gpu_timer;
         GpuSampler::Stats gpu_stats{};
-        // Fast-path验证：默认使用 device 非融合路径（GpuSampler 内部 force_non_fused），并可选融合对比
+        // Fast-path验证：默认使用 device 非融合路径（GpuSampler 内部可选融合）
         bool sampled_with_gpu = false;
-        GpuSampler::Stats gpu_stats_device{};
+        auto rng_base = rng_;
         diffusion::ProfilerTimer gpu_timer_device;
         sampled_with_gpu = gpu_sampler_->sample_from_device_ptr(
             device_logits,
@@ -862,7 +862,7 @@ bool DiffusionSampler::try_sample_with_gpu(
             sampled_tokens,
             confidences,
             need_entropy_probs ? entropy_probs_storage : nullptr,
-            &gpu_stats_device,
+            &gpu_stats,
             /*force_non_fused=*/false);
         DIFF_LOGD("[DiffusionSampler][debug] sample_from_device_ptr finished call path\n");
         double invoke_ms_device = gpu_timer_device.elapsed_ms();
@@ -877,7 +877,7 @@ bool DiffusionSampler::try_sample_with_gpu(
         std::vector<llama_token> fast_tokens;
         std::vector<float> fast_conf;
         if (enable_fastpath_compare && !need_entropy_probs) {
-            auto rng_fast = rng_;
+            auto rng_fast = rng_base;
             GpuSampler::Stats fast_stats{};
             fast_tokens.resize(config_.block_length);
             fast_conf.resize(config_.block_length);
@@ -904,7 +904,7 @@ bool DiffusionSampler::try_sample_with_gpu(
             }
             DiffusionProfiler::instance().record_custom("sampler_gpu_fastpath_mismatch", mismatch);
             if (mismatch > 0) {
-                fprintf(stderr, "[fastpath_compare] mismatches=%d / %zu\n", mismatch, fast_tokens.size());
+                DIFF_LOGD("[fastpath_compare] mismatches=%d / %zu\n", mismatch, fast_tokens.size());
             }
         }
         double invoke_ms = gpu_timer.elapsed_ms();
@@ -956,16 +956,15 @@ bool DiffusionSampler::try_sample_with_gpu(
             sampler_metrics_.gpu_fallback_partial_logits++;
         }
         if (debug_device) {
-            fprintf(stderr,
-                    "[device_logits] fallback: device=%d stride_ok=%d full=%d stride=%lld n_vocab=%d block=%d last=%d output_count=%d\n",
-                    device_available ? 1 : 0,
-                    stride_ok ? 1 : 0,
-                    full_logits ? 1 : 0,
-                    static_cast<long long>(logits_stride),
-                    n_vocab,
-                    config_.block_length,
-                    last_logits_count_,
-                    debug_output_count);
+            DIFF_LOGW("[device_logits] fallback: device=%d stride_ok=%d full=%d stride=%lld n_vocab=%d block=%d last=%d output_count=%d\n",
+                      device_available ? 1 : 0,
+                      stride_ok ? 1 : 0,
+                      full_logits ? 1 : 0,
+                      static_cast<long long>(logits_stride),
+                      n_vocab,
+                      config_.block_length,
+                      last_logits_count_,
+                      debug_output_count);
         }
         if (config_.top_k > 0) {
             sampler_metrics_.gpu_fallback_topk++;

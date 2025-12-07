@@ -27,6 +27,12 @@ struct SamplerTelemetry {
     double gpu_stage_event_wait_ms = 0.0;
     double gpu_total_ms = 0.0;
     double gpu_overhead_ms = 0.0;
+    double gpu_overhead_get_device_logits_ms = 0.0;
+    double gpu_overhead_get_output_ids_ms = 0.0;
+    double gpu_overhead_debug_compare_ms = 0.0;
+    double gpu_overhead_host_pre_ms = 0.0;
+    double gpu_overhead_host_after_output_ms = 0.0;
+    double gpu_overhead_host_post_ms = 0.0;
     int gpu_success = 0;
     int gpu_fail = 0;
     int gpu_path_device_hit = 0;

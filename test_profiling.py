@@ -306,6 +306,12 @@ class DiffusionProfiler:
             "telemetry_gpu_only_mode",
             "telemetry_gpu_total",
             "telemetry_gpu_overhead",
+            "telemetry_gpu_overhead_get_device_logits",
+            "telemetry_gpu_overhead_get_output_ids",
+            "telemetry_gpu_overhead_debug_compare",
+            "telemetry_gpu_overhead_host_pre",
+            "telemetry_gpu_overhead_host_after_output",
+            "telemetry_gpu_overhead_host_post",
             "telemetry_gpu_stage_prepare",
             "telemetry_gpu_stage_softmax",
             "telemetry_gpu_stage_sort",
@@ -843,7 +849,7 @@ def main():
                     'DIFFUSION_GPU_ONLY': '1',
                     'LLAMA_ENABLE_DEVICE_LOGITS': '1',
                     'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': '1',
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
                     # 若需要限定 GPU，可在外部设置 CUDA_VISIBLE_DEVICES
                 },
         },
@@ -858,7 +864,7 @@ def main():
                     'DIFFUSION_GPU_ONLY': '1',
                     'LLAMA_ENABLE_DEVICE_LOGITS': '1',
                     'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': '1',
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
                 },
         },
         {
@@ -872,7 +878,7 @@ def main():
                     'DIFFUSION_GPU_ONLY': '1',
                     'LLAMA_ENABLE_DEVICE_LOGITS': '1',
                     'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': '1',
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
                 },
         }
     ]

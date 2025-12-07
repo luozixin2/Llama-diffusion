@@ -155,7 +155,7 @@ __global__ void fused_softmax_sample_kernel(
     int vocab_size,
     int block_length,
     float inv_temp,            // 1.0f when no temperature
-    uint64_t seed,             // base seed
+    const float* random_vals,  // [block_length] pre-generated uniform(0,1]
     int* sampled_tokens,       // [block_length]
     float* confidences         // [block_length]
 ) {
@@ -207,9 +207,7 @@ __global__ void fused_softmax_sample_kernel(
 
     // 3) random threshold in [0, row_sum)
     if (tid == 0) {
-        curandStatePhilox4_32_10_t state;
-        curand_init(seed, row, 0, &state);
-        const float r = curand_uniform(&state) * row_sum;
+        const float r = random_vals[row] * row_sum;
         prefix_before[0] = r;
         target_chunk_ptr[0] = -1;
     }
@@ -230,16 +228,21 @@ __global__ void fused_softmax_sample_kernel(
     // 5) find target chunk
     if (tid == 0) {
         float prefix = 0.0f;
+        float prefix_before_val = 0.0f;
         int tgt = -1;
         for (int c = 0; c < nthreads; ++c) {
             float old_prefix = prefix;
             prefix += chunk_sums[c];
             if (tgt < 0 && prefix >= target_r) {
                 tgt = c;
-                prefix_before[0] = old_prefix; // reuse to store prefix_before target
+                prefix_before_val = old_prefix; // reuse to store prefix_before target
             }
         }
-        if (tgt < 0) tgt = nthreads - 1;
+        if (tgt < 0) {
+            tgt = nthreads - 1;
+            prefix_before_val = prefix - chunk_sums[tgt]; // avoid uninitialized prefix_before
+        }
+        prefix_before[0] = prefix_before_val;
         target_chunk_ptr[0] = tgt;
     }
     __syncthreads();
@@ -428,7 +431,7 @@ __global__ void sample_with_topp_kernel(
 
 bool check_cuda(cudaError_t err, const char* msg) {
     if (err != cudaSuccess) {
-        fprintf(stderr, "[GpuSampler] %s failed: %s\n", msg, cudaGetErrorString(err));
+        DIFF_LOGE("[GpuSampler] %s failed: %s\n", msg, cudaGetErrorString(err));
         return false;
     }
     return true;
@@ -488,7 +491,7 @@ public:
 
     bool is_available() const {
         if (!initialized_) {
-            fprintf(stderr, "[GpuSampler][warn] is_available: not initialized\n");
+            DIFF_LOGW("[GpuSampler][warn] is_available: not initialized\n");
         }
         return initialized_;
     }
@@ -511,14 +514,14 @@ public:
                   logits_on_device ? 1 : 0, force_non_fused ? 1 : 0,
                   (const void*)logits_ptr, logits_size, block_length_, vocab_size_);
         if (!initialized_) {
-            fprintf(stderr, "[GpuSampler] sample_impl not initialized\n");
+            DIFF_LOGE("[GpuSampler] sample_impl not initialized\n");
             return false;
         }
 
         const size_t expected = static_cast<size_t>(block_length_) * vocab_size_;
         if (logits_size != expected) {
-            fprintf(stderr, "[GpuSampler] sample_impl size mismatch: got=%zu expected=%zu (block=%d vocab=%d)\n",
-                    logits_size, expected, block_length_, vocab_size_);
+            DIFF_LOGE("[GpuSampler] sample_impl size mismatch: got=%zu expected=%zu (block=%d vocab=%d)\n",
+                      logits_size, expected, block_length_, vocab_size_);
             return false;
         }
 
@@ -597,6 +600,9 @@ public:
             // Fused softmax + sampling kernel (single pass)
             std::uniform_int_distribution<uint64_t> dist64;
             uint64_t seed = dist64(rng);
+            int rand_threads = 256;
+            int rand_blocks = (block_length_ + rand_threads - 1) / rand_threads;
+            fill_random_kernel<<<rand_blocks, rand_threads, 0, stream>>>(d_random_vals_, seed, block_length_);
             int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
             const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
             const float inv_temp = (config_.temperature != 1.0f) ? 1.0f / config_.temperature : 1.0f;
@@ -605,7 +611,7 @@ public:
                 vocab_size_,
                 block_length_,
                 inv_temp,
-                seed,
+                d_random_vals_,
                 d_sampled_tokens_,
                 d_confidences_
             );
@@ -704,11 +710,11 @@ public:
                     }
                 }
                 if (mism > 0) {
-                    fprintf(stderr, "[fused_vs_nonfused] mismatch=%d/%d first=%d fused=%d ref=%d\n",
-                            mism, block_length_, first_idx,
-                            fused_tokens[first_idx], ref_tokens[first_idx]);
+                    DIFF_LOGD("[fused_vs_nonfused] mismatch=%d/%d first=%d fused=%d ref=%d\n",
+                              mism, block_length_, first_idx,
+                              fused_tokens[first_idx], ref_tokens[first_idx]);
                 } else {
-                    fprintf(stderr, "[fused_vs_nonfused] match all (%d tokens)\n", block_length_);
+                    DIFF_LOGD("[fused_vs_nonfused] match all (%d tokens)\n", block_length_);
                 }
 
                 // Restore fused outputs as the return value
@@ -943,16 +949,114 @@ public:
                                      config_.top_p >= 1.0f;
         DIFF_LOGD("[GpuSampler][debug] device fast_gpu_sample=%d use_gpu_sampling=%d need_probs=%d top_k=%d top_p=%f\n",
                   fast_gpu_sample ? 1 : 0, use_gpu_sampling_ ? 1 : 0, need_probs ? 1 : 0, config_.top_k, config_.top_p);
-        if (fast_gpu_sample) {
-            // Disable fused fast path for correctness debugging; fall through to regular softmax + sample
-            // profiler.record_custom("sampler_gpu_fastpath_disabled", 1.0);
-        }
-
+        // Temperature scaling (applied before fused branch so fused uses inv_temp=1.0)
         if (config_.temperature != 1.0f) {
             const float inv_temp = 1.0f / config_.temperature;
             const size_t threads = 256;
             const size_t blocks = (expected + threads - 1) / threads;
             scale_logits_kernel<<<blocks, threads, 0, stream>>>(d_logits_, inv_temp, expected);
+        }
+
+        // Tail mask for vocab limit on device logits
+        const int safe_vocab_device = config_.n_vocab_limit > 0 ? config_.n_vocab_limit : vocab_size_;
+        if (safe_vocab_device < vocab_size_) {
+            const int threads_mask = 256;
+            const int blocks_mask = block_length_;
+            mask_tail_kernel<<<blocks_mask, threads_mask, 0, stream>>>(d_logits_, vocab_size_, block_length_, safe_vocab_device);
+            if (stats) {
+                stats->n_vocab_limit = safe_vocab_device;
+            }
+        }
+
+        // Fused fast path on device logits (skip softmax kernels)
+        if (fast_gpu_sample) {
+            std::uniform_int_distribution<uint64_t> dist64;
+            uint64_t seed = dist64(rng);
+            int rand_threads = 256;
+            int rand_blocks = (block_length_ + rand_threads - 1) / rand_threads;
+            fill_random_kernel<<<rand_blocks, rand_threads, 0, stream>>>(d_random_vals_, seed, block_length_);
+
+            int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
+            const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
+            const float inv_temp_fused = 1.0f; // logits 已按需温度缩放
+
+            cudaEventRecord(ev_after_copy, stream);
+            fused_softmax_sample_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
+                d_logits_,
+                vocab_size_,
+                block_length_,
+                inv_temp_fused,
+                d_random_vals_,
+                d_sampled_tokens_,
+                d_confidences_
+            );
+            cudaEventRecord(ev_after_sample, stream);
+
+            cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
+                            block_length_ * sizeof(int),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(confidences.data(), d_confidences_,
+                            block_length_ * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaEventRecord(ev_after_d2h, stream);
+            cudaEventRecord(ev_whole_end, stream);
+            cudaStreamSynchronize(stream);
+
+            // Clamp any out-of-range ids defensively
+            if (safe_vocab_device < vocab_size_) {
+                const int clamp_id = safe_vocab_device - 1;
+                for (int i = 0; i < block_length_; ++i) {
+                    if (sampled_tokens[i] >= safe_vocab_device) {
+                        sampled_tokens[i] = clamp_id;
+                        confidences[i] = 0.0f;
+                    }
+                }
+            }
+
+            float ms_copy = 0.0f, ms_fused = 0.0f, ms_d2h = 0.0f, ms_whole_gpu = 0.0f;
+            cudaEventElapsedTime(&ms_copy, ev_start, ev_after_copy);
+            cudaEventElapsedTime(&ms_fused, ev_after_copy, ev_after_sample);
+            cudaEventElapsedTime(&ms_d2h, ev_after_sample, ev_after_d2h);
+            cudaEventElapsedTime(&ms_whole_gpu, ev_whole_start, ev_whole_end);
+            double wall_ms = wall_timer.elapsed_ms();
+            double stage_total_ms = ms_copy + ms_fused + ms_d2h;
+
+            if (stats) {
+                stats->stage_prepare_ms = ms_copy;
+                stats->stage_softmax_ms = ms_fused;
+                stats->stage_sort_ms = 0.0;
+                stats->stage_sample_ms = ms_fused;
+                stats->stage_d2h_ms = ms_d2h;
+                stats->stage_cpu_post_ms = 0.0;
+                stats->stage_event_wait_ms = 0.0;
+                stats->stage_total_ms = stage_total_ms;
+                stats->stage_whole_gpu_ms = ms_whole_gpu;
+                stats->stage_whole_wall_ms = wall_ms;
+                stats->fast_path = true;
+                stats->device_logits = true;
+            }
+
+            DiffusionProfiler& profiler = DiffusionProfiler::instance();
+            profiler.record_custom("sampler_gpu_stage_prepare_ms", ms_copy);
+            profiler.record_custom("sampler_gpu_stage_softmax_ms", ms_fused);
+            profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
+            profiler.record_custom("sampler_gpu_stage_sample_ms", ms_fused);
+            profiler.record_custom("sampler_gpu_stage_d2h_ms", ms_d2h);
+            profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
+            profiler.record_custom("sampler_gpu_stage_event_wait_ms", 0.0);
+            profiler.record_custom("sampler_gpu_stage_total_ms", stage_total_ms);
+            profiler.record_custom("sampler_gpu_stage_whole_gpu_ms", ms_whole_gpu);
+            profiler.record_custom("sampler_gpu_stage_whole_wall_ms", wall_ms);
+
+            cudaEventDestroy(ev_whole_start);
+            cudaEventDestroy(ev_whole_end);
+            cudaEventDestroy(ev_start);
+            cudaEventDestroy(ev_after_copy);
+            cudaEventDestroy(ev_after_softmax);
+            cudaEventDestroy(ev_after_sample);
+            cudaEventDestroy(ev_after_d2h);
+
+            return true;
         }
 
         // ========== Stage 2: GPU Softmax (batched for all rows) ==========
@@ -1751,52 +1855,52 @@ private:
         
         // Allocate device memory
         if (!check_cuda(cudaMalloc(&d_logits_, total_floats * sizeof(float)), "cudaMalloc logits")) {
-            fprintf(stderr, "[GpuSampler] init failed: d_logits_\n");
+            DIFF_LOGE("[GpuSampler] init failed: d_logits_\n");
             return false;
         }
         if (!check_cuda(cudaMalloc(&d_probs_, total_floats * sizeof(float)), "cudaMalloc probs")) {
-            fprintf(stderr, "[GpuSampler] init failed: d_probs_\n");
+            DIFF_LOGE("[GpuSampler] init failed: d_probs_\n");
             return false;
         }
         if (!check_cuda(cudaMalloc(&d_indices_, total_floats * sizeof(int)), "cudaMalloc indices")) {
-            fprintf(stderr, "[GpuSampler] init failed: d_indices_\n");
+            DIFF_LOGE("[GpuSampler] init failed: d_indices_\n");
             return false;
         }
         if (!check_cuda(cudaMalloc(&d_row_max_, block_length_ * sizeof(float)), "cudaMalloc row_max")) {
-            fprintf(stderr, "[GpuSampler] init failed: d_row_max_\n");
+            DIFF_LOGE("[GpuSampler] init failed: d_row_max_\n");
             return false;
         }
         if (!check_cuda(cudaMalloc(&d_row_sum_, block_length_ * sizeof(float)), "cudaMalloc row_sum")) {
-            fprintf(stderr, "[GpuSampler] init failed: d_row_sum_\n");
+            DIFF_LOGE("[GpuSampler] init failed: d_row_sum_\n");
             return false;
         }
         
         // Phase 2 优化: 分配 GPU 采样相关内存
         if (!check_cuda(cudaMalloc(&d_random_vals_, block_length_ * sizeof(float)), "cudaMalloc random_vals")) {
             use_gpu_sampling_ = false;
-            fprintf(stderr, "[GpuSampler] disable gpu_sampling: d_random_vals_ alloc failed\n");
+            DIFF_LOGW("[GpuSampler] disable gpu_sampling: d_random_vals_ alloc failed\n");
         }
         if (!check_cuda(cudaMalloc(&d_sampled_tokens_, block_length_ * sizeof(int)), "cudaMalloc sampled_tokens")) {
             use_gpu_sampling_ = false;
-            fprintf(stderr, "[GpuSampler] disable gpu_sampling: d_sampled_tokens_ alloc failed\n");
+            DIFF_LOGW("[GpuSampler] disable gpu_sampling: d_sampled_tokens_ alloc failed\n");
         }
         if (!check_cuda(cudaMalloc(&d_confidences_, block_length_ * sizeof(float)), "cudaMalloc confidences")) {
             use_gpu_sampling_ = false;
-            fprintf(stderr, "[GpuSampler] disable gpu_sampling: d_confidences_ alloc failed\n");
+            DIFF_LOGW("[GpuSampler] disable gpu_sampling: d_confidences_ alloc failed\n");
         }
         
         // Allocate pinned host memory for async transfers
         if (!check_cuda(cudaMallocHost(&h_pinned_logits_, total_floats * sizeof(float)), "cudaMallocHost logits")) {
             use_multi_stream_ = false;  // Fallback to non-pinned
-            fprintf(stderr, "[GpuSampler][init][warn] cudaMallocHost logits failed, disable multi_stream\n");
+            DIFF_LOGW("[GpuSampler][init][warn] cudaMallocHost logits failed, disable multi_stream\n");
         }
         if (!check_cuda(cudaMallocHost(&h_pinned_probs_, total_floats * sizeof(float)), "cudaMallocHost probs")) {
             use_multi_stream_ = false;
-            fprintf(stderr, "[GpuSampler][init][warn] cudaMallocHost probs failed, disable multi_stream\n");
+            DIFF_LOGW("[GpuSampler][init][warn] cudaMallocHost probs failed, disable multi_stream\n");
         }
         if (!check_cuda(cudaMallocHost(&h_pinned_indices_, total_floats * sizeof(int)), "cudaMallocHost indices")) {
             use_multi_stream_ = false;
-            fprintf(stderr, "[GpuSampler][init][warn] cudaMallocHost indices failed, disable multi_stream\n");
+            DIFF_LOGW("[GpuSampler][init][warn] cudaMallocHost indices failed, disable multi_stream\n");
         }
         
         return true;
