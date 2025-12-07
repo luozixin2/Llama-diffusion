@@ -566,14 +566,36 @@ public:
         confidences.assign(block_length_, 0.0f);
 
         DiffusionProfiler& profiler = DiffusionProfiler::instance();
+        struct PrepareEvents {
+            cudaEvent_t start{};
+            cudaEvent_t after_copy{};
+            cudaEvent_t after_temp{};
+            cudaEvent_t after_mask{};
+            cudaEvent_t after_rng{};
+            PrepareEvents() {
+                cudaEventCreateWithFlags(&start, cudaEventDefault);
+                cudaEventCreateWithFlags(&after_copy, cudaEventDefault);
+                cudaEventCreateWithFlags(&after_temp, cudaEventDefault);
+                cudaEventCreateWithFlags(&after_mask, cudaEventDefault);
+                cudaEventCreateWithFlags(&after_rng, cudaEventDefault);
+            }
+            ~PrepareEvents() {
+                cudaEventDestroy(start);
+                cudaEventDestroy(after_copy);
+                cudaEventDestroy(after_temp);
+                cudaEventDestroy(after_mask);
+                cudaEventDestroy(after_rng);
+            }
+        } prep_events;
         
         // ========== Stage 1: H2D transfer + temperature scaling ==========
-        ProfilerTimer prepare_timer;
-        
+        cudaEventRecord(prep_events.start, stream);
+
         const size_t total_bytes = expected * sizeof(float);
         if (!check_cuda(cudaMemcpyAsync(d_logits_, logits_ptr, total_bytes, cudaMemcpyHostToDevice, stream), "H2D logits")) {
             return false;
         }
+        cudaEventRecord(prep_events.after_copy, stream);
 
         double prepare_ms = 0.0;
 
@@ -582,9 +604,15 @@ public:
                                      !need_probs &&
                                      config_.top_k <= 0 &&
                                      config_.top_p >= 1.0f;
+        static bool fastpath_warned_host = false;
+        if (!fast_gpu_sample && use_gpu_sampling_ && !need_probs && config_.top_k <= 0 && config_.top_p >= 1.0f && !fastpath_warned_host) {
+            DIFF_LOGI("[GpuSampler][info] fused fast path skipped on host logits (maybe force_non_fused/top_k/p/entropy)\n");
+            fastpath_warned_host = true;
+        }
         if (fast_gpu_sample) {
             ProfilerTimer sample_timer;
-            prepare_ms = prepare_timer.elapsed_ms();
+            // No extra temperature step in fused fast path; mark temp event same as copy
+            cudaEventRecord(prep_events.after_temp, stream);
 
             // Tail mask (same as non-fused path) to avoid sampling OOV ids
             const int safe_vocab = config_.n_vocab_limit > 0 ? config_.n_vocab_limit : vocab_size_;
@@ -596,6 +624,7 @@ public:
                     stats->n_vocab_limit = safe_vocab;
                 }
             }
+            cudaEventRecord(prep_events.after_mask, stream);
 
             // Fused softmax + sampling kernel (single pass)
             std::uniform_int_distribution<uint64_t> dist64;
@@ -603,6 +632,7 @@ public:
             int rand_threads = 256;
             int rand_blocks = (block_length_ + rand_threads - 1) / rand_threads;
             fill_random_kernel<<<rand_blocks, rand_threads, 0, stream>>>(d_random_vals_, seed, block_length_);
+            cudaEventRecord(prep_events.after_rng, stream);
             int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
             const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
             const float inv_temp = (config_.temperature != 1.0f) ? 1.0f / config_.temperature : 1.0f;
@@ -722,18 +752,33 @@ public:
                 confidences.swap(fused_conf);
             }
 
+            float ms_copy = 0.0f, ms_temp = 0.0f, ms_mask = 0.0f, ms_rng = 0.0f, ms_prepare = 0.0f;
+            cudaEventElapsedTime(&ms_copy, prep_events.start, prep_events.after_copy);
+            cudaEventElapsedTime(&ms_temp, prep_events.after_copy, prep_events.after_temp);
+            cudaEventElapsedTime(&ms_mask, prep_events.after_temp, prep_events.after_mask);
+            cudaEventElapsedTime(&ms_rng, prep_events.after_mask, prep_events.after_rng);
+            cudaEventElapsedTime(&ms_prepare, prep_events.start, prep_events.after_rng);
+            prepare_ms = ms_prepare;
+
             double total_ms = sample_timer.elapsed_ms();
             double fused_ms = std::max(0.0, total_ms - d2h_ms);
 
-            // Record stats (softmax+sample fused)
             profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
             profiler.record_custom("sampler_gpu_stage_softmax_ms", fused_ms);
             profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
             profiler.record_custom("sampler_gpu_stage_d2h_ms", d2h_ms);
             profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
+            profiler.record_custom("sampler_gpu_prepare_copy_ms", ms_copy);
+            profiler.record_custom("sampler_gpu_prepare_temp_ms", ms_temp);
+            profiler.record_custom("sampler_gpu_prepare_mask_ms", ms_mask);
+            profiler.record_custom("sampler_gpu_prepare_rng_ms", ms_rng);
 
             if (stats) {
                 stats->stage_prepare_ms = prepare_ms;
+                stats->stage_prepare_copy_ms = ms_copy;
+                stats->stage_prepare_temp_ms = ms_temp;
+                stats->stage_prepare_mask_ms = ms_mask;
+                stats->stage_prepare_rng_ms = ms_rng;
                 stats->stage_softmax_ms = fused_ms;
                 stats->stage_sort_ms = 0.0;
                 stats->stage_sample_ms = fused_ms;
@@ -746,12 +791,14 @@ public:
             // No token_probs in fast path
             return true;
         }
-
         if (config_.temperature != 1.0f) {
             const float inv_temp = 1.0f / config_.temperature;
             const size_t threads = 256;
             const size_t blocks = (expected + threads - 1) / threads;
             scale_logits_kernel<<<blocks, threads, 0, stream>>>(d_logits_, inv_temp, expected);
+            cudaEventRecord(prep_events.after_temp, stream);
+        } else {
+            cudaEventRecord(prep_events.after_temp, stream);
         }
 
         // Tail mask to avoid sampling ids beyond vocab limit (needed before softmax and fast path)
@@ -764,18 +811,10 @@ public:
                 stats->n_vocab_limit = safe_vocab_device;
             }
         }
-
-        // Tail mask to avoid sampling ids beyond vocab limit
-        const int safe_vocab = config_.n_vocab_limit > 0 ? config_.n_vocab_limit : vocab_size_;
-        if (safe_vocab < vocab_size_) {
-            const int threads_mask = 256;
-            const int blocks_mask = block_length_;
-            mask_tail_kernel<<<blocks_mask, threads_mask, 0, stream>>>(d_logits_, vocab_size_, block_length_, safe_vocab);
-        }
+        cudaEventRecord(prep_events.after_mask, stream);
+        cudaEventRecord(prep_events.after_rng, stream);
 
         // Rely on stream ordering; avoid extra sync before softmax
-        prepare_ms = prepare_timer.elapsed_ms();
-
         // ========== Stage 2: GPU Softmax (batched for all rows) ==========
         ProfilerTimer softmax_timer;
         
@@ -856,15 +895,31 @@ public:
         
         double cpu_ms = cpu_timer.elapsed_ms();
 
+        float ms_copy = 0.0f, ms_temp = 0.0f, ms_mask = 0.0f, ms_rng = 0.0f, ms_prepare = 0.0f;
+        cudaEventElapsedTime(&ms_copy, prep_events.start, prep_events.after_copy);
+        cudaEventElapsedTime(&ms_temp, prep_events.after_copy, prep_events.after_temp);
+        cudaEventElapsedTime(&ms_mask, prep_events.after_temp, prep_events.after_mask);
+        cudaEventElapsedTime(&ms_rng, prep_events.after_mask, prep_events.after_rng);
+        cudaEventElapsedTime(&ms_prepare, prep_events.start, prep_events.after_rng);
+        prepare_ms = ms_prepare;
+
         // Record stats
         profiler.record_custom("sampler_gpu_stage_prepare_ms", prepare_ms);
         profiler.record_custom("sampler_gpu_stage_softmax_ms", softmax_ms);
         profiler.record_custom("sampler_gpu_stage_sort_ms", sort_ms);
         profiler.record_custom("sampler_gpu_stage_d2h_ms", d2h_ms);
         profiler.record_custom("sampler_gpu_stage_cpu_post_ms", cpu_ms);
+        profiler.record_custom("sampler_gpu_prepare_copy_ms", ms_copy);
+        profiler.record_custom("sampler_gpu_prepare_temp_ms", ms_temp);
+        profiler.record_custom("sampler_gpu_prepare_mask_ms", ms_mask);
+        profiler.record_custom("sampler_gpu_prepare_rng_ms", ms_rng);
         
         if (stats) {
             stats->stage_prepare_ms = prepare_ms;
+            stats->stage_prepare_copy_ms = ms_copy;
+            stats->stage_prepare_temp_ms = ms_temp;
+            stats->stage_prepare_mask_ms = ms_mask;
+            stats->stage_prepare_rng_ms = ms_rng;
             stats->stage_softmax_ms = softmax_ms;
             stats->stage_sort_ms = sort_ms;
             stats->stage_sample_ms = 0.0;
@@ -918,6 +973,9 @@ public:
         cudaEvent_t ev_whole_end = make_event();
         cudaEvent_t ev_start = make_event();
         cudaEvent_t ev_after_copy = make_event();
+        cudaEvent_t ev_after_temp = make_event();
+        cudaEvent_t ev_after_mask = make_event();
+        cudaEvent_t ev_after_rng = make_event();
         cudaEvent_t ev_after_softmax = make_event();
         cudaEvent_t ev_after_sample = make_event();
         cudaEvent_t ev_after_d2h = make_event();
@@ -932,11 +990,15 @@ public:
             cudaEventDestroy(ev_whole_end);
             cudaEventDestroy(ev_start);
             cudaEventDestroy(ev_after_copy);
+            cudaEventDestroy(ev_after_temp);
+            cudaEventDestroy(ev_after_mask);
+            cudaEventDestroy(ev_after_rng);
             cudaEventDestroy(ev_after_softmax);
             cudaEventDestroy(ev_after_sample);
             cudaEventDestroy(ev_after_d2h);
             return false;
         }
+        cudaEventRecord(ev_after_copy, stream);
         cudaDeviceSynchronize();
         auto err = cudaGetLastError();
         DIFF_LOGD("[GpuSampler][debug] device D2D logits err=%d\n", int(err));
@@ -949,12 +1011,20 @@ public:
                                      config_.top_p >= 1.0f;
         DIFF_LOGD("[GpuSampler][debug] device fast_gpu_sample=%d use_gpu_sampling=%d need_probs=%d top_k=%d top_p=%f\n",
                   fast_gpu_sample ? 1 : 0, use_gpu_sampling_ ? 1 : 0, need_probs ? 1 : 0, config_.top_k, config_.top_p);
+        static bool fastpath_warned_device = false;
+        if (!fast_gpu_sample && use_gpu_sampling_ && !need_probs && config_.top_k <= 0 && config_.top_p >= 1.0f && !fastpath_warned_device) {
+            DIFF_LOGI("[GpuSampler][info] fused fast path skipped on device logits (force_non_fused=%d)\n", force_non_fused ? 1 : 0);
+            fastpath_warned_device = true;
+        }
         // Temperature scaling (applied before fused branch so fused uses inv_temp=1.0)
         if (config_.temperature != 1.0f) {
             const float inv_temp = 1.0f / config_.temperature;
             const size_t threads = 256;
             const size_t blocks = (expected + threads - 1) / threads;
             scale_logits_kernel<<<blocks, threads, 0, stream>>>(d_logits_, inv_temp, expected);
+            cudaEventRecord(ev_after_temp, stream);
+        } else {
+            cudaEventRecord(ev_after_temp, stream);
         }
 
         // Tail mask for vocab limit on device logits
@@ -967,6 +1037,8 @@ public:
                 stats->n_vocab_limit = safe_vocab_device;
             }
         }
+        cudaEventRecord(ev_after_mask, stream);
+        cudaEventRecord(ev_after_rng, stream);
 
         // Fused fast path on device logits (skip softmax kernels)
         if (fast_gpu_sample) {
@@ -975,12 +1047,12 @@ public:
             int rand_threads = 256;
             int rand_blocks = (block_length_ + rand_threads - 1) / rand_threads;
             fill_random_kernel<<<rand_blocks, rand_threads, 0, stream>>>(d_random_vals_, seed, block_length_);
+            cudaEventRecord(ev_after_rng, stream);
 
             int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
             const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
             const float inv_temp_fused = 1.0f; // logits 已按需温度缩放
 
-            cudaEventRecord(ev_after_copy, stream);
             fused_softmax_sample_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
                 d_logits_,
                 vocab_size_,
@@ -1013,16 +1085,25 @@ public:
                 }
             }
 
-            float ms_copy = 0.0f, ms_fused = 0.0f, ms_d2h = 0.0f, ms_whole_gpu = 0.0f;
+            float ms_copy = 0.0f, ms_temp = 0.0f, ms_mask = 0.0f, ms_rng = 0.0f, ms_prepare = 0.0f;
+            float ms_fused = 0.0f, ms_d2h = 0.0f, ms_whole_gpu = 0.0f;
             cudaEventElapsedTime(&ms_copy, ev_start, ev_after_copy);
-            cudaEventElapsedTime(&ms_fused, ev_after_copy, ev_after_sample);
+            cudaEventElapsedTime(&ms_temp, ev_after_copy, ev_after_temp);
+            cudaEventElapsedTime(&ms_mask, ev_after_temp, ev_after_mask);
+            cudaEventElapsedTime(&ms_rng, ev_after_mask, ev_after_rng);
+            cudaEventElapsedTime(&ms_prepare, ev_start, ev_after_rng);
+            cudaEventElapsedTime(&ms_fused, ev_after_rng, ev_after_sample);
             cudaEventElapsedTime(&ms_d2h, ev_after_sample, ev_after_d2h);
             cudaEventElapsedTime(&ms_whole_gpu, ev_whole_start, ev_whole_end);
             double wall_ms = wall_timer.elapsed_ms();
-            double stage_total_ms = ms_copy + ms_fused + ms_d2h;
+            double stage_total_ms = ms_prepare + ms_fused + ms_d2h;
 
             if (stats) {
-                stats->stage_prepare_ms = ms_copy;
+                stats->stage_prepare_ms = ms_prepare;
+                stats->stage_prepare_copy_ms = ms_copy;
+                stats->stage_prepare_temp_ms = ms_temp;
+                stats->stage_prepare_mask_ms = ms_mask;
+                stats->stage_prepare_rng_ms = ms_rng;
                 stats->stage_softmax_ms = ms_fused;
                 stats->stage_sort_ms = 0.0;
                 stats->stage_sample_ms = ms_fused;
@@ -1037,7 +1118,7 @@ public:
             }
 
             DiffusionProfiler& profiler = DiffusionProfiler::instance();
-            profiler.record_custom("sampler_gpu_stage_prepare_ms", ms_copy);
+            profiler.record_custom("sampler_gpu_stage_prepare_ms", ms_prepare);
             profiler.record_custom("sampler_gpu_stage_softmax_ms", ms_fused);
             profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
             profiler.record_custom("sampler_gpu_stage_sample_ms", ms_fused);
@@ -1047,11 +1128,18 @@ public:
             profiler.record_custom("sampler_gpu_stage_total_ms", stage_total_ms);
             profiler.record_custom("sampler_gpu_stage_whole_gpu_ms", ms_whole_gpu);
             profiler.record_custom("sampler_gpu_stage_whole_wall_ms", wall_ms);
+            profiler.record_custom("sampler_gpu_prepare_copy_ms", ms_copy);
+            profiler.record_custom("sampler_gpu_prepare_temp_ms", ms_temp);
+            profiler.record_custom("sampler_gpu_prepare_mask_ms", ms_mask);
+            profiler.record_custom("sampler_gpu_prepare_rng_ms", ms_rng);
 
             cudaEventDestroy(ev_whole_start);
             cudaEventDestroy(ev_whole_end);
             cudaEventDestroy(ev_start);
             cudaEventDestroy(ev_after_copy);
+            cudaEventDestroy(ev_after_temp);
+            cudaEventDestroy(ev_after_mask);
+            cudaEventDestroy(ev_after_rng);
             cudaEventDestroy(ev_after_softmax);
             cudaEventDestroy(ev_after_sample);
             cudaEventDestroy(ev_after_d2h);
@@ -1060,7 +1148,6 @@ public:
         }
 
         // ========== Stage 2: GPU Softmax (batched for all rows) ==========
-        cudaEventRecord(ev_after_copy, stream);
 
         const int threads_per_block = 256;
         const size_t smem_size = threads_per_block * sizeof(float);
@@ -1127,17 +1214,26 @@ public:
                 }
             }
 
-            float ms_copy = 0.0f, ms_softmax = 0.0f, ms_sample = 0.0f, ms_d2h = 0.0f, ms_whole_gpu = 0.0f;
+            float ms_copy = 0.0f, ms_temp = 0.0f, ms_mask = 0.0f, ms_rng = 0.0f, ms_prepare = 0.0f;
+            float ms_softmax = 0.0f, ms_sample = 0.0f, ms_d2h = 0.0f, ms_whole_gpu = 0.0f;
             cudaEventElapsedTime(&ms_copy, ev_start, ev_after_copy);
-            cudaEventElapsedTime(&ms_softmax, ev_after_copy, ev_after_softmax);
+            cudaEventElapsedTime(&ms_temp, ev_after_copy, ev_after_temp);
+            cudaEventElapsedTime(&ms_mask, ev_after_temp, ev_after_mask);
+            cudaEventElapsedTime(&ms_rng, ev_after_mask, ev_after_rng);
+            cudaEventElapsedTime(&ms_prepare, ev_start, ev_after_rng);
+            cudaEventElapsedTime(&ms_softmax, ev_after_rng, ev_after_softmax);
             cudaEventElapsedTime(&ms_sample, ev_after_softmax, ev_after_sample);
             cudaEventElapsedTime(&ms_d2h, ev_after_sample, ev_after_d2h);
             cudaEventElapsedTime(&ms_whole_gpu, ev_whole_start, ev_whole_end);
             double wall_ms = wall_timer.elapsed_ms();
-            double stage_total_ms = ms_copy + ms_softmax + ms_sample + ms_d2h;
+            double stage_total_ms = ms_prepare + ms_softmax + ms_sample + ms_d2h;
 
             if (stats) {
-                stats->stage_prepare_ms = ms_copy;
+                stats->stage_prepare_ms = ms_prepare;
+                stats->stage_prepare_copy_ms = ms_copy;
+                stats->stage_prepare_temp_ms = ms_temp;
+                stats->stage_prepare_mask_ms = ms_mask;
+                stats->stage_prepare_rng_ms = ms_rng;
                 stats->stage_softmax_ms = ms_softmax;
                 stats->stage_sort_ms = 0.0;
                 stats->stage_sample_ms = ms_sample;
@@ -1152,13 +1248,17 @@ public:
             }
 
             DiffusionProfiler& profiler = DiffusionProfiler::instance();
-            profiler.record_custom("sampler_gpu_stage_prepare_ms", ms_copy);
+            profiler.record_custom("sampler_gpu_stage_prepare_ms", ms_prepare);
             profiler.record_custom("sampler_gpu_stage_softmax_ms", ms_softmax);
             profiler.record_custom("sampler_gpu_stage_sort_ms", 0.0);
             profiler.record_custom("sampler_gpu_stage_sample_ms", ms_sample);
             profiler.record_custom("sampler_gpu_stage_d2h_ms", ms_d2h);
             profiler.record_custom("sampler_gpu_stage_cpu_post_ms", 0.0);
             profiler.record_custom("sampler_gpu_stage_event_wait_ms", 0.0);
+            profiler.record_custom("sampler_gpu_prepare_copy_ms", ms_copy);
+            profiler.record_custom("sampler_gpu_prepare_temp_ms", ms_temp);
+            profiler.record_custom("sampler_gpu_prepare_mask_ms", ms_mask);
+            profiler.record_custom("sampler_gpu_prepare_rng_ms", ms_rng);
             profiler.record_custom("sampler_gpu_stage_total_ms", stage_total_ms);
             profiler.record_custom("sampler_gpu_stage_whole_gpu_ms", ms_whole_gpu);
             profiler.record_custom("sampler_gpu_stage_whole_wall_ms", wall_ms);
@@ -1167,6 +1267,9 @@ public:
             cudaEventDestroy(ev_whole_end);
             cudaEventDestroy(ev_start);
             cudaEventDestroy(ev_after_copy);
+            cudaEventDestroy(ev_after_temp);
+            cudaEventDestroy(ev_after_mask);
+            cudaEventDestroy(ev_after_rng);
             cudaEventDestroy(ev_after_softmax);
             cudaEventDestroy(ev_after_sample);
             cudaEventDestroy(ev_after_d2h);
@@ -1179,6 +1282,9 @@ public:
         cudaEventDestroy(ev_whole_end);
         cudaEventDestroy(ev_start);
         cudaEventDestroy(ev_after_copy);
+        cudaEventDestroy(ev_after_temp);
+        cudaEventDestroy(ev_after_mask);
+        cudaEventDestroy(ev_after_rng);
         cudaEventDestroy(ev_after_softmax);
         cudaEventDestroy(ev_after_sample);
         cudaEventDestroy(ev_after_d2h);

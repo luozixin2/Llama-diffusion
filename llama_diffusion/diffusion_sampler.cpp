@@ -475,10 +475,16 @@ bool DiffusionSampler::sample_block_tokens(
     std::vector<float>& confidences,
     std::vector<std::vector<float>>* entropy_probs_storage
 ) {
-    const bool gpu_only_mode = (std::getenv("DIFFUSION_GPU_ONLY") != nullptr) || config_.gpu_only_mode;
-    const bool device_logits_env = std::getenv("LLAMA_ENABLE_DEVICE_LOGITS") != nullptr;
+    auto env_flag = [](const char* key) {
+        const char* v = std::getenv(key);
+        if (!v) return false;
+        if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+        return true;
+    };
+    const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
+    const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
 
-    DIFF_LOGD("[DiffusionSampler][debug] sample_block_tokens use_gpu_sampler=%d gpu_only=%d need_entropy=%d block_len=%d n_vocab=%d\n",
+    DIFF_LOGI("[DiffusionSampler][debug] sample_block_tokens use_gpu_sampler=%d gpu_only=%d need_entropy=%d block_len=%d n_vocab=%d\n",
               use_gpu_sampler_ ? 1 : 0,
               gpu_only_mode ? 1 : 0,
               need_entropy_probs ? 1 : 0,
@@ -644,10 +650,17 @@ bool DiffusionSampler::try_sample_with_gpu(
     std::vector<std::vector<float>>* entropy_probs_storage,
     double* gpu_elapsed_ms
 ) {
-    const bool gpu_only_mode = (std::getenv("DIFFUSION_GPU_ONLY") != nullptr) || config_.gpu_only_mode;
-    const bool device_logits_env = std::getenv("LLAMA_ENABLE_DEVICE_LOGITS") != nullptr;
+    auto env_flag = [](const char* key) {
+        const char* v = std::getenv(key);
+        if (!v) return false;
+        if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+        return true;
+    };
+    const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
+    const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
 
-    DIFF_LOGD("[DiffusionSampler][debug] enter try_sample_with_gpu gpu_only=%d device_logits_env=%d block_len=%d need_entropy=%d\n",
+    const bool device_logits_async = env_flag("LLAMA_DEVICE_LOGITS_ASYNC");
+    DIFF_LOGI("[DiffusionSampler][debug] enter try_sample_with_gpu gpu_only=%d device_logits_env=%d block_len=%d need_entropy=%d\n",
               gpu_only_mode ? 1 : 0,
               device_logits_env ? 1 : 0,
               config_.block_length,
@@ -672,10 +685,11 @@ bool DiffusionSampler::try_sample_with_gpu(
     }
 
     // Experimental: device logits path (CUDA only, when enabled upstream)
+    if (device_logits_env && device_logits_async) { llama_synchronize(ctx_); }
     diffusion::ProfilerTimer get_device_timer;
     int64_t logits_stride = 0;
     const float* device_logits = llama_get_logits_device(ctx_, &logits_stride);
-    DIFF_LOGD("[DiffusionSampler][debug] device_logits ptr=%p stride=%lld\n",
+    DIFF_LOGI("[DiffusionSampler][debug] device_logits ptr=%p stride=%lld\n",
               (const void*)device_logits, (long long)logits_stride);
     double get_device_ms = get_device_timer.elapsed_ms();
     DiffusionProfiler::instance().record_custom(
@@ -685,15 +699,16 @@ bool DiffusionSampler::try_sample_with_gpu(
     sampler_metrics_.gpu_overhead_get_device_logits_ms += get_device_ms;
     const bool device_available = device_logits != nullptr;
     const bool stride_ok = logits_stride == n_vocab;
+    bool local_stride_ok = stride_ok; // 允许在压缩后更新
     const bool full_logits = last_logits_count_ == config_.block_length;
     int debug_output_count = -1;
+    const int32_t* output_ids_ptr = nullptr;
     bool can_use_device_logits =
         device_available &&
-        stride_ok &&
         full_logits &&
         config_.block_length > 0 &&
         static_cast<size_t>(config_.block_length) * static_cast<size_t>(n_vocab) == static_cast<size_t>(config_.block_length) * n_vocab;
-    DIFF_LOGD("[DiffusionSampler][debug] device_available=%d stride_ok=%d full_logits=%d can_use_device_logits=%d last_logits_count=%d n_vocab=%d\n",
+    DIFF_LOGI("[DiffusionSampler][debug] device_available=%d stride_ok=%d full_logits=%d can_use_device_logits=%d last_logits_count=%d n_vocab=%d\n",
               device_available ? 1 : 0,
               stride_ok ? 1 : 0,
               full_logits ? 1 : 0,
@@ -729,15 +744,34 @@ bool DiffusionSampler::try_sample_with_gpu(
 
     if ((can_use_device_logits || debug_device) && device_available) {
         diffusion::ProfilerTimer output_ids_timer;
-        llama_get_logits_output_ids(ctx_, &debug_output_count); // also triggers output_reorder/sync
+        output_ids_ptr = llama_get_logits_output_ids(ctx_, &debug_output_count); // also triggers output_reorder/sync
         double get_output_ids_ms = output_ids_timer.elapsed_ms();
         DiffusionProfiler::instance().record_custom("sampler_gpu_get_output_ids_ms", get_output_ids_ms);
         sampler_metrics_.gpu_overhead_get_output_ids_ms += get_output_ids_ms;
+        if (output_ids_ptr && debug_output_count > 0) {
+            int log_n = std::min(debug_output_count, 8);
+            DIFF_LOGI("[DiffusionSampler][debug] output_ids count=%d first=%d %d %d %d %d %d %d %d\n",
+                      debug_output_count,
+                      log_n > 0 ? output_ids_ptr[0] : -1,
+                      log_n > 1 ? output_ids_ptr[1] : -1,
+                      log_n > 2 ? output_ids_ptr[2] : -1,
+                      log_n > 3 ? output_ids_ptr[3] : -1,
+                      log_n > 4 ? output_ids_ptr[4] : -1,
+                      log_n > 5 ? output_ids_ptr[5] : -1,
+                      log_n > 6 ? output_ids_ptr[6] : -1,
+                      log_n > 7 ? output_ids_ptr[7] : -1);
+        } else {
+            DIFF_LOGI("[DiffusionSampler][debug] output_ids missing count=%d ptr=%p\n",
+                      debug_output_count, (const void*)output_ids_ptr);
+        }
     }
 
 #if defined(DIFFUSION_ENABLE_CUDA)
     // Debug: host vs device logits diff to catch reorder/stride issues
     if (debug_device && device_available && stride_ok && debug_output_count >= config_.block_length) {
+#ifdef LLAMA_CUDA
+        cudaDeviceSynchronize();
+#endif
         diffusion::ProfilerTimer debug_compare_timer;
         double max_abs_diff = 0.0;
         int max_row = -1;
@@ -753,7 +787,7 @@ bool DiffusionSampler::try_sample_with_gpu(
                                          static_cast<size_t>(n_vocab) * sizeof(float),
                                          cudaMemcpyDeviceToHost);
             if (err != cudaSuccess) {
-                DIFF_LOGD("[device_logits_debug] cudaMemcpy row=%d err=%d\n", row, int(err));
+                DIFF_LOGI("[device_logits_debug] cudaMemcpy row=%d err=%d\n", row, int(err));
                 continue;
             }
             for (int col = 0; col < n_vocab; ++col) {
@@ -766,10 +800,10 @@ bool DiffusionSampler::try_sample_with_gpu(
             }
         }
         if (max_abs_diff > 1e-3f) {
-            DIFF_LOGD("[device_logits_debug] max_abs_diff=%f at row=%d col=%d\n",
+            DIFF_LOGI("[device_logits_debug] max_abs_diff=%f at row=%d col=%d\n",
                       max_abs_diff, max_row, max_col);
         } else {
-            DIFF_LOGD("[device_logits_debug] device logits match host (max_abs_diff=%f)\n",
+            DIFF_LOGI("[device_logits_debug] device logits match host (max_abs_diff=%f)\n",
                       max_abs_diff);
         }
         double debug_compare_ms = debug_compare_timer.elapsed_ms();
@@ -779,11 +813,33 @@ bool DiffusionSampler::try_sample_with_gpu(
 #endif
 
     const float* device_logits_ptr = device_logits;
+    bool used_compact = false;
     if (can_use_device_logits) {
 #if defined(DIFFUSION_ENABLE_CUDA)
         const int output_count = debug_output_count;
         const size_t expected_rows = static_cast<size_t>(config_.block_length);
         const size_t total_rows_available = static_cast<size_t>(output_count);
+        // 始终按 output_ids 重新压缩/排序 device logits，保证与 host 顺序一致
+        if (output_ids_ptr && output_count >= static_cast<int>(expected_rows)) {
+            const size_t needed_bytes = expected_rows * static_cast<size_t>(n_vocab) * sizeof(float);
+            if (ensure_compact_buffer(needed_bytes)) {
+                float* compact_ptr = device_logits_compact_;
+                for (size_t row = 0; row < expected_rows; ++row) {
+                    const int src_row = output_ids_ptr[row];
+                    if (src_row < 0) { continue; }
+                    const float* src = device_logits + static_cast<size_t>(src_row) * static_cast<size_t>(logits_stride);
+                    float* dst = compact_ptr + row * static_cast<size_t>(n_vocab);
+                    cudaMemcpy(dst, src, static_cast<size_t>(n_vocab) * sizeof(float), cudaMemcpyDeviceToDevice);
+                }
+                device_logits_ptr = compact_ptr;
+                used_compact = true;
+                logits_stride = n_vocab;
+                local_stride_ok = true;
+            } else {
+                DIFF_LOGW("[device_logits] compact buffer alloc failed bytes=%zu\n", needed_bytes);
+            }
+        }
+
         if (output_count < static_cast<int>(expected_rows)) {
             can_use_device_logits = false;
             sampler_metrics_.gpu_fallback_compact_fail++;
@@ -791,9 +847,18 @@ bool DiffusionSampler::try_sample_with_gpu(
                 DIFF_LOGW("[device_logits] fallback: output_count=%d expected=%zu\n",
                           output_count, expected_rows);
             }
+        } else if (!local_stride_ok) {
+            // stride 不匹配且无法压缩，放弃设备 logits
+            can_use_device_logits = false;
+            if (debug_device) {
+                DIFF_LOGW("[device_logits] fallback: stride mismatch logits_stride=%lld n_vocab=%d\n",
+                          (long long)logits_stride, n_vocab);
+            }
         } else {
-            // stride 已匹配，直接使用设备端 logits 指针，避免多余 H2D 拷贝
-            device_logits_ptr = device_logits;
+            // stride 已匹配或已压缩，直接使用 device logits 指针，避免多余 H2D 拷贝
+            if (!used_compact) {
+                device_logits_ptr = device_logits;
+            }
             if (debug_device) {
                 DIFF_LOGD("[device_logits][debug] use device pointer directly rows=%zu available=%zu\n",
                           expected_rows, total_rows_available);
@@ -804,17 +869,24 @@ bool DiffusionSampler::try_sample_with_gpu(
 #endif
     }
 
-    DIFF_LOGD("[DiffusionSampler][debug] device branch check can_use_device_logits=%d\n",
+    DIFF_LOGI("[DiffusionSampler][debug] device branch check can_use_device_logits=%d\n",
               can_use_device_logits ? 1 : 0);
     // Extra guard to surface latent CUDA errors before device sampler invocation
 #ifdef LLAMA_CUDA
     cudaError_t pre_err = cudaGetLastError();
-    DIFF_LOGD("[DiffusionSampler][debug] pre-branch cudaGetLastError=%d\n", int(pre_err));
+    DIFF_LOGI("[DiffusionSampler][debug] pre-branch cudaGetLastError=%d\n", int(pre_err));
 #endif
 
     if (can_use_device_logits) {
-        DIFF_LOGD("[DiffusionSampler][debug] enter device branch before call\n");
-        DIFF_LOGD("[DiffusionSampler][debug] calling sample_from_device_ptr\n");
+        DIFF_LOGI("[DiffusionSampler][debug] enter device branch before call\n");
+        DIFF_LOGI("[DiffusionSampler][debug] calling sample_from_device_ptr\n");
+#ifdef LLAMA_CUDA
+        // 确保上游 logits 写入完成，避免读取未完成的 device logits
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            DIFF_LOGW("[DiffusionSampler][warn] cudaDeviceSynchronize before device sample failed err=%d\n", int(sync_err));
+        }
+#endif
         diffusion::ProfilerTimer gpu_timer;
         GpuSampler::Stats gpu_stats{};
         // Fast-path验证：默认使用 device 非融合路径（GpuSampler 内部可选融合）
@@ -833,8 +905,8 @@ bool DiffusionSampler::try_sample_with_gpu(
             need_entropy_probs ? entropy_probs_storage : nullptr,
             &gpu_stats,
             /*force_non_fused=*/false);
-        DIFF_LOGD("[DiffusionSampler][debug] sample_from_device_ptr finished call path\n");
-        DIFF_LOGD("[DiffusionSampler][debug] sample_from_device_ptr returned=%d tokens=%zu\n",
+        DIFF_LOGI("[DiffusionSampler][debug] sample_from_device_ptr finished call path\n");
+        DIFF_LOGI("[DiffusionSampler][debug] sample_from_device_ptr returned=%d tokens=%zu\n",
                   sampled_with_gpu ? 1 : 0, sampled_tokens.size());
         // 重新计时，记录 GPU 调用后的主机处理阶段
         host_phase_timer = diffusion::ProfilerTimer();
@@ -885,6 +957,10 @@ bool DiffusionSampler::try_sample_with_gpu(
         DiffusionProfiler::instance().record_custom("sampler_gpu_stage_d2h_ms", gpu_stats.stage_d2h_ms);
         DiffusionProfiler::instance().record_custom("sampler_gpu_stage_cpu_post_ms", gpu_stats.stage_cpu_post_ms);
         DiffusionProfiler::instance().record_custom("sampler_gpu_event_wait_ms", gpu_stats.stage_event_wait_ms);
+        DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_copy_ms", gpu_stats.stage_prepare_copy_ms);
+        DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_temp_ms", gpu_stats.stage_prepare_temp_ms);
+        DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_mask_ms", gpu_stats.stage_prepare_mask_ms);
+        DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_rng_ms", gpu_stats.stage_prepare_rng_ms);
         const double stage_sum = gpu_stats.stage_prepare_ms + gpu_stats.stage_softmax_ms +
                                  gpu_stats.stage_sort_ms + gpu_stats.stage_sample_ms +
                                  gpu_stats.stage_d2h_ms + gpu_stats.stage_cpu_post_ms +
@@ -898,6 +974,10 @@ bool DiffusionSampler::try_sample_with_gpu(
         if (sampled_with_gpu) {
             sampler_metrics_.gpu_success++;
             sampler_metrics_.gpu_stage_prepare_ms += gpu_stats.stage_prepare_ms;
+            sampler_metrics_.gpu_prepare_copy_ms += gpu_stats.stage_prepare_copy_ms;
+            sampler_metrics_.gpu_prepare_temp_ms += gpu_stats.stage_prepare_temp_ms;
+            sampler_metrics_.gpu_prepare_mask_ms += gpu_stats.stage_prepare_mask_ms;
+            sampler_metrics_.gpu_prepare_rng_ms += gpu_stats.stage_prepare_rng_ms;
             sampler_metrics_.gpu_stage_softmax_ms += gpu_stats.stage_softmax_ms;
             sampler_metrics_.gpu_stage_sort_ms += gpu_stats.stage_sort_ms;
             sampler_metrics_.gpu_stage_sample_ms += gpu_stats.stage_sample_ms;
@@ -1008,6 +1088,10 @@ bool DiffusionSampler::try_sample_with_gpu(
     DiffusionProfiler::instance().record_custom("sampler_gpu_stage_d2h_ms", gpu_stats.stage_d2h_ms);
     DiffusionProfiler::instance().record_custom("sampler_gpu_stage_cpu_post_ms", gpu_stats.stage_cpu_post_ms);
     DiffusionProfiler::instance().record_custom("sampler_gpu_event_wait_ms", gpu_stats.stage_event_wait_ms);
+    DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_copy_ms", gpu_stats.stage_prepare_copy_ms);
+    DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_temp_ms", gpu_stats.stage_prepare_temp_ms);
+    DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_mask_ms", gpu_stats.stage_prepare_mask_ms);
+    DiffusionProfiler::instance().record_custom("sampler_gpu_prepare_rng_ms", gpu_stats.stage_prepare_rng_ms);
     const double stage_sum = gpu_stats.stage_prepare_ms + gpu_stats.stage_softmax_ms +
                              gpu_stats.stage_sort_ms + gpu_stats.stage_sample_ms +
                              gpu_stats.stage_d2h_ms + gpu_stats.stage_cpu_post_ms +
@@ -1026,6 +1110,10 @@ bool DiffusionSampler::try_sample_with_gpu(
     sampler_metrics_.gpu_success++;
     sampler_metrics_.gpu_total_ms += local_gpu_ms;
     sampler_metrics_.gpu_stage_prepare_ms += gpu_stats.stage_prepare_ms;
+    sampler_metrics_.gpu_prepare_copy_ms += gpu_stats.stage_prepare_copy_ms;
+    sampler_metrics_.gpu_prepare_temp_ms += gpu_stats.stage_prepare_temp_ms;
+    sampler_metrics_.gpu_prepare_mask_ms += gpu_stats.stage_prepare_mask_ms;
+    sampler_metrics_.gpu_prepare_rng_ms += gpu_stats.stage_prepare_rng_ms;
     sampler_metrics_.gpu_stage_softmax_ms += gpu_stats.stage_softmax_ms;
     sampler_metrics_.gpu_stage_sort_ms += gpu_stats.stage_sort_ms;
     sampler_metrics_.gpu_stage_sample_ms += gpu_stats.stage_sample_ms;

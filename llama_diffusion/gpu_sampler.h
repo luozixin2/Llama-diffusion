@@ -10,6 +10,10 @@ namespace diffusion {
 
 struct GpuSamplerStats {
     double stage_prepare_ms = 0.0;
+    double stage_prepare_copy_ms = 0.0;
+    double stage_prepare_temp_ms = 0.0;
+    double stage_prepare_mask_ms = 0.0;
+    double stage_prepare_rng_ms = 0.0;
     double stage_softmax_ms = 0.0;
     double stage_sort_ms = 0.0;
     double stage_sample_ms = 0.0;

@@ -1437,6 +1437,23 @@ void llama_context::output_reorder() {
     const uint64_t n_vocab = model.vocab.n_tokens();
     const uint64_t n_embd  = model.hparams.n_embd;
 
+#if defined(GGML_USE_CUDA)
+    // Make sure device logits mirror host buffer before applying swaps
+    if (logits_on_device && logits_device && logits_size > 0) {
+        cudaError_t copy_err = cudaMemcpy(
+            const_cast<float *>(logits_device),
+            logits,
+            logits_size * sizeof(float),
+            cudaMemcpyHostToDevice);
+        if (copy_err != cudaSuccess) {
+            LLAMA_LOG_WARN("%s: cudaMemcpy host->device logits failed (%d), disabling device logits\n", __func__, int(copy_err));
+            logits_on_device = false;
+            logits_device = nullptr;
+            logits_device_stride = 0;
+        }
+    }
+#endif
+
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
