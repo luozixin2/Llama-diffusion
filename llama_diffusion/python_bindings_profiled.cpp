@@ -119,6 +119,7 @@ public:
         add_metric("telemetry_gpu_stage_d2h", telemetry.gpu_stage_d2h_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_cpu_post", telemetry.gpu_stage_cpu_post_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_event_wait", telemetry.gpu_stage_event_wait_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_gap", telemetry.gpu_gap_ms, telemetry.gpu_success + telemetry.gpu_fail);
         add_metric("telemetry_gpu_total", telemetry.gpu_total_ms, telemetry.gpu_success + telemetry.gpu_fail);
         add_metric("telemetry_gpu_overhead", telemetry.gpu_overhead_ms, telemetry.gpu_success + telemetry.gpu_fail);
         add_metric("telemetry_gpu_overhead_get_device_logits", telemetry.gpu_overhead_get_device_logits_ms, telemetry.gpu_success + telemetry.gpu_fail);

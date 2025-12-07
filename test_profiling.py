@@ -795,92 +795,143 @@ def main():
     
     # 定义测试配置（仅包含质量过关的配置）
     test_configs = [
-        # Baseline配置（用于对比）
+        # CPU 基线（关闭 GPU 相关环境）
         {
-            'name': 'Baseline (block=8, steps=8)',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 8,
-                'remasking_strategy': 'low_confidence_dynamic',
-                # 关闭 GPU 相关环境，确保纯 CPU 参考
-                'env_overrides': {
-                    'DIFFUSION_GPU_ONLY': None,
-                    'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                    'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-                },
-        },
-        {
-            'name': 'Baseline (block=4, steps=4)',
-            'gen_length': 128,
-            'block_length': 4,
-            'denoising_steps': 4,
-                'remasking_strategy': 'low_confidence_dynamic',
-                'env_overrides': {
-                    'DIFFUSION_GPU_ONLY': None,
-                    'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                    'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-                },
-        },
-        {
-            'name': 'Baseline (block=8, steps=4)',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 4,
-                'remasking_strategy': 'low_confidence_dynamic',
-                'env_overrides': {
-                    'DIFFUSION_GPU_ONLY': None,
-                    'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                    'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-                },
-        },
-        # GPU加速的Baseline
-        {
-            'name': 'Baseline (block=8, steps=8) + GPU',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic',
-                'use_gpu_sampler': True,
-                # 显式开启 GPU logits + async，同一 GPU
-                'env_overrides': {
-                    'DIFFUSION_GPU_ONLY': '1',
-                    'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                    'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-                    # 若需要限定 GPU，可在外部设置 CUDA_VISIBLE_DEVICES
-                },
-        },
-        {
-            'name': 'Baseline (block=4, steps=4) + GPU',
+            'name': 'CPU (block=4, steps=4)',
             'gen_length': 128,
             'block_length': 4,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
-                'use_gpu_sampler': True,
-                'env_overrides': {
-                    'DIFFUSION_GPU_ONLY': '1',
-                    'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                    'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-                },
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
         },
         {
-            'name': 'Baseline (block=8, steps=4) + GPU',
+            'name': 'CPU (block=8, steps=8)',
             'gen_length': 128,
             'block_length': 8,
+            'denoising_steps': 8,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'CPU (block=16, steps=16)',
+            'gen_length': 128,
+            'block_length': 16,
+            'denoising_steps': 16,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'CPU (block=32, steps=32)',
+            'gen_length': 128,
+            'block_length': 32,
+            'denoising_steps': 32,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'CPU (block=64, steps=64)',
+            'gen_length': 128,
+            'block_length': 64,
+            'denoising_steps': 64,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        # GPU 采样（GPU-only + device logits + async）
+        {
+            'name': 'GPU (block=4, steps=4)',
+            'gen_length': 128,
+            'block_length': 4,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
-                'use_gpu_sampler': True,
-                'env_overrides': {
-                    'DIFFUSION_GPU_ONLY': '1',
-                    'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                    'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-                },
-        }
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=8, steps=8)',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 8,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=16, steps=16)',
+            'gen_length': 128,
+            'block_length': 16,
+            'denoising_steps': 16,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=32, steps=32)',
+            'gen_length': 128,
+            'block_length': 32,
+            'denoising_steps': 32,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=64, steps=64)',
+            'gen_length': 128,
+            'block_length': 64,
+            'denoising_steps': 64,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
     ]
     
     # 运行对比测试 (自动warmup + 每个配置运行3次取平均)

@@ -25,6 +25,7 @@ struct SamplerTelemetry {
     double gpu_stage_d2h_ms = 0.0;
     double gpu_stage_cpu_post_ms = 0.0;
     double gpu_stage_event_wait_ms = 0.0;
+    double gpu_gap_ms = 0.0; // invoke_wall - sum(stages) 的残差
     double gpu_total_ms = 0.0;
     double gpu_overhead_ms = 0.0;
     double gpu_overhead_get_device_logits_ms = 0.0;
