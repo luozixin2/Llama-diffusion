@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <cstdlib>
 
 struct llama_output_swap_device {
     uint64_t i0;
@@ -41,6 +42,7 @@ extern "C" bool llama_gpu_swap_rows(
     if (!logits || !swaps || n_swaps <= 0) {
         return true;
     }
+    const bool async = std::getenv("LLAMA_DEVICE_LOGITS_ASYNC") != nullptr;
     const int threads = 256;
     const int blocks = n_swaps;
     llama_gpu_swap_rows_kernel<<<blocks, threads>>>(
@@ -49,6 +51,9 @@ extern "C" bool llama_gpu_swap_rows(
         n_rows,
         reinterpret_cast<const llama_output_swap_device*>(swaps),
         n_swaps);
+    if (async) {
+        return cudaGetLastError() == cudaSuccess;
+    }
     cudaError_t err = cudaDeviceSynchronize();
     return err == cudaSuccess;
 }

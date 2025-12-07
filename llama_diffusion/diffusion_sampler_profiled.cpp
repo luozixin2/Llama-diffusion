@@ -117,6 +117,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
     for (int step = 0; step < config_.denoising_steps; step++) {
         std::string step_section = "denoising_step_" + std::to_string(step);
         PROFILE_SECTION(step_section.c_str());
+        fprintf(stderr, "[DiffusionSamplerProfiled][debug] block=%d step=%d enable_gpu_sampler=%d\n",
+                block_idx, step, config_.enable_gpu_sampler ? 1 : 0);
         
         // Check for masks
         {

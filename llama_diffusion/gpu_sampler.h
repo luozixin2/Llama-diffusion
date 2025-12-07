@@ -16,6 +16,10 @@ struct GpuSamplerStats {
     double stage_d2h_ms = 0.0;
     double stage_cpu_post_ms = 0.0;
     double stage_event_wait_ms = 0.0;
+    double stage_total_ms = 0.0;        // Sum of stages above
+    double stage_whole_gpu_ms = 0.0;    // CUDA event elapsed over entire device path
+    double stage_whole_wall_ms = 0.0;   // CPU wall time over entire device path
+    int n_vocab_limit = 0;              // effective vocab cap for masking tail tokens
     bool fast_path = false;
     bool device_logits = false;
 };

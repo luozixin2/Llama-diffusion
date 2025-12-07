@@ -8,6 +8,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import copy
 
+# 默认锁定到单卡，避免 llama.cpp 多卡流水线在 profiling 下偶发崩溃（exit 139）。
+# 如需自行控制显卡，可在外部预先设置 CUDA_VISIBLE_DEVICES 再运行脚本。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# GPU 采样依赖 device logits，必须在模型创建前设置，后续即使临时 unset 也不会丢失分配。
+os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
+os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
+
 class DiffusionProfiler:
     def __init__(self, model_path: str, n_ctx: int = 8192, n_gpu_layers: int = 0):
         self.model = llama_diffusion_profiled.LlamaDiffusionProfiled(
@@ -19,12 +26,16 @@ class DiffusionProfiler:
         self, 
         prompt: List[int],
         mask_token_id: int,
-        warmup_iterations: int = 3,
+        warmup_iterations: int = 1,
         gen_length: int = 64,
         block_length: int = 8,
         denoising_steps: int = 4
     ):
         """GPU warmup - 运行几次推理以预热GPU和缓存"""
+        warmup_iterations = int(os.environ.get("TEST_PROFILING_WARMUP_ITERS", warmup_iterations))
+        gen_length = int(os.environ.get("TEST_PROFILING_WARMUP_GEN_LENGTH", gen_length))
+        block_length = int(os.environ.get("TEST_PROFILING_WARMUP_BLOCK", block_length))
+        denoising_steps = int(os.environ.get("TEST_PROFILING_WARMUP_STEPS", denoising_steps))
         print(f"\n{'='*80}")
         print(f"GPU WARMUP - Running {warmup_iterations} iterations")
         print(f"{'='*80}")
@@ -67,6 +78,24 @@ class DiffusionProfiler:
         **kwargs
     ):
         """运行单次性能测试"""
+
+        def _apply_env(env_overrides: Dict[str, str]):
+            # Save originals and apply overrides (None means unset)
+            saved = {}
+            for k, v in env_overrides.items():
+                saved[k] = os.environ.get(k)
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            return saved
+
+        def _restore_env(saved_env: Dict[str, str]):
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         
         # 检查是否需要warmup
         if ensure_warmup and not self.is_warmed_up:
@@ -77,18 +106,26 @@ class DiffusionProfiler:
         model_kwargs = kwargs.copy()
         if 'name' in model_kwargs:
             del model_kwargs['name']
+        env_overrides = model_kwargs.pop('env_overrides', None)
             
         start_time = time.time()
-        
-        # 使用过滤后的 model_kwargs 调用 C++ 函数
-        tokens, profile = self.model.generate_with_profiling(
-            prompt=prompt,
-            mask_token_id=mask_token_id,
-            gen_length=gen_length,
-            block_length=block_length,
-            denoising_steps=denoising_steps,
-            **model_kwargs 
-        )
+        saved_env = {}
+        if env_overrides:
+            saved_env = _apply_env(env_overrides)
+
+        try:
+            # 使用过滤后的 model_kwargs 调用 C++ 函数
+            tokens, profile = self.model.generate_with_profiling(
+                prompt=prompt,
+                mask_token_id=mask_token_id,
+                gen_length=gen_length,
+                block_length=block_length,
+                denoising_steps=denoising_steps,
+                **model_kwargs 
+            )
+        finally:
+            if env_overrides:
+                _restore_env(saved_env)
         
         end_time = time.time()
         total_wall_time = (end_time - start_time) * 1000  # Convert to ms
@@ -115,6 +152,9 @@ class DiffusionProfiler:
         summary_log_path: str = None  # 可选：将打印的摘要/表格写入文件
     ):
         """运行多配置对比测试"""
+        
+        if os.environ.get("TEST_PROFILING_SKIP_WARMUP", "").lower() in ("1", "true", "yes"):
+            warmup_before_test = False
         
         # 在所有测试前进行warmup
         if warmup_before_test:
@@ -263,12 +303,35 @@ class DiffusionProfiler:
             "telemetry_gpu_fallback_compact_fail",
             "telemetry_gpu_fallback_device_unavail",
             "telemetry_gpu_sampler_unavailable",
+            "telemetry_gpu_only_mode",
             "telemetry_gpu_total",
             "telemetry_gpu_overhead",
+            "telemetry_gpu_stage_prepare",
+            "telemetry_gpu_stage_softmax",
+            "telemetry_gpu_stage_sort",
+            "telemetry_gpu_stage_sample",
+            "telemetry_gpu_stage_d2h",
+            "telemetry_gpu_stage_cpu_post",
+            "telemetry_gpu_event_wait",
+            "telemetry_gpu_stage_total",
+            "telemetry_gpu_stage_whole_gpu_ms",
+            "telemetry_gpu_stage_whole_wall_ms",
+            "telemetry_gpu_invoke_residual_ms",
+            "telemetry_gpu_try_wall_ms",
+            "telemetry_gpu_try_get_device_ms",
+            "telemetry_gpu_try_get_output_ids_ms",
+            "telemetry_gpu_try_residual_ms",
         ]
-        present_telemetry = {k: profile[k].get("count", 0) for k in telemetry_keys if k in profile}
+        present_telemetry = {}
+        for k in telemetry_keys:
+            if k in profile:
+                stats = profile[k]
+                if "count" in stats:
+                    present_telemetry[k] = stats["count"]
+                elif "total_ms" in stats:
+                    present_telemetry[k] = f"total={stats.get('total_ms',0):.2f}, avg={stats.get('avg_ms',0):.2f}, calls={int(stats.get('call_count',0))}"
         if present_telemetry:
-            lines.append("\nTelemetry (counts):")
+            lines.append("\nTelemetry:")
             for k, v in present_telemetry.items():
                 lines.append(f"{k:<35}: {v}")
 
@@ -709,6 +772,7 @@ def main():
     MODEL_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
     TOKENIZER_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
     SUMMARY_LOG = "profile_summary.txt"
+    RUNS_PER_CONFIG = int(os.environ.get("TEST_PROFILING_RUNS_PER_CONFIG", "3"))
     
     # 加载tokenizer获取真实的prompt
     from transformers import AutoTokenizer
@@ -731,21 +795,40 @@ def main():
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic'
+                'remasking_strategy': 'low_confidence_dynamic',
+                # 关闭 GPU 相关环境，确保纯 CPU 参考
+                'env_overrides': {
+                    'DIFFUSION_GPU_ONLY': None,
+                    'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                    'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                },
         },
         {
             'name': 'Baseline (block=4, steps=4)',
             'gen_length': 128,
             'block_length': 4,
             'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic'
+                'remasking_strategy': 'low_confidence_dynamic',
+                'env_overrides': {
+                    'DIFFUSION_GPU_ONLY': None,
+                    'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                    'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                },
         },
         {
             'name': 'Baseline (block=8, steps=4)',
             'gen_length': 128,
             'block_length': 8,
             'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic'
+                'remasking_strategy': 'low_confidence_dynamic',
+                'env_overrides': {
+                    'DIFFUSION_GPU_ONLY': None,
+                    'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                    'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                },
         },
         # GPU加速的Baseline
         {
@@ -754,7 +837,15 @@ def main():
             'block_length': 8,
             'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
+                'use_gpu_sampler': True,
+                # 显式开启 GPU logits + async，同一 GPU
+                'env_overrides': {
+                    'DIFFUSION_GPU_ONLY': '1',
+                    'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                    'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': '1',
+                    # 若需要限定 GPU，可在外部设置 CUDA_VISIBLE_DEVICES
+                },
         },
         {
             'name': 'Baseline (block=4, steps=4) + GPU',
@@ -762,7 +853,13 @@ def main():
             'block_length': 4,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
+                'use_gpu_sampler': True,
+                'env_overrides': {
+                    'DIFFUSION_GPU_ONLY': '1',
+                    'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                    'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': '1',
+                },
         },
         {
             'name': 'Baseline (block=8, steps=4) + GPU',
@@ -770,7 +867,13 @@ def main():
             'block_length': 8,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
+                'use_gpu_sampler': True,
+                'env_overrides': {
+                    'DIFFUSION_GPU_ONLY': '1',
+                    'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                    'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                    'DIFFUSION_DEBUG_DEVICE_LOGITS': '1',
+                },
         }
     ]
     
@@ -780,7 +883,7 @@ def main():
         MASK_TOKEN_ID, 
         test_configs,
         warmup_before_test=True,
-        runs_per_config=3,  # 每个配置运行3次
+        runs_per_config=RUNS_PER_CONFIG,  # 默认3次，可通过 TEST_PROFILING_RUNS_PER_CONFIG 覆盖
         summary_log_path=SUMMARY_LOG
     )
     

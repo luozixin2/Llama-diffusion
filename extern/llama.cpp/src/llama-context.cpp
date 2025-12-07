@@ -1456,15 +1456,44 @@ void llama_context::output_reorder() {
 
 #if defined(GGML_USE_CUDA)
     // Sync logits to device and apply swaps on device when requested
-    if (logits_on_device && logits_device && logits) {
-        const size_t bytes = logits_size * sizeof(float);
-        cudaError_t err = cudaMemcpy(const_cast<float *>(logits_device), logits, bytes, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            LLAMA_LOG_WARN("%s: cudaMemcpy logits_device failed (%d), disabling device logits\n", __func__, int(err));
-            logits_on_device = false;
-            logits_device = nullptr;
-            logits_device_stride = 0;
+    if (logits_on_device && logits_device) {
+        if (!output_swaps.empty()) {
+            // Apply swaps on device without host copy
+            struct llama_output_swap_device {
+                uint64_t i0;
+                uint64_t i1;
+            };
+            std::vector<llama_output_swap_device> swaps_dev(output_swaps.size());
+            for (size_t idx = 0; idx < output_swaps.size(); ++idx) {
+                swaps_dev[idx].i0 = output_swaps[idx].i0;
+                swaps_dev[idx].i1 = output_swaps[idx].i1;
+            }
+            llama_output_swap_device * d_swaps = nullptr;
+            const size_t swaps_bytes = swaps_dev.size() * sizeof(llama_output_swap_device);
+            cudaError_t alloc_err = cudaMalloc(&d_swaps, swaps_bytes);
+            if (alloc_err == cudaSuccess) {
+                cudaMemcpy(d_swaps, swaps_dev.data(), swaps_bytes, cudaMemcpyHostToDevice);
+                const bool ok = llama_gpu_swap_rows(
+                    const_cast<float *>(logits_device),
+                    n_vocab,
+                    n_outputs,
+                    d_swaps,
+                    (int) swaps_dev.size());
+                cudaFree(d_swaps);
+                if (!ok) {
+                    LLAMA_LOG_WARN("%s: llama_gpu_swap_rows failed, disabling device logits\n", __func__);
+                    logits_on_device = false;
+                    logits_device = nullptr;
+                    logits_device_stride = 0;
+                }
+            } else {
+                LLAMA_LOG_WARN("%s: cudaMalloc d_swaps failed (%d), disabling device logits\n", __func__, int(alloc_err));
+                logits_on_device = false;
+                logits_device = nullptr;
+                logits_device_stride = 0;
+            }
         }
+        // Note: skip host->device memcpy; device logits already produced by decode.
     }
 #endif
 
@@ -2567,12 +2596,18 @@ float * llama_get_logits(llama_context * ctx) {
 }
 
 const float * llama_get_logits_device(llama_context * ctx, int64_t * stride_tokens) {
-    ctx->synchronize();
+    static const bool async_device_logits = std::getenv("LLAMA_DEVICE_LOGITS_ASYNC") != nullptr;
+    if (!async_device_logits) {
+        ctx->synchronize();
+    }
     return ctx->get_logits_device(stride_tokens);
 }
 
 const int32_t * llama_get_logits_output_ids(llama_context * ctx, int * out_count) {
-    ctx->synchronize();
+    static const bool async_device_logits = std::getenv("LLAMA_DEVICE_LOGITS_ASYNC") != nullptr;
+    if (!async_device_logits) {
+        ctx->synchronize();
+    }
     return ctx->get_logits_output_ids(out_count);
 }
 
