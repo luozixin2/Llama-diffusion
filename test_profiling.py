@@ -1,10 +1,19 @@
 import llama_diffusion.llama_diffusion_profiled as llama_diffusion_profiled
 import json 
 import time
+import os
+import shutil
 from typing import Dict, List
 import matplotlib.pyplot as plt
 import pandas as pd
 import copy
+
+# 默认锁定到单卡，避免 llama.cpp 多卡流水线在 profiling 下偶发崩溃（exit 139）。
+# 如需自行控制显卡，可在外部预先设置 CUDA_VISIBLE_DEVICES 再运行脚本。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# GPU 采样依赖 device logits，必须在模型创建前设置，后续即使临时 unset 也不会丢失分配。
+os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
+os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
 
 class DiffusionProfiler:
     def __init__(self, model_path: str, n_ctx: int = 8192, n_gpu_layers: int = 0):
@@ -17,12 +26,16 @@ class DiffusionProfiler:
         self, 
         prompt: List[int],
         mask_token_id: int,
-        warmup_iterations: int = 3,
+        warmup_iterations: int = 1,
         gen_length: int = 64,
         block_length: int = 8,
         denoising_steps: int = 4
     ):
         """GPU warmup - 运行几次推理以预热GPU和缓存"""
+        warmup_iterations = int(os.environ.get("TEST_PROFILING_WARMUP_ITERS", warmup_iterations))
+        gen_length = int(os.environ.get("TEST_PROFILING_WARMUP_GEN_LENGTH", gen_length))
+        block_length = int(os.environ.get("TEST_PROFILING_WARMUP_BLOCK", block_length))
+        denoising_steps = int(os.environ.get("TEST_PROFILING_WARMUP_STEPS", denoising_steps))
         print(f"\n{'='*80}")
         print(f"GPU WARMUP - Running {warmup_iterations} iterations")
         print(f"{'='*80}")
@@ -65,6 +78,24 @@ class DiffusionProfiler:
         **kwargs
     ):
         """运行单次性能测试"""
+
+        def _apply_env(env_overrides: Dict[str, str]):
+            # Save originals and apply overrides (None means unset)
+            saved = {}
+            for k, v in env_overrides.items():
+                saved[k] = os.environ.get(k)
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            return saved
+
+        def _restore_env(saved_env: Dict[str, str]):
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         
         # 检查是否需要warmup
         if ensure_warmup and not self.is_warmed_up:
@@ -75,18 +106,26 @@ class DiffusionProfiler:
         model_kwargs = kwargs.copy()
         if 'name' in model_kwargs:
             del model_kwargs['name']
+        env_overrides = model_kwargs.pop('env_overrides', None)
             
         start_time = time.time()
-        
-        # 使用过滤后的 model_kwargs 调用 C++ 函数
-        tokens, profile = self.model.generate_with_profiling(
-            prompt=prompt,
-            mask_token_id=mask_token_id,
-            gen_length=gen_length,
-            block_length=block_length,
-            denoising_steps=denoising_steps,
-            **model_kwargs 
-        )
+        saved_env = {}
+        if env_overrides:
+            saved_env = _apply_env(env_overrides)
+
+        try:
+            # 使用过滤后的 model_kwargs 调用 C++ 函数
+            tokens, profile = self.model.generate_with_profiling(
+                prompt=prompt,
+                mask_token_id=mask_token_id,
+                gen_length=gen_length,
+                block_length=block_length,
+                denoising_steps=denoising_steps,
+                **model_kwargs 
+            )
+        finally:
+            if env_overrides:
+                _restore_env(saved_env)
         
         end_time = time.time()
         total_wall_time = (end_time - start_time) * 1000  # Convert to ms
@@ -109,15 +148,20 @@ class DiffusionProfiler:
         mask_token_id: int,
         configs: List[Dict],
         warmup_before_test: bool = True,
-        runs_per_config: int = 1  # 支持多次运行取平均
+        runs_per_config: int = 1,  # 支持多次运行取平均
+        summary_log_path: str = None  # 可选：将打印的摘要/表格写入文件
     ):
         """运行多配置对比测试"""
+        
+        if os.environ.get("TEST_PROFILING_SKIP_WARMUP", "").lower() in ("1", "true", "yes"):
+            warmup_before_test = False
         
         # 在所有测试前进行warmup
         if warmup_before_test:
             self.warmup(prompt, mask_token_id)
         
         results = []
+        log_lines = []
         
         for i, config in enumerate(configs):
             config_name = config.get('name', f'Config {i+1}')
@@ -149,14 +193,25 @@ class DiffusionProfiler:
                 averaged_result['config_name'] = config_name
                 averaged_result['individual_runs'] = run_results
                 results.append(averaged_result)
-                print(f"\nAverage across {runs_per_config} runs:")
-                self._print_result_summary(averaged_result)
+                summary_text = self._format_result_summary(averaged_result, header=f"Average across {runs_per_config} runs")
+                print(summary_text)
+                log_lines.append(summary_text)
             else:
                 result = run_results[0]
                 result['config_name'] = config_name
                 results.append(result)
-                self._print_result_summary(result)
+                summary_text = self._format_result_summary(result)
+                print(summary_text)
+                log_lines.append(summary_text)
         
+        # 写入汇总日志（包含逐配置摘要 + 综合表格）
+        if summary_log_path:
+            summary_txt = self._format_comparative_table(results)
+            log_lines.append(summary_txt)
+            with open(summary_log_path, 'w') as f:
+                f.write("\n\n".join(log_lines))
+            print(f"\nSummary log saved to {summary_log_path}")
+
         return results
     
     def _average_results(self, run_results: List[Dict]) -> Dict:
@@ -168,7 +223,7 @@ class DiffusionProfiler:
             'profile': {}
         }
         
-        # 平均profile数据
+        # 平均/合并 profile 数据（同时支持 total_ms/avg_ms/call_count 以及 count-only 遥测）
         all_sections = set()
         for result in run_results:
             all_sections.update(result['profile'].keys())
@@ -177,13 +232,17 @@ class DiffusionProfiler:
             total_ms_values = []
             avg_ms_values = []
             call_count_values = []
+            count_values = []
             
             for result in run_results:
                 if section in result['profile']:
                     stats = result['profile'][section]
-                    total_ms_values.append(stats.get('total_ms', 0))
-                    avg_ms_values.append(stats.get('avg_ms', 0))
-                    call_count_values.append(stats.get('call_count', 0))
+                    if 'total_ms' in stats or 'avg_ms' in stats or 'call_count' in stats:
+                        total_ms_values.append(stats.get('total_ms', 0))
+                        avg_ms_values.append(stats.get('avg_ms', 0))
+                        call_count_values.append(stats.get('call_count', 0))
+                    if 'count' in stats:
+                        count_values.append(stats.get('count', 0))
             
             if total_ms_values:
                 avg_result['profile'][section] = {
@@ -191,35 +250,134 @@ class DiffusionProfiler:
                     'avg_ms': sum(avg_ms_values) / len(avg_ms_values),
                     'call_count': sum(call_count_values) / len(call_count_values)
                 }
+                if count_values:
+                    avg_result['profile'][section]['count'] = sum(count_values) / len(count_values)
+            elif count_values:
+                avg_result['profile'][section] = {
+                    'count': sum(count_values) / len(count_values)
+                }
         
         return avg_result
     
-    def _print_result_summary(self, result: Dict):
-        """打印单次测试摘要"""
+    def _format_result_summary(self, result: Dict, header: str = None) -> str:
+        """格式化单次测试摘要，返回字符串"""
         profile = result['profile']
-        
-        print(f"\nWall Time: {result['wall_time_ms']:.2f} ms")
-        print(f"Tokens Generated: {len(result['tokens'])}")
-        print(f"Throughput: {len(result['tokens']) / (result['wall_time_ms'] / 1000):.2f} tokens/sec")
-        
+        lines = []
+        if header:
+            lines.append(header)
+        lines.append(f"Wall Time: {result['wall_time_ms']:.2f} ms")
+        lines.append(f"Tokens Generated: {len(result['tokens'])}")
+        lines.append(f"Throughput: {len(result['tokens']) / (result['wall_time_ms'] / 1000):.2f} tokens/sec")
+
         if 'total_generation' in profile:
             total_gen = profile['total_generation']
-            print(f"Total Generation Time: {total_gen.get('total_ms', 0):.2f} ms")
-        
-        # Top bottlenecks
+            lines.append(f"Total Generation Time: {total_gen.get('total_ms', 0):.2f} ms")
+
         sorted_sections = sorted(
             profile.items(),
             key=lambda x: x[1].get('total_ms', 0),
             reverse=True
         )[:10]
-        
-        print("\nTop 10 Time-Consuming Sections:")
-        print(f"{'Section':<40} {'Total (ms)':<12} {'Avg (ms)':<12} {'Calls':<8}")
-        print("-" * 80)
-        
+
+        lines.append("\nTop 10 Time-Consuming Sections:")
+        lines.append(f"{'Section':<40} {'Total (ms)':<12} {'Avg (ms)':<12} {'Calls':<8}")
+        lines.append("-" * 80)
+
         for section, stats in sorted_sections:
-            print(f"{section:<40} {stats.get('total_ms', 0):<12.2f} "
-                  f"{stats.get('avg_ms', 0):<12.2f} {int(stats.get('call_count', 0)):<8}")
+            lines.append(f"{section:<40} {stats.get('total_ms', 0):<12.2f} "
+                         f"{stats.get('avg_ms', 0):<12.2f} {int(stats.get('call_count', 0)):<8}")
+
+        # Telemetry counts (GPU sampling)
+        telemetry_keys = [
+            "telemetry_gpu_fast_path",
+            "telemetry_gpu_device_fast_path",
+            "telemetry_gpu_path_device_hit",
+            "telemetry_gpu_path_device_miss",
+            "telemetry_gpu_path_need_entropy",
+            "telemetry_gpu_fallback_topk",
+            "telemetry_gpu_fallback_topp",
+            "telemetry_gpu_fallback_entropy",
+            "telemetry_gpu_fallback_stride",
+            "telemetry_gpu_fallback_stride_mismatch",
+            "telemetry_gpu_fallback_partial_logits",
+            "telemetry_gpu_fallback_compact_fail",
+            "telemetry_gpu_fallback_device_unavail",
+            "telemetry_gpu_sampler_unavailable",
+            "telemetry_gpu_only_mode",
+            "telemetry_gpu_total",
+            "telemetry_gpu_overhead",
+            "telemetry_gpu_overhead_get_device_logits",
+            "telemetry_gpu_overhead_get_output_ids",
+            "telemetry_gpu_overhead_debug_compare",
+            "telemetry_gpu_overhead_host_pre",
+            "telemetry_gpu_overhead_host_after_output",
+            "telemetry_gpu_overhead_host_post",
+            "sampler_gpu_host_pre_get_device_ms",
+            "sampler_gpu_host_pre_get_output_ids_ms",
+            "sampler_gpu_host_pre_debug_compare_ms",
+            "sampler_gpu_host_pre_compact_ms",
+            "sampler_gpu_host_pre_sync_ms",
+            "sampler_gpu_host_pre_misc_ms",
+            "telemetry_gpu_stage_prepare",
+            "telemetry_gpu_prepare_copy",
+            "telemetry_gpu_prepare_temp",
+            "telemetry_gpu_prepare_mask",
+            "telemetry_gpu_prepare_rng",
+            "telemetry_gpu_stage_softmax",
+            "telemetry_gpu_stage_sort",
+            "telemetry_gpu_stage_sample",
+            "telemetry_gpu_stage_d2h",
+            "telemetry_gpu_stage_cpu_post",
+            "telemetry_gpu_event_wait",
+            "telemetry_gpu_stage_total",
+            "telemetry_gpu_stage_whole_gpu_ms",
+            "telemetry_gpu_stage_whole_wall_ms",
+            "telemetry_gpu_invoke_residual_ms",
+            "telemetry_gpu_try_wall_ms",
+            "telemetry_gpu_try_get_device_ms",
+            "telemetry_gpu_try_get_output_ids_ms",
+            "telemetry_gpu_try_residual_ms",
+        ]
+        present_telemetry = {}
+        for k in telemetry_keys:
+            if k in profile:
+                stats = profile[k]
+                if "count" in stats:
+                    present_telemetry[k] = stats["count"]
+                elif "total_ms" in stats:
+                    present_telemetry[k] = f"total={stats.get('total_ms',0):.2f}, avg={stats.get('avg_ms',0):.2f}, calls={int(stats.get('call_count',0))}"
+        if present_telemetry:
+            lines.append("\nTelemetry:")
+            for k, v in present_telemetry.items():
+                lines.append(f"{k:<35}: {v}")
+
+        return "\n".join(lines)
+
+    def _print_result_summary(self, result: Dict):
+        """打印单次测试摘要"""
+        print(self._format_result_summary(result))
+    
+    def _format_comparative_table(self, results: List[Dict]) -> str:
+        """生成最终对比表格字符串"""
+        lines = []
+        lines.append(f"\n{'='*80}")
+        lines.append("COMPARATIVE SUMMARY")
+        lines.append(f"{'='*80}\n")
+        lines.append(f"{'Config':<30} {'Wall Time (ms)':<15} {'Tokens/sec':<15} {'Speedup':<10}")
+        lines.append("-" * 70)
+
+        if not results:
+            return "\n".join(lines)
+
+        baseline_time = results[0]['wall_time_ms']
+        for result in results:
+            tokens_per_sec = len(result['tokens']) / (result['wall_time_ms'] / 1000)
+            speedup = baseline_time / result['wall_time_ms'] if result['wall_time_ms'] > 0 else 0
+            lines.append(f"{result.get('config_name','Unknown'):<30} "
+                         f"{result['wall_time_ms']:<15.2f} "
+                         f"{tokens_per_sec:<15.2f} "
+                         f"{speedup:<10.2f}x")
+        return "\n".join(lines)
     
     def analyze_bottlenecks(self, result: Dict):
         """分析性能瓶颈"""
@@ -282,11 +440,13 @@ class DiffusionProfiler:
             print("No critical bottlenecks identified.")
     
     def visualize_profile(self, result: Dict, output_file: str = 'profile_viz.png'):
-        """可视化性能分析结果"""
+        """可视化性能分析结果 - 确保不互相包含，多次调用函数单独展示"""
         import matplotlib.pyplot as plt
         import numpy as np
+        import re
         
         profile = result['profile']
+        total_wall_time = result['wall_time_ms']
         
         # Filter out very small sections
         filtered_profile = {
@@ -298,32 +458,264 @@ class DiffusionProfiler:
             print("No significant sections to visualize")
             return
         
-        # Sort by total time
-        sorted_sections = sorted(
-            filtered_profile.items(),
-            key=lambda x: x[1].get('total_ms', 0),
-            reverse=True
-        )[:15]  # Top 15 sections
+        # 分类阶段
+        top_level_phases = ['prefill_phase', 'generation_phase']
+        block_pattern = re.compile(r'^block_\d+$')
+        denoising_step_pattern = re.compile(r'^denoising_step_\d+$')
         
-        sections = [s[0] for s in sorted_sections]
-        times = [s[1].get('total_ms', 0) for s in sorted_sections]
-  
-        # Create figure with subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        # 识别不同类型的阶段
+        top_level_data = {}  # 顶层阶段
+        block_data = {}  # block_X 阶段
+        denoising_step_data = {}  # denoising_step_X 阶段
+        multi_call_functions = {}  # 多次调用的函数 (call_count > 1)
+        other_sections = {}  # 其他单次调用的阶段
         
-        # Bar chart
-        y_pos = np.arange(len(sections))
-        ax1.barh(y_pos, times)
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(sections, fontsize=8)
-        ax1.invert_yaxis()
-        ax1.set_xlabel('Time (ms)')
-        ax1.set_title('Top Time-Consuming Sections')
-        ax1.grid(axis='x', alpha=0.3)
+        for name, stats in filtered_profile.items():
+            call_count = stats.get('call_count', 0)
+            total_ms = stats.get('total_ms', 0)
+            
+            if name in top_level_phases:
+                top_level_data[name] = stats
+            elif block_pattern.match(name):
+                block_data[name] = stats
+            elif denoising_step_pattern.match(name):
+                denoising_step_data[name] = stats
+            elif call_count > 1:
+                multi_call_functions[name] = stats
+            else:
+                other_sections[name] = stats
         
-        # Pie chart
-        ax2.pie(times, labels=sections, autopct='%1.1f%%', startangle=90)
-        ax2.set_title('Time Distribution')
+        # 计算顶层阶段的"其他时间"（不包含子阶段的时间）
+        # generation_phase 包含所有 block_X，block_X 包含 denoising_step_X
+        # prefill_phase 可能包含 prefill_llama_decode 等
+        
+        # 计算 generation_phase 的子阶段总时间
+        generation_phase_stats = top_level_data.get('generation_phase')
+        if generation_phase_stats:
+            # 计算所有 block 的总时间
+            blocks_total_time = sum(s.get('total_ms', 0) for s in block_data.values())
+            # generation_phase 的其他时间 = generation_phase 总时间 - 所有 block 时间
+            generation_other_time = max(0, generation_phase_stats.get('total_ms', 0) - blocks_total_time)
+        else:
+            generation_other_time = 0
+        
+        # 计算 prefill_phase 的子阶段总时间
+        prefill_phase_stats = top_level_data.get('prefill_phase')
+        prefill_sub_sections = {k: v for k, v in filtered_profile.items() 
+                               if k.startswith('prefill_') and k != 'prefill_phase'}
+        prefill_sub_total = sum(s.get('total_ms', 0) for s in prefill_sub_sections.values())
+        if prefill_phase_stats:
+            prefill_other_time = max(0, prefill_phase_stats.get('total_ms', 0) - prefill_sub_total)
+        else:
+            prefill_other_time = 0
+        
+        # 计算每个 block 的子阶段（denoising_step）总时间
+        # 需要将 denoising_step 按 block 分组（这需要从调用关系推断，这里简化处理）
+        # 由于 denoising_step 是在 block 内调用的，我们计算所有 denoising_step 的总时间
+        denoising_steps_total = sum(s.get('total_ms', 0) for s in denoising_step_data.values())
+        
+        # 构建饼图数据 - 确保不互相包含
+        pie_labels = []
+        pie_values = []
+        pie_colors = []
+        
+        # 1. Top-level phases other time (excluding sub-phases)
+        if generation_other_time > 1.0:
+            pie_labels.append('generation_phase (other)')
+            pie_values.append(generation_other_time)
+            pie_colors.append('#FF6B6B')
+        
+        if prefill_other_time > 1.0:
+            pie_labels.append('prefill_phase (other)')
+            pie_values.append(prefill_other_time)
+            pie_colors.append('#4ECDC4')
+        
+        # 2. All blocks total time (subtract denoising_step time to avoid duplication)
+        # Simplified: show block total time, but not denoising_step (they are included in blocks)
+        blocks_total = sum(s.get('total_ms', 0) for s in block_data.values())
+        blocks_net_time = max(0, blocks_total - denoising_steps_total)
+        if blocks_net_time > 1.0:
+            pie_labels.append('blocks (excl. denoising)')
+            pie_values.append(blocks_net_time)
+            pie_colors.append('#95E1D3')
+        
+        # 3. denoising_step total time
+        if denoising_steps_total > 1.0:
+            pie_labels.append('denoising_steps (total)')
+            pie_values.append(denoising_steps_total)
+            pie_colors.append('#F38181')
+        
+        # 4. Multi-call functions (show total time separately)
+        for name, stats in sorted(multi_call_functions.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True):
+            total_ms = stats.get('total_ms', 0)
+            call_count = int(stats.get('call_count', 0))
+            if total_ms > 1.0:
+                pie_labels.append(f'{name}\n({call_count} calls)')
+                pie_values.append(total_ms)
+                pie_colors.append('#AA96DA')
+        
+        # 5. Other single-call important phases
+        for name, stats in sorted(other_sections.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:5]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                pie_labels.append(name)
+                pie_values.append(total_ms)
+                pie_colors.append('#FCBAD3')
+        
+        # Calculate unclassified time
+        accounted_time = sum(pie_values)
+        unaccounted_time = max(0, total_wall_time - accounted_time)
+        if unaccounted_time > 1.0:
+            pie_labels.append('Other/Unclassified')
+            pie_values.append(unaccounted_time)
+            pie_colors.append('#C7C7C7')
+        
+        # Build bar chart data - categorized display
+        bar_categories = {
+            'Top-level Phases': [],
+            'Block Phases': [],
+            'Denoising Steps': [],
+            'Multi-call Functions': [],
+            'Other Phases': []
+        }
+        
+        # Top-level phases
+        if generation_other_time > 1.0:
+            bar_categories['Top-level Phases'].append(('generation_phase (other)', generation_other_time))
+        if prefill_other_time > 1.0:
+            bar_categories['Top-level Phases'].append(('prefill_phase (other)', prefill_other_time))
+        
+        # Block phases (show top 10)
+        for name, stats in sorted(block_data.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                bar_categories['Block Phases'].append((name, total_ms))
+        
+        # Denoising steps (show top 10)
+        for name, stats in sorted(denoising_step_data.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                call_count = int(stats.get('call_count', 0))
+                bar_categories['Denoising Steps'].append((f'{name} ({call_count} calls)', total_ms))
+        
+        # Multi-call functions
+        for name, stats in sorted(multi_call_functions.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            call_count = int(stats.get('call_count', 0))
+            if total_ms > 1.0:
+                bar_categories['Multi-call Functions'].append((f'{name} ({call_count} calls)', total_ms))
+        
+        # Other phases
+        for name, stats in sorted(other_sections.items(), 
+                                 key=lambda x: x[1].get('total_ms', 0), reverse=True)[:10]:
+            total_ms = stats.get('total_ms', 0)
+            if total_ms > 1.0:
+                bar_categories['Other Phases'].append((name, total_ms))
+        
+        # 创建图表
+        fig = plt.figure(figsize=(20, 10))
+        
+        # 饼图 - 左侧
+        ax1 = plt.subplot(2, 2, 1)
+        if pie_values:
+            # 只显示占比大于1%的项
+            significant_indices = [i for i, v in enumerate(pie_values) 
+                                 if v / sum(pie_values) * 100 > 1.0]
+            if significant_indices:
+                filtered_labels = [pie_labels[i] for i in significant_indices]
+                filtered_values = [pie_values[i] for i in significant_indices]
+                filtered_colors = [pie_colors[i] for i in significant_indices]
+                
+                wedges, texts, autotexts = ax1.pie(
+                    filtered_values, 
+                    labels=filtered_labels, 
+                    autopct='%1.1f%%', 
+                    startangle=90,
+                    colors=filtered_colors,
+                    textprops={'fontsize': 8}
+                )
+                # Adjust percentage text size
+                for autotext in autotexts:
+                    autotext.set_fontsize(7)
+            else:
+                ax1.text(0.5, 0.5, 'No significant data', ha='center', va='center', transform=ax1.transAxes)
+        ax1.set_title('Time Distribution (Non-overlapping)', fontsize=12, fontweight='bold')
+        
+        # Multi-call functions ratio - top right
+        ax2 = plt.subplot(2, 2, 2)
+        multi_call_total = sum(s.get('total_ms', 0) for s in multi_call_functions.values())
+        multi_call_percentage = (multi_call_total / total_wall_time * 100) if total_wall_time > 0 else 0
+        other_time = max(0, total_wall_time - multi_call_total)
+        other_percentage = 100 - multi_call_percentage
+        
+        if multi_call_total > 1.0 and other_time > 0:
+            ax2.pie(
+                [multi_call_total, other_time],
+                labels=[f'Multi-call Functions\n({multi_call_percentage:.1f}%)', 
+                       f'Other Time\n({other_percentage:.1f}%)'],
+                autopct='%1.1f%%',
+                startangle=90,
+                colors=['#AA96DA', '#E0E0E0'],
+                textprops={'fontsize': 9}
+            )
+        elif multi_call_total > 1.0:
+            # If multi-call functions take all time
+            ax2.pie(
+                [multi_call_total],
+                labels=[f'Multi-call Functions\n({multi_call_percentage:.1f}%)'],
+                autopct='%1.1f%%',
+                startangle=90,
+                colors=['#AA96DA'],
+                textprops={'fontsize': 9}
+            )
+        else:
+            ax2.text(0.5, 0.5, 'No multi-call function data', ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('Multi-call Functions Time Ratio', fontsize=12, fontweight='bold')
+        
+        # Bar chart - bottom (categorized display)
+        ax3 = plt.subplot(2, 1, 2)
+        
+        all_bar_labels = []
+        all_bar_values = []
+        category_colors = {
+            'Top-level Phases': '#FF6B6B',
+            'Block Phases': '#95E1D3',
+            'Denoising Steps': '#F38181',
+            'Multi-call Functions': '#AA96DA',
+            'Other Phases': '#FCBAD3'
+        }
+        bar_colors_list = []
+        
+        y_offset = 0
+        for category, items in bar_categories.items():
+            if items:
+                for label, value in items:
+                    all_bar_labels.append(label)
+                    all_bar_values.append(value)
+                    bar_colors_list.append(category_colors[category])
+                y_offset += len(items) + 1  # Add separator
+        
+        if all_bar_values:
+            y_pos = np.arange(len(all_bar_labels))
+            bars = ax3.barh(y_pos, all_bar_values, color=bar_colors_list)
+            ax3.set_yticks(y_pos)
+            ax3.set_yticklabels(all_bar_labels, fontsize=7)
+            ax3.invert_yaxis()
+            ax3.set_xlabel('Time (ms)', fontsize=10)
+            ax3.set_title('Phase Time Breakdown (Categorized)', fontsize=12, fontweight='bold')
+            ax3.grid(axis='x', alpha=0.3)
+            
+            # Add value labels
+            for i, (bar, value) in enumerate(zip(bars, all_bar_values)):
+                width = bar.get_width()
+                ax3.text(width, bar.get_y() + bar.get_height()/2, 
+                        f'{value:.1f}ms', 
+                        ha='left', va='center', fontsize=6)
         
         plt.tight_layout()
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
@@ -365,6 +757,7 @@ class DiffusionProfiler:
         
         print(f"\nResults exported to {output_file}")
         
+        archive_subdir = None
         if archive:
             archive_dir = 'profile_runs'
             if not os.path.exists(archive_dir):
@@ -386,12 +779,16 @@ class DiffusionProfiler:
             
             print(f"Results archived to {archive_subdir}")
 
+        return archive_subdir
+
 
 def main():
     """示例测试"""
     # 配置
     MODEL_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
     TOKENIZER_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
+    SUMMARY_LOG = "profile_summary.txt"
+    RUNS_PER_CONFIG = int(os.environ.get("TEST_PROFILING_RUNS_PER_CONFIG", "3"))
     
     # 加载tokenizer获取真实的prompt
     from transformers import AutoTokenizer
@@ -408,53 +805,143 @@ def main():
     
     # 定义测试配置（仅包含质量过关的配置）
     test_configs = [
-        # Baseline配置（用于对比）
+        # CPU 基线（关闭 GPU 相关环境）
         {
-            'name': 'Baseline (block=8, steps=8)',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic'
-        },
-        {
-            'name': 'Baseline (block=4, steps=4)',
-            'gen_length': 128,
-            'block_length': 4,
-            'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic'
-        },
-        {
-            'name': 'Baseline (block=8, steps=4)',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic'
-        },
-        # GPU加速的Baseline
-        {
-            'name': 'Baseline (block=8, steps=8) + GPU',
-            'gen_length': 128,
-            'block_length': 8,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
-        },
-        {
-            'name': 'Baseline (block=4, steps=4) + GPU',
+            'name': 'CPU (block=4, steps=4)',
             'gen_length': 128,
             'block_length': 4,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
         },
         {
-            'name': 'Baseline (block=8, steps=4) + GPU',
+            'name': 'CPU (block=8, steps=8)',
             'gen_length': 128,
             'block_length': 8,
+            'denoising_steps': 8,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'CPU (block=16, steps=16)',
+            'gen_length': 128,
+            'block_length': 16,
+            'denoising_steps': 16,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'CPU (block=32, steps=32)',
+            'gen_length': 128,
+            'block_length': 32,
+            'denoising_steps': 32,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'CPU (block=64, steps=64)',
+            'gen_length': 128,
+            'block_length': 64,
+            'denoising_steps': 64,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': None,
+                'LLAMA_ENABLE_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': None,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        # GPU 采样（GPU-only + device logits + async）
+        {
+            'name': 'GPU (block=4, steps=4)',
+            'gen_length': 128,
+            'block_length': 4,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True
-        }
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=8, steps=8)',
+            'gen_length': 128,
+            'block_length': 8,
+            'denoising_steps': 8,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=16, steps=16)',
+            'gen_length': 128,
+            'block_length': 16,
+            'denoising_steps': 16,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=32, steps=32)',
+            'gen_length': 128,
+            'block_length': 32,
+            'denoising_steps': 32,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
+        {
+            'name': 'GPU (block=64, steps=64)',
+            'gen_length': 128,
+            'block_length': 64,
+            'denoising_steps': 64,
+            'remasking_strategy': 'low_confidence_dynamic',
+            'use_gpu_sampler': True,
+            'env_overrides': {
+                'DIFFUSION_GPU_ONLY': '1',
+                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
+                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+            },
+        },
     ]
     
     # 运行对比测试 (自动warmup + 每个配置运行3次取平均)
@@ -463,7 +950,8 @@ def main():
         MASK_TOKEN_ID, 
         test_configs,
         warmup_before_test=True,
-        runs_per_config=3  # 每个配置运行3次
+        runs_per_config=RUNS_PER_CONFIG,  # 默认3次，可通过 TEST_PROFILING_RUNS_PER_CONFIG 覆盖
+        summary_log_path=SUMMARY_LOG
     )
     
     # 详细分析每个结果
@@ -475,7 +963,11 @@ def main():
         profiler.visualize_profile(result, f'profile_{i}.png')
     
     # 导出结果
-    profiler.export_results(results)
+    archive_subdir = profiler.export_results(results)
+
+    # 如果有归档目录，则将 summary 日志也拷贝进去
+    if archive_subdir and os.path.exists(SUMMARY_LOG):
+        shutil.copy2(SUMMARY_LOG, os.path.join(archive_subdir, SUMMARY_LOG))
     
     # 对比总结
     print(f"\n{'='*80}")

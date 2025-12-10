@@ -296,6 +296,64 @@ test_configs = [
 
 ---
 
+## 9. 2025-12-06 更新：GPU logits 与采样融合快路径
+
+### 9.1 主要改动
+- **host+device 双缓冲**：`LLAMA_ENABLE_DEVICE_LOGITS=1` 时，llama.cpp 同步维护 host/device logits，并在 GPU 侧完成 reorder（`llama_gpu_swap_rows`），调用端可直接消费 device logits，避免 H2D。
+- **GPU 采样 fast path 融合**：`fused_softmax_sample_kernel` 将 softmax+采样合并为单核，仅回传 token+confidence，减少 kernel/sync；top-k/p 或 entropy 需求时回退到排序/CPU 后处理路径。
+- **Telemetry 细化**：新增 fast path 计数（`telemetry_gpu_fast_path`、`telemetry_gpu_device_fast_path`），保留分阶段计时；device 路径命中/回退已记录。
+
+### 9.2 性能回归（单卡，b=s=4/8，steps=4/8，默认温度）
+- 开关 **ON**（device logits）：b8,s8 ≈ **185.6 tok/s**，b4,s4 ≈ **165.4 tok/s**，b8,s4 ≈ **275.5 tok/s**（归档：`profile_runs/20251206_052450/`）
+- 开关 **OFF**（host logits）：b8,s8 ≈ **156.5 tok/s**，b4,s4 ≈ **154.2 tok/s**，b8,s4 ≈ **281.4 tok/s**（归档：`profile_runs/20251206_052545/`）
+
+### 9.3 观察
+- device logits 打开时 b8,s8 提升显著（fast path 命中且无 H2D）；b8,s4 在 OFF 略高，表明小批短步长仍受 D2H/同步影响。
+- fast path 触发条件：`top_k<=0 && top_p>=1 && !entropy`，否则走回退；device logits 路径只支持 fast path，top-k/p/entropy 仍回退到 host logits。
+- 待办：质量抽检并完善文档（开关/回退条件、fast path 命中率、文本质量对比）。
+
+### 9.4 质量抽检（2025-12-06，示例提示词）
+- 提示词：参考 `example_usage.py` 中 “机器人第一次发现音乐” 短故事场景；参数：`gen_length=2048, block_length=4, denoising_steps=4, top_k=0, top_p=1, temperature=1.0, remasking=low_confidence_dynamic, use_gpu_sampler=True`。
+- 输出：
+  - ON（`LLAMA_ENABLE_DEVICE_LOGITS=1`）：见 `profile_runs/quality_on.txt`，连贯完结，无多余 end token。
+  - OFF（未设开关）：见 `profile_runs/quality_off.txt`，故事连贯，但末尾出现多余 `<|endoftext|>` 重复标记。
+- 结论：两侧语义与流畅度一致，开关 ON 无质量回退，且末尾控制更干净。
+
+### 9.5 开关与回退说明（doc-fallback / doc-device-logits / doc-dual）
+- 开关：`LLAMA_ENABLE_DEVICE_LOGITS=1` 时启用 host+device 双缓冲与 GPU reorder（`llama_gpu_swap_rows`）；未设置时保持 host logits。
+- 触发 fast path（device/host 同规则）：`top_k <= 0` 且 `top_p >= 1` 且无 entropy 需求；此时 softmax+采样单核融合，仅回传 token+confidence。
+- 回退条件：
+  - 需要 top-k/p 或 entropy -> 排序+CPU 后处理，仍支持 GPU softmax。
+  - device logits 不可用或 stride 不等于 vocab -> 回退 host logits。
+  - device 路径仅支持 fast path，若需排序/entropy 则直接回退 host。
+- 纯 GPU 开关：`DIFFUSION_GPU_ONLY=1` 时要求 device logits 可用且无 top-k/p/entropy，跳过 host logits 拷贝/compact，CPU 仅接收 token/conf。
+- 双缓冲行为：llama.cpp 同时保留 host/device logits；存在 `output_swaps` 时在 GPU 侧重排并保持 host 拷贝，调用端可选择 device 或 host。
+- 遥测字段：
+  - `telemetry_gpu_fast_path`（host fast）、`telemetry_gpu_device_fast_path`（device fast）
+  - `telemetry_gpu_path_device_hit/miss/need_entropy`、分阶段耗时 `telemetry_gpu_stage_*`、`telemetry_gpu_logit_pack`
+- 结果归档：ON `profile_runs/20251206_052450/`，OFF `profile_runs/20251206_052545/`；质量输出 `profile_runs/quality_on.txt` / `quality_off.txt`。
+
+---
+
+## 10. 2025-12-07 更新：GPU logits 稳定性 & 日志等级体系
+
+### 10.1 主要修复与防护
+- **词表上限与尾部 masking**：`DiffusionConfig::n_vocab_limit` 默认 151670，CPU/GPU 路径均对越界 logits 置 `-inf`，消除 OOV/解码 None 问题。
+- **GPU-only 强制防护**：`DIFFUSION_GPU_ONLY=1` 时若 GPU sampler 不可用直接报错，防止回退访问 host logits。
+- **设备 logits 稳定性**：比较 host/device 时改为 D2H 拷贝再比对，避免直接解引用 device 指针导致 segfault；`test_profiling.py` GPU-only 已稳定通过（见 `profile_runs/20251207_062957/`）。
+- **同步与错误探针**：在 D2D/softmax/采样/D2H 后强制 `cudaDeviceSynchronize` + `cudaGetLastError`，记录到日志便于定位故障。
+
+### 10.2 日志等级 API（F/E/W/I/D/V）
+- 新增 `llama_diffusion/diffusion_logging.h`，提供 `DIFF_LOGF/E/W/I/D/V`，编译期通过 `-DDIFFUSION_LOG_LEVEL=DIFF_LOG_LEVEL_WARN` 等开关裁剪输出，低于阈值的日志不产生格式化开销。
+- 默认等级：INFO；调试建议：`DIFFUSION_LOG_LEVEL=DIFF_LOG_LEVEL_DEBUG`；生产建议：WARN 或 INFO。WARN 及以上自动 `fflush(stderr)`，确保关键信息落盘。
+
+### 10.3 使用与建议
+- 开启设备 logits：`LLAMA_ENABLE_DEVICE_LOGITS=1`；纯 GPU 路径：同时设置 `DIFFUSION_GPU_ONLY=1`（要求无 top-k/p/entropy）。
+- 关闭冗余日志：编译或运行时降低 `DIFFUSION_LOG_LEVEL`；仅需错误级别即可最小化开销。
+- 归档：最新稳定 GPU-only 运行与对比见 `profile_runs/20251207_062957/`；示例生成与流式回归见 `profile_runs/example_usage_gpu_only_run3.log`、`profile_runs/example_usage_stream_gpu_only_run3.log`。
+
+---
+
 ## 附录：测试结果存档
 
 所有 profiling 结果保存在 `profile_runs/` 目录：

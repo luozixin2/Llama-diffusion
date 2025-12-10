@@ -10,11 +10,22 @@ namespace diffusion {
 
 struct GpuSamplerStats {
     double stage_prepare_ms = 0.0;
+    double stage_prepare_copy_ms = 0.0;
+    double stage_prepare_temp_ms = 0.0;
+    double stage_prepare_mask_ms = 0.0;
+    double stage_prepare_rng_ms = 0.0;
     double stage_softmax_ms = 0.0;
     double stage_sort_ms = 0.0;
     double stage_sample_ms = 0.0;
     double stage_d2h_ms = 0.0;
     double stage_cpu_post_ms = 0.0;
+    double stage_event_wait_ms = 0.0;
+    double stage_total_ms = 0.0;        // Sum of stages above
+    double stage_whole_gpu_ms = 0.0;    // CUDA event elapsed over entire device path
+    double stage_whole_wall_ms = 0.0;   // CPU wall time over entire device path
+    int n_vocab_limit = 0;              // effective vocab cap for masking tail tokens
+    bool fast_path = false;
+    bool device_logits = false;
 };
 
 #if defined(DIFFUSION_ENABLE_CUDA)
@@ -50,6 +61,32 @@ public:
         Stats* stats
     );
 
+    // Scatter pointer version - directly transfers from scattered logits pointers
+    // Avoids CPU-side concatenation, uses async H2D with multiple streams
+    bool sample_from_scatter_ptrs(
+        const std::vector<float*>& logits_ptrs,  // Array of pointers to each position's logits
+        int vocab_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        Stats* stats
+    );
+
+    // Device pointer version - when logits already on GPU (D2D copy)
+    bool sample_from_device_ptr(
+        const float* device_logits_ptr,
+        size_t logits_size,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        Stats* stats,
+        bool force_non_fused = false
+    );
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -75,6 +112,16 @@ public:
     bool sample_from_ptr(
         const float*,
         size_t,
+        RemaskingStrategy,
+        std::mt19937&,
+        std::vector<llama_token>&,
+        std::vector<float>&,
+        std::vector<std::vector<float>>*,
+        Stats*
+    ) { return false; }
+    bool sample_from_scatter_ptrs(
+        const std::vector<float*>&,
+        int,
         RemaskingStrategy,
         std::mt19937&,
         std::vector<llama_token>&,

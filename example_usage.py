@@ -10,6 +10,9 @@ def main():
     tokenizer_path = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
     # 加载 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    # HuggingFace的 vocab_size 仅包含基础词表，不含部分 special tokens；用 max_id+1 作为有效上限
+    vocab_ids = list(tokenizer.get_vocab().values())
+    effective_vocab_limit = max(vocab_ids) + 1
     
     # 获取 mask token ID
     mask_token_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
@@ -45,8 +48,8 @@ def main():
         prompt=prompt_tokens,
         mask_token_id=mask_token_id,
         gen_length=2048,
-        block_length=1,
-        denoising_steps=1,
+        block_length=4,
+        denoising_steps=4,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
@@ -75,6 +78,19 @@ def main():
             except:
                 continue
         generated_text = "".join(decoded_parts)
+
+    # 调试：检查 token 合法性
+    # 使用 effective_vocab_limit 校验，避免把合法的高位 special token 误判为越界
+    invalid_tokens = [
+        t for t in generated_tokens
+        if not isinstance(t, int) or t < 0 or t >= effective_vocab_limit
+    ]
+    if invalid_tokens:
+        print(f"[debug] invalid token ids found (count={len(invalid_tokens)}), first 20: {invalid_tokens[:20]}")
+    else:
+        print("[debug] all generated token ids are within vocab range.")
+    # 显示少量 token 预览
+    print(f"[debug] first 50 generated token ids: {generated_tokens[:50]}")
     
     # 清理 mask token
     if '<|MASK|>' in generated_text:

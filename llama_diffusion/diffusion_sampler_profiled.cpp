@@ -117,6 +117,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
     for (int step = 0; step < config_.denoising_steps; step++) {
         std::string step_section = "denoising_step_" + std::to_string(step);
         PROFILE_SECTION(step_section.c_str());
+        fprintf(stderr, "[DiffusionSamplerProfiled][debug] block=%d step=%d enable_gpu_sampler=%d\n",
+                block_idx, step, config_.enable_gpu_sampler ? 1 : 0);
         
         // Check for masks
         {
@@ -150,9 +152,12 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                 batch.pos[i] = static_cast<llama_pos>(block_start + i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
+                // 为保证 device logits 路径一致性，整块请求 logits
                 batch.logits[i] = true;
             }
             batch.n_tokens = config_.block_length;
+            // 记录当前请求的 logits 数，供 device logits 路径校验
+            last_logits_count_ = config_.block_length;
         }
         
         {

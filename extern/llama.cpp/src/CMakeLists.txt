@@ -14,6 +14,7 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-logits-kernels.cu
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
@@ -131,6 +132,10 @@ add_library(llama
             models/xverse.cpp
             models/graph-context-mamba.cpp
             )
+
+if (GGML_CUDA)
+    set_source_files_properties(llama-logits-kernels.cu PROPERTIES LANGUAGE CUDA)
+endif()
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)

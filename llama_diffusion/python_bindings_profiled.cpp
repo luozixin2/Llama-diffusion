@@ -72,7 +72,7 @@ public:
         ctx_params.n_ctx = n_ctx_;
         ctx_params.n_seq_max = 2;
         ctx_params.block_size = block_length;
-        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; // Disable flash attention
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
         
         llama_context* ctx = llama_init_from_model(model_, ctx_params);
         if (!ctx) {
@@ -96,6 +96,19 @@ public:
             }
             py_profile[py::str(outer.first)] = inner_dict;
         }
+        // Append custom metrics (record_custom)
+        for (const auto& kv : custom_metrics) {
+            const auto& name = kv.first;
+            const auto& values = kv.second;
+            double total = 0.0;
+            for (double v : values) total += v;
+            double avg = values.empty() ? 0.0 : total / values.size();
+            py::dict stats;
+            stats["total_ms"] = total;
+            stats["avg_ms"] = avg;
+            stats["call_count"] = static_cast<int>(values.size());
+            py_profile[py::str(name)] = stats;
+        }
 
         const auto& telemetry = sampler.get_sampler_metrics();
         auto add_metric = [&](const char* key, double total, int count) {
@@ -103,6 +116,11 @@ public:
             stats["total_ms"] = total;
             stats["avg_ms"] = count > 0 ? total / count : 0.0;
             stats["call_count"] = count;
+            py_profile[py::str(key)] = stats;
+        };
+        auto add_count = [&](const char* key, int count) {
+            py::dict stats;
+            stats["count"] = count;
             py_profile[py::str(key)] = stats;
         };
         add_metric("telemetry_gpu_logit_pack", telemetry.gpu_logit_pack_ms, telemetry.gpu_logit_pack_calls);
@@ -113,10 +131,38 @@ public:
         add_metric("telemetry_gpu_stage_sample", telemetry.gpu_stage_sample_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_d2h", telemetry.gpu_stage_d2h_ms, telemetry.gpu_success);
         add_metric("telemetry_gpu_stage_cpu_post", telemetry.gpu_stage_cpu_post_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_event_wait", telemetry.gpu_stage_event_wait_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_prepare_copy", telemetry.gpu_prepare_copy_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_prepare_temp", telemetry.gpu_prepare_temp_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_prepare_mask", telemetry.gpu_prepare_mask_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_prepare_rng", telemetry.gpu_prepare_rng_ms, telemetry.gpu_success);
+        add_metric("telemetry_gpu_gap", telemetry.gpu_gap_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_total", telemetry.gpu_total_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead", telemetry.gpu_overhead_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead_get_device_logits", telemetry.gpu_overhead_get_device_logits_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead_get_output_ids", telemetry.gpu_overhead_get_output_ids_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead_debug_compare", telemetry.gpu_overhead_debug_compare_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead_host_pre", telemetry.gpu_overhead_host_pre_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead_host_after_output", telemetry.gpu_overhead_host_after_output_ms, telemetry.gpu_success + telemetry.gpu_fail);
+        add_metric("telemetry_gpu_overhead_host_post", telemetry.gpu_overhead_host_post_ms, telemetry.gpu_success + telemetry.gpu_fail);
         add_metric("telemetry_cpu_sampling", telemetry.cpu_sampling_ms, telemetry.cpu_sampling_calls);
         add_metric("telemetry_cpu_loop", telemetry.cpu_loop_ms, telemetry.cpu_loop_calls);
-        add_metric("telemetry_gpu_success", static_cast<double>(telemetry.gpu_success), telemetry.gpu_success);
-        add_metric("telemetry_gpu_fail", static_cast<double>(telemetry.gpu_fail), telemetry.gpu_fail);
+        add_count("telemetry_gpu_success", telemetry.gpu_success);
+        add_count("telemetry_gpu_fail", telemetry.gpu_fail);
+        add_count("telemetry_gpu_path_device_hit", telemetry.gpu_path_device_hit);
+        add_count("telemetry_gpu_path_device_miss", telemetry.gpu_path_device_miss);
+        add_count("telemetry_gpu_path_need_entropy", telemetry.gpu_path_need_entropy);
+        add_count("telemetry_gpu_fast_path", telemetry.gpu_fast_path);
+        add_count("telemetry_gpu_device_fast_path", telemetry.gpu_device_fast_path);
+        add_count("telemetry_gpu_fallback_topk", telemetry.gpu_fallback_topk);
+        add_count("telemetry_gpu_fallback_topp", telemetry.gpu_fallback_topp);
+        add_count("telemetry_gpu_fallback_entropy", telemetry.gpu_fallback_entropy);
+        add_count("telemetry_gpu_fallback_stride", telemetry.gpu_fallback_stride);
+        add_count("telemetry_gpu_fallback_stride_mismatch", telemetry.gpu_fallback_stride_mismatch);
+        add_count("telemetry_gpu_fallback_partial_logits", telemetry.gpu_fallback_partial_logits);
+        add_count("telemetry_gpu_fallback_compact_fail", telemetry.gpu_fallback_compact_fail);
+        add_count("telemetry_gpu_fallback_device_unavail", telemetry.gpu_fallback_device_unavail);
+        add_count("telemetry_gpu_sampler_unavailable", telemetry.gpu_sampler_unavailable);
         
         std::vector<int> int_result(result.begin(), result.end());
         return std::make_pair(int_result, py_profile);

@@ -60,7 +60,9 @@ struct llama_context {
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
+    const int32_t * get_logits_output_ids(int * out_count);
     float * get_logits_ith(int32_t i);
+    const float * get_logits_device(int64_t * stride_tokens) const;
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -186,6 +188,12 @@ private:
     // output
     //
 
+    // Device logits (CUDA-only, gated; see enable_device_logits/logits_on_device)
+    bool enable_device_logits = false;
+    bool logits_on_device = false;
+    const float * logits_device = nullptr;
+    int64_t logits_device_stride = 0;
+
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
     uint32_t output_reserve(int32_t n_outputs);
@@ -290,6 +298,8 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    // device buffer for logits (optional, CUDA-only)
+    ggml_backend_buffer_ptr buf_output_device;
 
     bool has_evaluated_once = false;
 

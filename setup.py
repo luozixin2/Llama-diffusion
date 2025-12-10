@@ -25,12 +25,19 @@ class CMakeBuild(build_ext):
         # 【关键修改 1】让 CMake 从项目的根目录开始配置
         cmake_sourcedir = os.path.abspath(os.path.dirname(__file__)) # 项目根目录
         
+        # 使用本地 cmake（如果存在）
+        cmake_cmd = "/home/lzx/.local/cmake/bin/cmake"
+        if not os.path.exists(cmake_cmd):
+            cmake_cmd = "cmake"
+        
         cmake_args = [
-            "cmake", cmake_sourcedir, # 指向顶层 CMakeLists.txt
+            cmake_cmd, cmake_sourcedir, # 指向顶层 CMakeLists.txt
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             "-DBUILD_SHARED_LIBS=OFF", # 我们编译的是静态库，但pybind11模块是共享库
             f"-DCMAKE_BUILD_TYPE={self.build_type}", # 使用 setuptools 的 build_type (Debug/Release)
             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+            "-DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;89;90",
+            "-DGGML_CUDA=ON",
             # 【可选】如果你想让 CMake 将所有输出都放到 build_dir 的根目录，可以加上这个
             # 但通常 pybind11_add_module 会处理好输出路径
             # f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_dir}", 
@@ -45,7 +52,10 @@ class CMakeBuild(build_ext):
         
         # 2) 构建 CMake 项目
         # 【关键修改 2】指定要构建的特定目标
-        build_args = ["cmake", "--build", ".", "--config", self.build_type]
+        cmake_cmd = "/home/lzx/.local/cmake/bin/cmake"
+        if not os.path.exists(cmake_cmd):
+            cmake_cmd = "cmake"
+        build_args = [cmake_cmd, "--build", ".", "--config", self.build_type]
         
         # 根据扩展名，选择对应的 CMake 目标
         # 这些目标名称来自你的 llama_diffusion/CMakeLists.txt 中的 pybind11_add_module
