@@ -72,7 +72,8 @@ public:
         ctx_params.n_ctx = n_ctx_;
         ctx_params.n_seq_max = 2;
         ctx_params.block_size = block_length;
-        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
+        ctx_params.flash_attn_type = block_length > 0 ? LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL
+                                                     : LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
         
         llama_context* ctx = llama_init_from_model(model_, ctx_params);
         if (!ctx) {

@@ -81,7 +81,8 @@ public:
         ctx_params.n_batch = 8192; // Increase batch size to support long prompts (max prompt ~2077 tokens)
         ctx_params.n_seq_max = 2; // Allow multiple sequences for streaming
         ctx_params.block_size = block_length; // Set block_size from config
-        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
+        ctx_params.flash_attn_type = block_length > 0 ? LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL
+                                                     : LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
         
         llama_context* ctx = llama_init_from_model(model_, ctx_params);
         if (!ctx) {
@@ -153,7 +154,8 @@ public:
         ctx_params.n_batch = 8192; // Increase batch size to support long prompts (max prompt ~2077 tokens)
         ctx_params.n_seq_max = 2; // Allow multiple sequences for streaming
         ctx_params.block_size = block_length; // Set block_size from config
-        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
+        ctx_params.flash_attn_type = block_length > 0 ? LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL
+                                                     : LLAMA_FLASH_ATTN_TYPE_ENABLED; // Enable flash attention for better performance
         
         llama_context* ctx = llama_init_from_model(model_, ctx_params);
         if (!ctx) {

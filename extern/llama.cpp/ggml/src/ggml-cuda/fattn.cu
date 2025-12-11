@@ -208,6 +208,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
 
+    int32_t block_size = 0;
+    memcpy(&block_size, ((const int32_t *) KQV->op_params) + 4, sizeof(int32_t));
+    const bool block_causal = block_size > 0;
+
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
@@ -269,6 +273,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (mask && mask->ne[2] != 1) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (block_causal && !mask) {
         return BEST_FATTN_KERNEL_NONE;
     }
 

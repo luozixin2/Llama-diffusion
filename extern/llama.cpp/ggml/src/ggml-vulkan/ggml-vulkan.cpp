@@ -14132,7 +14132,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
 
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
             const float * params = (const float *)tensor->op_params;
-            tensor_clone = ggml_flash_attn_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], params[0], params[1], params[2]);
+            const uint32_t block_size = ((const uint32_t *) tensor->op_params)[4];
+            tensor_clone = ggml_flash_attn_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], params[0], params[1], params[2], block_size);
             if (src_clone[4]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
             }

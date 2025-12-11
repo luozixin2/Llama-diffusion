@@ -33,6 +33,8 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
             return "disabled";
         case LLAMA_FLASH_ATTN_TYPE_ENABLED:
             return "enabled";
+        case LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL:
+            return "block_causal";
     }
     GGML_ABORT("fatal error");
 }

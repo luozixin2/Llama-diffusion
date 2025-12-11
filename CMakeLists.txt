@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.18)
 # 设置 MSVC 运行时（Windows专用，Linux下忽略但保留无妨）
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-set(MY_CUDA_ROOT "/home/lzx/cuda-12.8")
+set(MY_CUDA_ROOT "/home/lzx/cuda-12.2")
 
 # 1. 告诉 CMake 哪里找 CUDA 工具包 (用于 find_package)
 set(CUDAToolkit_ROOT "${MY_CUDA_ROOT}" CACHE PATH "CUDA Toolkit Root" FORCE)

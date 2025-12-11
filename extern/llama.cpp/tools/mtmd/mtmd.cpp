@@ -96,6 +96,7 @@ static clip_flash_attn_type mtmd_get_clip_flash_attn_type(enum llama_flash_attn_
         case LLAMA_FLASH_ATTN_TYPE_AUTO:     return CLIP_FLASH_ATTN_TYPE_AUTO;
         case LLAMA_FLASH_ATTN_TYPE_DISABLED: return CLIP_FLASH_ATTN_TYPE_DISABLED;
         case LLAMA_FLASH_ATTN_TYPE_ENABLED:  return CLIP_FLASH_ATTN_TYPE_ENABLED;
+        case LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL: return CLIP_FLASH_ATTN_TYPE_ENABLED;
     }
     return CLIP_FLASH_ATTN_TYPE_AUTO;
 }

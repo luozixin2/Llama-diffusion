@@ -5073,7 +5073,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_tensor  * mask,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        uint32_t              block_size) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
@@ -5098,8 +5099,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    float params[] = { scale, max_bias, logit_softcap };
+    float params[] = { scale, max_bias, logit_softcap, 0.0f, 0.0f };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 4, (int32_t) block_size);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;

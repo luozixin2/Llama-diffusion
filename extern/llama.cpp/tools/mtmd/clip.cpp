@@ -2326,7 +2326,7 @@ private:
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
 
-            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f, 0);
             ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
 
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

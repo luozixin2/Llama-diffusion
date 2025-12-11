@@ -317,7 +317,9 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
         // resolve automatic Flash Attention use
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ||
+            params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL) {
+            const bool want_block_causal_fa = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL;
             auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
             if (!gf) {
                 throw std::runtime_error("failed to split graph for Flash Attention check");
@@ -348,13 +350,16 @@ llama_context::llama_context(
             }
             if (fa_device_mismatch) {
                 cparams.flash_attn = false;
-                LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", __func__);
+                LLAMA_LOG_WARN("%s: Flash Attention was %s, set to disabled\n", __func__, want_block_causal_fa ? "block-causal" : "auto");
                 if (ggml_is_quantized(params.type_v)) {
                     throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
                 }
             } else {
                 cparams.flash_attn = true;
-                LLAMA_LOG_INFO("%s: Flash Attention was auto, set to enabled\n", __func__);
+                LLAMA_LOG_INFO("%s: Flash Attention was %s, set to %s\n",
+                    __func__,
+                    want_block_causal_fa ? "block-causal" : "auto",
+                    want_block_causal_fa ? "block-causal" : "enabled");
             }
         }
 
@@ -2479,12 +2484,27 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL && params.block_size == 0) {
+        LLAMA_LOG_WARN("%s: block-causal flash_attn requested but block_size is 0 - falling back to enabled\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL) {
+        auto * dev_gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev_gpu) {
+            LLAMA_LOG_WARN("%s: block-causal flash_attn requires a GPU backend - disabling flash_attn\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
+    const bool wants_flash = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    if (wants_flash && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         if (model->hparams.n_embd_head_k % blck_size != 0) {
             LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
@@ -2493,7 +2513,7 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
+    if (wants_flash && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         if (model->hparams.n_embd_head_v % blck_size != 0) {
             LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_k=%u\n",

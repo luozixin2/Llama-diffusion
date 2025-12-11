@@ -30,13 +30,20 @@ class CMakeBuild(build_ext):
         if not os.path.exists(cmake_cmd):
             cmake_cmd = "cmake"
         
+        py_exe = sys.executable
+        py_root = sys.prefix
         cmake_args = [
             cmake_cmd, cmake_sourcedir, # 指向顶层 CMakeLists.txt
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DPYTHON_EXECUTABLE={py_exe}",
+            # 部分工具链只认 Python3_EXECUTABLE，这里同步写入
+            f"-DPython3_EXECUTABLE={py_exe}",
+            f"-DPython3_ROOT_DIR={py_root}",
+            "-DPython3_FIND_VIRTUALENV=ONLY",
+            # 强制使用给定解释器，不从系统路径重新搜索
+            "-DPython3_FIND_STRATEGY=LOCATION",
             "-DBUILD_SHARED_LIBS=OFF", # 我们编译的是静态库，但pybind11模块是共享库
             f"-DCMAKE_BUILD_TYPE={self.build_type}", # 使用 setuptools 的 build_type (Debug/Release)
             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-            "-DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;89;90",
             "-DGGML_CUDA=ON",
             # 【可选】如果你想让 CMake 将所有输出都放到 build_dir 的根目录，可以加上这个
             # 但通常 pybind11_add_module 会处理好输出路径

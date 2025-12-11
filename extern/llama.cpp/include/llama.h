@@ -184,6 +184,7 @@ extern "C" {
         LLAMA_FLASH_ATTN_TYPE_AUTO     = -1,
         LLAMA_FLASH_ATTN_TYPE_DISABLED = 0,
         LLAMA_FLASH_ATTN_TYPE_ENABLED  = 1,
+        LLAMA_FLASH_ATTN_TYPE_BLOCK_CAUSAL = 2,
     };
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
