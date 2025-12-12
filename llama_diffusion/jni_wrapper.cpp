@@ -127,6 +127,7 @@ Java_com_yourpackage_LlamaDiffusion_nativeGenerate(
     diffusion::DiffusionConfig config;
     config.gen_length = genLength;
     config.block_length = blockLength;
+    config.micro_block_size = blockLength;
     config.denoising_steps = denoisingSteps;
     config.temperature = temperature;
     config.top_k = topK;
@@ -221,6 +222,7 @@ Java_com_yourpackage_LlamaDiffusion_nativeGenerateStream(
     diffusion::DiffusionConfig config;
     config.gen_length = genLength;
     config.block_length = blockLength;
+    config.micro_block_size = blockLength;
     config.denoising_steps = denoisingSteps;
     config.temperature = temperature;
     config.top_k = topK;

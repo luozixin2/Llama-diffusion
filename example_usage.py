@@ -43,12 +43,16 @@ def main():
     
     prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
     
+    block_length = 4
+    micro_block_size = block_length  # 可按需调整，需整除 block_length
+
     # 生成
     output_tokens = model.generate(
         prompt=prompt_tokens,
         mask_token_id=mask_token_id,
         gen_length=2048,
-        block_length=4,
+        block_length=block_length,
+        micro_block_size=micro_block_size,
         denoising_steps=4,
         temperature=1.0,
         top_k=0,

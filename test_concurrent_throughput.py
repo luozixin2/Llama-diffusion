@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 import time
 import threading
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import os
@@ -50,6 +50,7 @@ class ConcurrentThroughputTester:
                     mask_token_id=mask_token_id,
                     gen_length=64,
                     block_length=4,
+                    micro_block_size=4,
                     denoising_steps=4,
                     remasking_strategy='low_confidence_dynamic',
                     use_gpu_sampler=False
@@ -73,7 +74,8 @@ class ConcurrentThroughputTester:
         block_length: int,
         denoising_steps: int,
         use_gpu_sampler: bool,
-        task_id: int
+        task_id: int,
+        micro_block_size: int
     ) -> Dict:
         """单个生成任务"""
         start_time = time.time()
@@ -83,6 +85,7 @@ class ConcurrentThroughputTester:
                 mask_token_id=mask_token_id,
                 gen_length=gen_length,
                 block_length=block_length,
+                micro_block_size=micro_block_size,
                 denoising_steps=denoising_steps,
                 remasking_strategy='low_confidence_dynamic',
                 use_gpu_sampler=use_gpu_sampler
@@ -121,11 +124,13 @@ class ConcurrentThroughputTester:
         denoising_steps: int,
         use_gpu_sampler: bool,
         num_concurrent: int = 4,
-        num_rounds: int = 3
+        num_rounds: int = 3,
+        micro_block_size: Optional[int] = None
     ) -> Dict:
         """运行并发测试"""
         print(f"\n{'='*80}")
-        config_name = f"block={block_length}, steps={denoising_steps}, {'GPU' if use_gpu_sampler else 'CPU'}"
+        micro_block_size = micro_block_size or block_length
+        config_name = f"block={block_length}, micro={micro_block_size}, steps={denoising_steps}, {'GPU' if use_gpu_sampler else 'CPU'}"
         print(f"Running concurrent test: {config_name}")
         print(f"Concurrent tasks: {num_concurrent}, Rounds: {num_rounds}")
         print(f"{'='*80}")
@@ -154,7 +159,8 @@ class ConcurrentThroughputTester:
                         block_length,
                         denoising_steps,
                         use_gpu_sampler,
-                        i
+                        i,
+                        micro_block_size
                     )
                     futures.append(future)
                 
@@ -240,6 +246,7 @@ class ConcurrentThroughputTester:
             # CPU配置
             configs.append({
                 'block_length': block_steps,
+                'micro_block_size': block_steps,
                 'denoising_steps': block_steps,
                 'use_gpu_sampler': False,
                 'name': f'CPU (block={block_steps}, steps={block_steps})'
@@ -247,6 +254,7 @@ class ConcurrentThroughputTester:
             # GPU配置
             configs.append({
                 'block_length': block_steps,
+                'micro_block_size': block_steps,
                 'denoising_steps': block_steps,
                 'use_gpu_sampler': True,
                 'name': f'GPU (block={block_steps}, steps={block_steps})'
@@ -263,7 +271,8 @@ class ConcurrentThroughputTester:
                 denoising_steps=config['denoising_steps'],
                 use_gpu_sampler=config['use_gpu_sampler'],
                 num_concurrent=num_concurrent,
-                num_rounds=num_rounds
+                num_rounds=num_rounds,
+                micro_block_size=config.get('micro_block_size')
             )
             result['config']['name'] = config['name']
             results.append(result)

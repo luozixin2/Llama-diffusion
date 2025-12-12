@@ -51,6 +51,7 @@ class DiffusionProfiler:
                     mask_token_id=mask_token_id,
                     gen_length=gen_length,
                     block_length=block_length,
+                    micro_block_size=block_length,
                     denoising_steps=denoising_steps,
                     remasking_strategy='low_confidence_dynamic'
                 )
@@ -120,6 +121,7 @@ class DiffusionProfiler:
                 mask_token_id=mask_token_id,
                 gen_length=gen_length,
                 block_length=block_length,
+                micro_block_size=model_kwargs.pop('micro_block_size', block_length),
                 denoising_steps=denoising_steps,
                 **model_kwargs 
             )
@@ -155,6 +157,11 @@ class DiffusionProfiler:
         
         if os.environ.get("TEST_PROFILING_SKIP_WARMUP", "").lower() in ("1", "true", "yes"):
             warmup_before_test = False
+        
+        # 默认微块尺寸与块长一致，避免参数缺失
+        for cfg in configs:
+            if 'micro_block_size' not in cfg and 'block_length' in cfg:
+                cfg['micro_block_size'] = cfg['block_length']
         
         # 在所有测试前进行warmup
         if warmup_before_test:

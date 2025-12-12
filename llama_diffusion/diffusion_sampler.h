@@ -136,6 +136,15 @@ public:
         const std::vector<std::vector<float>>& token_probs
     );
 
+    // 针对微块/子集的 CPU 采样（active_positions 是 block 内的下标）
+    void sample_active_tokens_cpu(
+        int n_vocab,
+        const std::vector<int>& active_positions,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* entropy_probs_storage
+    );
+
     bool should_stop(const std::vector<llama_token>& tokens, size_t start_idx);
 
 protected:

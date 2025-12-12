@@ -16,6 +16,8 @@ enum class RemaskingStrategy {
 struct DiffusionConfig {
     int gen_length = 128;
     int block_length = 8;
+    // 微块大小，要求能整除 block_length；默认等于 block_length（退化为原实现）
+    int micro_block_size = 8;
     int denoising_steps = 8;
     float temperature = 1.0f;
     int top_k = 0;

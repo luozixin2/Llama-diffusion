@@ -42,7 +42,8 @@ public:
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
         const std::vector<int>& stop_token_ids = {},
-        bool use_gpu_sampler = false
+        bool use_gpu_sampler = false,
+        int micro_block_size = -1
     ) {
         // Convert prompt to llama_token
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
@@ -51,6 +52,7 @@ public:
         diffusion::DiffusionConfig config;
         config.gen_length = gen_length;
         config.block_length = block_length;
+        config.micro_block_size = (micro_block_size > 0) ? micro_block_size : block_length;
         config.denoising_steps = denoising_steps;
         config.temperature = temperature;
         config.top_k = top_k;
@@ -115,7 +117,8 @@ public:
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
         const std::vector<int>& stop_token_ids = {},
-        bool use_gpu_sampler = false
+        bool use_gpu_sampler = false,
+        int micro_block_size = -1
     ) {
         // Convert prompt to llama_token
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
@@ -124,6 +127,7 @@ public:
         diffusion::DiffusionConfig config;
         config.gen_length = gen_length;
         config.block_length = block_length;
+        config.micro_block_size = (micro_block_size > 0) ? micro_block_size : block_length;
         config.denoising_steps = denoising_steps;
         config.temperature = temperature;
         config.top_k = top_k;
@@ -226,6 +230,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
              py::arg("use_gpu_sampler") = false,
+             py::arg("micro_block_size") = -1,
              "Generate text using block diffusion\n\n"
              "Args:\n"
              "    prompt: List of token IDs for the prompt\n"
@@ -259,6 +264,7 @@ PYBIND11_MODULE(llama_diffusion, m) {
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
              py::arg("use_gpu_sampler") = false,
+             py::arg("micro_block_size") = -1,
              py::call_guard<py::gil_scoped_release>(),
              "Generate text using block diffusion with streaming output\n\n"
              "Args:\n"

@@ -7,13 +7,15 @@ from transformers import AutoTokenizer
 import sys
 
 class ChatSession:
-    def __init__(self, model, tokenizer, mask_token_id, eos_token_id, use_gpu_sampler=False):
+    def __init__(self, model, tokenizer, mask_token_id, eos_token_id, use_gpu_sampler=False, block_length=4, micro_block_size=None):
         self.model = model
         self.tokenizer = tokenizer
         self.mask_token_id = mask_token_id
         self.eos_token_id = eos_token_id
         self.messages = []
         self.use_gpu_sampler = use_gpu_sampler
+        self.block_length = block_length
+        self.micro_block_size = micro_block_size or block_length
         
     def stream_callback(self, token_ids: list[int]):
         """解码并打印新生成的 token"""
@@ -51,7 +53,8 @@ class ChatSession:
                 callback=callback_with_collection,
                 mask_token_id=self.mask_token_id,
                 gen_length=gen_length,
-                block_length=4,
+                block_length=self.block_length,
+                micro_block_size=self.micro_block_size,
                 denoising_steps=denoising_steps,
                 temperature=temperature,
                 top_p=top_p,
@@ -100,7 +103,7 @@ def print_help():
   /clear      - 清空对话历史
   /history    - 显示对话历史
   /settings   - 显示当前设置
-  /set <参数> <值> - 修改参数 (gen_length, temperature, top_p, denoising_steps)
+  /set <参数> <值> - 修改参数 (gen_length, temperature, top_p, denoising_steps, block_length, micro_block_size)
   /exit, /quit - 退出程序
   
 直接输入文本即可开始对话
@@ -117,7 +120,9 @@ def main():
         'gen_length': 512,
         'temperature': 0.8,
         'top_p': 0.95,
-        'denoising_steps': 4
+        'denoising_steps': 4,
+        'block_length': 4,
+        'micro_block_size': 4,
     }
     
     print("=" * 80)
@@ -145,7 +150,7 @@ def main():
         sys.exit(1)
     
     # 创建对话会话
-    session = ChatSession(model, tokenizer, mask_token_id, eos_token_id, use_gpu_sampler=True)
+    session = ChatSession(model, tokenizer, mask_token_id, eos_token_id, use_gpu_sampler=True, block_length=settings['block_length'], micro_block_size=settings['micro_block_size'])
     
     print("=" * 80)
     print("多轮对话系统已启动!")
@@ -199,8 +204,15 @@ def main():
                         continue
                     
                     try:
-                        value = float(cmd_parts[2]) if param != 'gen_length' and param != 'denoising_steps' else int(cmd_parts[2])
+                        if param in ('gen_length', 'denoising_steps', 'block_length', 'micro_block_size'):
+                            value = int(cmd_parts[2])
+                        else:
+                            value = float(cmd_parts[2])
                         settings[param] = value
+                        if param == 'block_length':
+                            session.block_length = value
+                        if param == 'micro_block_size':
+                            session.micro_block_size = value
                         print(f"已设置 {param} = {value}")
                     except ValueError:
                         print("无效的值")

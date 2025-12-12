@@ -72,6 +72,9 @@ def main():
     print("Streaming Output:")
     print("-" * 20)
     
+    block_length = 4
+    micro_block_size = block_length  # 可按需调整，需整除 block_length
+
     try:
         # 调用 generate_stream，它没有返回值
         model.generate_stream(
@@ -79,7 +82,8 @@ def main():
             callback=stream_callback, # 传入回调函数
             mask_token_id=mask_token_id,
             gen_length=512,
-            block_length=4,
+            block_length=block_length,
+            micro_block_size=micro_block_size,
             denoising_steps=4,  # 去噪步数
             temperature=0.95,  # 更高的temperature
             top_p=0.95,  # 标准top_p

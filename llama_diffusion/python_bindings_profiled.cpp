@@ -41,13 +41,15 @@ public:
         float confidence_threshold = 0.85f,
         float eb_threshold = 0.35f,
         const std::vector<int>& stop_token_ids = {},
-        bool use_gpu_sampler = false
+        bool use_gpu_sampler = false,
+        int micro_block_size = -1
     ) {
         std::vector<llama_token> llama_prompt(prompt.begin(), prompt.end());
         
         diffusion::DiffusionConfig config;
         config.gen_length = gen_length;
         config.block_length = block_length;
+        config.micro_block_size = (micro_block_size > 0) ? micro_block_size : block_length;
         config.denoising_steps = denoising_steps;
         config.temperature = temperature;
         config.top_k = top_k;
@@ -201,6 +203,7 @@ PYBIND11_MODULE(llama_diffusion_profiled, m) {
              py::arg("eb_threshold") = 0.35f,
              py::arg("stop_token_ids") = std::vector<int>(),
              py::arg("use_gpu_sampler") = false,
+             py::arg("micro_block_size") = -1,
              "Generate with detailed performance profiling\n\n"
              "Returns:\n"
              "    tuple: (generated_tokens, profile_dict)")

@@ -16,6 +16,11 @@ namespace diffusion {
 
 DiffusionSampler::DiffusionSampler(llama_context* ctx, llama_model* model, const DiffusionConfig& config)
     : ctx_(ctx), model_(model), config_(config) {
+    if (config_.micro_block_size <= 0 || config_.micro_block_size > config_.block_length ||
+        (config_.block_length % config_.micro_block_size) != 0) {
+        throw std::runtime_error("[DiffusionSampler] micro_block_size must be >0, <= block_length, and divide block_length.");
+    }
+
     std::random_device rd;
     rng_.seed(rd());
 
@@ -236,35 +241,136 @@ void DiffusionSampler::denoise_block(
     const std::vector<int>& num_transfer_tokens_per_step
 ) {
     const int block_start = block_idx * config_.block_length;
+    const int micro_size = config_.micro_block_size;
+    const int micro_count = config_.block_length / micro_size;
     llama_memory_t memory = llama_get_memory(ctx_);
-    // 记录剩余 mask 数，避免每步全量扫描
-    int remaining_masks = 0;
-        for (llama_token token : current_block) {
-            if (token == config_.mask_token_id) {
-            remaining_masks++;
+
+    // 当微块尺寸等于块长时，直接走整块去噪以保持与旧实现一致
+    if (micro_size == config_.block_length) {
+        int remaining_masks = 0;
+        for (llama_token t : current_block) {
+            if (t == config_.mask_token_id) remaining_masks++;
         }
+
+        llama_batch batch = llama_batch_init(config_.block_length, 0, 1);
+        for (int i = 0; i < config_.block_length; i++) {
+            batch.pos[i] = static_cast<llama_pos>(block_start + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+        }
+
+        for (int step = 0; step < config_.denoising_steps; step++) {
+            if (remaining_masks == 0) break;
+
+            llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
+            for (int i = 0; i < config_.block_length; i++) {
+                batch.token[i] = current_block[i];
+                batch.logits[i] = true;
+            }
+            batch.n_tokens = config_.block_length;
+            last_logits_count_ = config_.block_length;
+
+            if (llama_decode(ctx_, batch) != 0) {
+                llama_batch_free(batch);
+                assert(false && "llama_decode failed inside denoise_block (full path)!");
+                return;
+            }
+
+            const int n_vocab = get_vocab_size();
+            const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
+            std::vector<llama_token> sampled_tokens(config_.block_length);
+            std::vector<float> confidences(config_.block_length);
+            std::vector<std::vector<float>> all_probs;
+            std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &all_probs : nullptr;
+            sample_block_tokens(n_vocab, need_entropy_probs, sampled_tokens, confidences, entropy_ptr);
+
+            if (step >= static_cast<int>(num_transfer_tokens_per_step.size())) {
+                for (int i = 0; i < config_.block_length; i++) {
+                    if (current_block[i] == config_.mask_token_id) {
+                        current_block[i] = sampled_tokens[i];
+                        remaining_masks--;
+                    }
+                }
+                continue;
+            }
+
+            int num_transfer = num_transfer_tokens_per_step[step];
+            std::vector<bool> transfer_indices;
+            switch (config_.remasking_strategy) {
+                case RemaskingStrategy::SEQUENTIAL:
+                    transfer_indices = get_transfer_indices_sequential(current_block, confidences, num_transfer);
+                    break;
+                case RemaskingStrategy::LOW_CONFIDENCE_STATIC:
+                    transfer_indices = get_transfer_indices_low_conf_static(current_block, confidences, num_transfer);
+                    break;
+                case RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC:
+                    transfer_indices = get_transfer_indices_low_conf_dynamic(current_block, confidences, num_transfer);
+                    break;
+                case RemaskingStrategy::ENTROPY_BOUNDED:
+                    transfer_indices = get_transfer_indices_entropy_bounded(current_block, all_probs);
+                    break;
+                default:
+                    transfer_indices = get_transfer_indices_low_conf_static(current_block, confidences, num_transfer);
+                    break;
+            }
+
+            for (int i = 0; i < config_.block_length; i++) {
+                if (transfer_indices[i] && current_block[i] == config_.mask_token_id) {
+                    current_block[i] = sampled_tokens[i];
+                    remaining_masks--;
+                }
+            }
+        }
+
+        llama_batch_free(batch);
+        return;
     }
 
-    // 复用 batch，避免每步 init/free 带来的开销
-    llama_batch batch = llama_batch_init(config_.block_length, 0, 1);
-    for (int i = 0; i < config_.block_length; i++) {
-        batch.pos[i] = static_cast<llama_pos>(block_start + i);
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
+    // 统计每个微块的 mask 数，便于按微块清理/重算 KV
+    int remaining_masks = 0;
+    std::vector<int> masks_per_micro(micro_count, 0);
+    for (int i = 0; i < config_.block_length; ++i) {
+        if (current_block[i] == config_.mask_token_id) {
+            remaining_masks++;
+            masks_per_micro[i / micro_size]++;
+        }
     }
 
     for (int step = 0; step < config_.denoising_steps; step++) {
         if (remaining_masks == 0) {
-            break;  // 没有 mask 直接提前结束
+            break;
         }
 
-        // 每次 denoising 前清除当前 block 的 KV cache
+        // 找出仍有 mask 的微块及其位置
+        std::vector<int> active_positions;
+        std::vector<int> active_micros;
+        active_positions.reserve(remaining_masks);
+        for (int m = 0; m < micro_count; ++m) {
+            if (masks_per_micro[m] == 0) continue;
+            active_micros.push_back(m);
+            const int base = m * micro_size;
+            for (int j = 0; j < micro_size; ++j) {
+                const int pos = base + j;
+                if (current_block[pos] == config_.mask_token_id) {
+                    active_positions.push_back(pos);
+                }
+            }
+        }
+
+        if (active_positions.empty()) {
+            break;
+        }
+
+        // 清理整块 KV，确保无残留；解码仍用整块 logits
         llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
 
-        // 准备 batch：仅对仍为 mask 的位置请求 logits，减少不必要输出
-        // 当启用 device logits 时，为保证 GPU 路径一致性，对整块请求 logits
+        const int active_count = static_cast<int>(active_positions.size());
+        llama_batch batch = llama_batch_init(config_.block_length, 0, 1);
         for (int i = 0; i < config_.block_length; i++) {
             batch.token[i] = current_block[i];
+            batch.pos[i] = static_cast<llama_pos>(block_start + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
             batch.logits[i] = true;
         }
         batch.n_tokens = config_.block_length;
@@ -276,67 +382,152 @@ void DiffusionSampler::denoise_block(
             return;
         }
 
-        // Sample new tokens
-        std::vector<llama_token> sampled_tokens(config_.block_length);
-        std::vector<float> confidences(config_.block_length);
-        std::vector<std::vector<float>> all_probs;
-
+        // 采样：整块 logits 计算，只对活跃位置采样（优先 GPU）
         const int n_vocab = get_vocab_size();
         const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
-        std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &all_probs : nullptr;
-        sample_block_tokens(
-            n_vocab,
-            need_entropy_probs,
-            sampled_tokens,
-            confidences,
-            entropy_ptr
-        );
 
-        // Determine which tokens to transfer (unmask)
-        if (step >= static_cast<int>(num_transfer_tokens_per_step.size())) {
-            // Should not happen, but handle gracefully
-            for (int i = 0; i < config_.block_length; i++) {
-                if (current_block[i] == config_.mask_token_id) {
-                    current_block[i] = sampled_tokens[i];
-                    remaining_masks--;
+        std::vector<llama_token> sampled_tokens_active(active_count);
+        std::vector<float> confidences_active(active_count);
+        std::vector<std::vector<float>> entropy_active;
+        bool sampled = false;
+
+        // 分支1：活跃=整块，直接复用整块采样（内含 GPU 路径）
+        if (active_count == config_.block_length) {
+            std::vector<std::vector<float>>* entropy_ptr_full = need_entropy_probs ? &entropy_active : nullptr;
+            sample_block_tokens(
+                n_vocab,
+                need_entropy_probs,
+                sampled_tokens_active,  // 大小等于 block_length
+                confidences_active,
+                entropy_ptr_full
+            );
+            sampled = true;
+        } else {
+            // 分支2：活跃为子集，先尝试 GPU 采样整块后回收活跃位置；失败则回退 CPU 子集采样
+            if (use_gpu_sampler_) {
+                auto env_flag = [](const char* key) {
+                    const char* v = std::getenv(key);
+                    if (!v) return false;
+                    if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+                    return true;
+                };
+                const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
+                const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
+
+                std::vector<llama_token> sampled_block(config_.block_length);
+                std::vector<float> confidences_block(config_.block_length);
+                std::vector<std::vector<float>> entropy_block;
+                std::vector<std::vector<float>>* entropy_ptr_block = need_entropy_probs ? &entropy_block : nullptr;
+
+                diffusion::ProfilerTimer total_timer;
+                double gpu_elapsed_ms = 0.0;
+                if (try_sample_with_gpu(
+                        n_vocab,
+                        need_entropy_probs,
+                        sampled_block,
+                        confidences_block,
+                        entropy_ptr_block,
+                        &gpu_elapsed_ms)) {
+                    DiffusionProfiler::instance().record_custom("sampler_gpu_total_ms", gpu_elapsed_ms);
+                    double overhead = std::max(0.0, total_timer.elapsed_ms() - gpu_elapsed_ms);
+                    DiffusionProfiler::instance().record_custom("sampler_gpu_overhead_ms", overhead);
+                    sampler_metrics_.gpu_total_ms += gpu_elapsed_ms;
+                    sampler_metrics_.gpu_overhead_ms += overhead;
+
+                    // 仅回收活跃位置
+                    for (int i = 0; i < active_count; ++i) {
+                        const int pos = active_positions[i];
+                        sampled_tokens_active[i] = sampled_block[pos];
+                        confidences_active[i] = confidences_block[pos];
+                        if (need_entropy_probs && pos < static_cast<int>(entropy_block.size())) {
+                            entropy_active.push_back(std::move(entropy_block[pos]));
+                        }
+                    }
+                    sampled = true;
+                } else {
+                    if (gpu_only_mode) {
+                        llama_batch_free(batch);
+                        throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampler 不可用或执行失败，已禁止回退到 host logits。");
+                    }
+                    if (device_logits_env) {
+                        DIFF_LOGW("[DiffusionSampler][warn] device logits 启用但 GPU 采样未命中，回退 CPU 采样，可能触发 host/device 混用。\n");
+                    }
                 }
             }
-            continue;
-        }
-        
-        int num_transfer = num_transfer_tokens_per_step[step];
 
-        std::vector<bool> transfer_indices;
-        switch (config_.remasking_strategy) {
-            case RemaskingStrategy::SEQUENTIAL:
-                transfer_indices = get_transfer_indices_sequential(current_block, confidences, num_transfer);
-                break;
-            case RemaskingStrategy::LOW_CONFIDENCE_STATIC:
-                transfer_indices = get_transfer_indices_low_conf_static(current_block, confidences, num_transfer);
-                break;
-            case RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC:
-                transfer_indices = get_transfer_indices_low_conf_dynamic(current_block, confidences, num_transfer);
-                break;
-            case RemaskingStrategy::ENTROPY_BOUNDED:
-                transfer_indices = get_transfer_indices_entropy_bounded(current_block, all_probs);
-                break;
-            default:
-                transfer_indices = get_transfer_indices_low_conf_static(current_block, confidences, num_transfer);
-                break;
-        }
-
-        // Update the block with sampled tokens at selected positions
-        for (int i = 0; i < config_.block_length; i++) {
-            if (transfer_indices[i] && current_block[i] == config_.mask_token_id) {
-                current_block[i] = sampled_tokens[i];
-                remaining_masks--;
+            if (!sampled) {
+                diffusion::ProfilerTimer cpu_timer_total;
+                std::vector<std::vector<float>>* entropy_ptr = need_entropy_probs ? &entropy_active : nullptr;
+                sample_active_tokens_cpu(
+                    n_vocab,
+                    active_positions,
+                    sampled_tokens_active,
+                    confidences_active,
+                    entropy_ptr
+                );
+                DiffusionProfiler::instance().record_custom("sampler_cpu_sampling_ms", cpu_timer_total.elapsed_ms());
+                sampler_metrics_.cpu_sampling_ms += cpu_timer_total.elapsed_ms();
+                sampler_metrics_.cpu_sampling_calls++;
             }
         }
-        
-        // 下一次循环开始时再清理 KV；此处不重复清理
-    }
 
-    llama_batch_free(batch);
+        llama_batch_free(batch);
+
+        // 将置信度/概率映射回 block 级别
+        std::vector<float> block_confidences(config_.block_length, -INFINITY);
+        std::vector<std::vector<float>> entropy_probs_full;
+        if (need_entropy_probs) {
+            entropy_probs_full.resize(config_.block_length);
+        }
+        for (int i = 0; i < active_count; ++i) {
+            const int pos = active_positions[i];
+            block_confidences[pos] = confidences_active[i];
+            if (need_entropy_probs && i < static_cast<int>(entropy_active.size())) {
+                entropy_probs_full[pos] = std::move(entropy_active[i]);
+            }
+        }
+
+        // 选择要转移的 token
+        std::vector<bool> transfer_indices;
+        if (step >= static_cast<int>(num_transfer_tokens_per_step.size())) {
+            transfer_indices.assign(config_.block_length, true);
+        } else {
+            int num_transfer = num_transfer_tokens_per_step[step];
+            switch (config_.remasking_strategy) {
+                case RemaskingStrategy::SEQUENTIAL:
+                    transfer_indices = get_transfer_indices_sequential(current_block, block_confidences, num_transfer);
+                    break;
+                case RemaskingStrategy::LOW_CONFIDENCE_STATIC:
+                    transfer_indices = get_transfer_indices_low_conf_static(current_block, block_confidences, num_transfer);
+                    break;
+                case RemaskingStrategy::LOW_CONFIDENCE_DYNAMIC:
+                    transfer_indices = get_transfer_indices_low_conf_dynamic(current_block, block_confidences, num_transfer);
+                    break;
+                case RemaskingStrategy::ENTROPY_BOUNDED:
+                    transfer_indices = get_transfer_indices_entropy_bounded(current_block, entropy_probs_full);
+                    break;
+                default:
+                    transfer_indices = get_transfer_indices_low_conf_static(current_block, block_confidences, num_transfer);
+                    break;
+            }
+        }
+
+        // 更新 block，减少掩码计数
+        for (size_t i = 0; i < transfer_indices.size(); ++i) {
+            if (!transfer_indices[i]) continue;
+            if (current_block[i] == config_.mask_token_id) {
+                // 找到对应的采样结果
+                auto it = std::find(active_positions.begin(), active_positions.end(), static_cast<int>(i));
+                if (it == active_positions.end()) continue;
+                int idx = static_cast<int>(std::distance(active_positions.begin(), it));
+                current_block[i] = sampled_tokens_active[idx];
+                remaining_masks--;
+                masks_per_micro[i / micro_size] = std::max(0, masks_per_micro[i / micro_size] - 1);
+            }
+        }
+
+        // 下一次循环开始时才再次清理 KV
+    }
 }
 
 void DiffusionSampler::finalize_block(
@@ -628,6 +819,112 @@ void DiffusionSampler::sample_block_on_cpu(
 
         sampled_tokens[i] = static_cast<llama_token>(chosen);
         confidences[i] = probs_buf[static_cast<size_t>(chosen)];
+
+        if (entropy_probs_storage) {
+            entropy_probs_storage->emplace_back(probs_buf.begin(), probs_buf.end());
+        }
+    }
+
+    DiffusionProfiler::instance().record_custom(
+        "sampler_cpu_loop_ms",
+        cpu_timer.elapsed_ms()
+    );
+    sampler_metrics_.cpu_loop_ms += cpu_timer.elapsed_ms();
+    sampler_metrics_.cpu_loop_calls++;
+}
+
+void DiffusionSampler::sample_active_tokens_cpu(
+    int n_vocab,
+    const std::vector<int>& active_positions,
+    std::vector<llama_token>& sampled_tokens,
+    std::vector<float>& confidences,
+    std::vector<std::vector<float>>* entropy_probs_storage
+) {
+    diffusion::ProfilerTimer cpu_timer;
+    const int active_count = static_cast<int>(active_positions.size());
+    if (entropy_probs_storage) {
+        entropy_probs_storage->clear();
+        entropy_probs_storage->reserve(active_count);
+    }
+
+    static thread_local std::vector<float> logits_buf;
+    static thread_local std::vector<float> probs_buf;
+    logits_buf.resize(static_cast<size_t>(n_vocab));
+    probs_buf.resize(static_cast<size_t>(n_vocab));
+
+    for (int idx = 0; idx < active_count; ++idx) {
+        // llama_get_logits_ith 接受 batch 内序号，需与构造的 batch 顺序一致
+        // 按块内真实位置取 logits，确保与整块 decode 顺序一致
+        int pos_in_block = active_positions[idx];
+        float* logits = llama_get_logits_ith(ctx_, pos_in_block);
+        if (logits == nullptr) {
+            sampled_tokens[idx] = config_.mask_token_id;
+            confidences[idx] = 0.0f;
+            if (entropy_probs_storage) {
+                entropy_probs_storage->emplace_back(static_cast<size_t>(n_vocab), 0.0f);
+            }
+            continue;
+        }
+
+        float max_logit = -INFINITY;
+        for (int j = 0; j < n_vocab; ++j) {
+            float v = logits[j];
+            if (config_.temperature != 1.0f) {
+                v /= config_.temperature;
+            }
+            logits_buf[static_cast<size_t>(j)] = v;
+            if (!std::isinf(v) && v > max_logit) {
+                max_logit = v;
+            }
+        }
+
+        if (config_.top_k > 0) {
+            apply_top_k(logits_buf, config_.top_k);
+        }
+        if (config_.top_p < 1.0f) {
+            apply_top_p(logits_buf, config_.top_p);
+        }
+
+        float sum_exp = 0.0f;
+        for (int j = 0; j < n_vocab; ++j) {
+            float l = logits_buf[static_cast<size_t>(j)];
+            if (!std::isinf(l)) {
+                float e = std::exp(l - max_logit);
+                probs_buf[static_cast<size_t>(j)] = e;
+                sum_exp += e;
+            } else {
+                probs_buf[static_cast<size_t>(j)] = 0.0f;
+            }
+        }
+
+        if (sum_exp <= 0.0f) {
+            sampled_tokens[idx] = config_.mask_token_id;
+            confidences[idx] = 0.0f;
+            if (entropy_probs_storage) {
+                entropy_probs_storage->emplace_back(static_cast<size_t>(n_vocab), 0.0f);
+            }
+            continue;
+        }
+
+        const float inv_sum = 1.0f / sum_exp;
+        for (int j = 0; j < n_vocab; ++j) {
+            probs_buf[static_cast<size_t>(j)] *= inv_sum;
+        }
+
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        float r = dist(rng_);
+        float cdf = 0.0f;
+        int chosen = n_vocab - 1;
+        for (int j = 0; j < n_vocab; ++j) {
+            cdf += probs_buf[static_cast<size_t>(j)];
+            if (r <= cdf) {
+                chosen = j;
+                break;
+            }
+        }
+
+        sampled_tokens[idx] = static_cast<llama_token>(chosen);
+        confidences[idx] = probs_buf[static_cast<size_t>(chosen)];
 
         if (entropy_probs_storage) {
             entropy_probs_storage->emplace_back(probs_buf.begin(), probs_buf.end());
