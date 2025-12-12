@@ -214,10 +214,20 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                     const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
                     const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
 
-                    std::vector<llama_token> sampled_block(config_.block_length);
-                    std::vector<float> confidences_block(config_.block_length);
-                    std::vector<std::vector<float>> entropy_block;
-                    std::vector<std::vector<float>>* entropy_ptr_block = need_entropy_probs ? &entropy_block : nullptr;
+                    if (static_cast<int>(gpu_sampled_block_buffer_.size()) != config_.block_length) {
+                        gpu_sampled_block_buffer_.assign(config_.block_length, 0);
+                    }
+                    if (static_cast<int>(gpu_conf_block_buffer_.size()) != config_.block_length) {
+                        gpu_conf_block_buffer_.assign(config_.block_length, 0.0f);
+                    }
+                    if (need_entropy_probs) {
+                        gpu_entropy_block_buffer_.assign(config_.block_length, std::vector<float>{});
+                    } else {
+                        gpu_entropy_block_buffer_.clear();
+                    }
+                    std::vector<llama_token>& sampled_block = gpu_sampled_block_buffer_;
+                    std::vector<float>& confidences_block = gpu_conf_block_buffer_;
+                    std::vector<std::vector<float>>* entropy_ptr_block = need_entropy_probs ? &gpu_entropy_block_buffer_ : nullptr;
 
                     diffusion::ProfilerTimer total_timer;
                     double gpu_elapsed_ms = 0.0;
@@ -238,8 +248,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                             const int pos = active_positions[i];
                             sampled_tokens_active[i] = sampled_block[pos];
                             confidences_active[i] = confidences_block[pos];
-                            if (need_entropy_probs && pos < static_cast<int>(entropy_block.size())) {
-                                entropy_active.push_back(std::move(entropy_block[pos]));
+                            if (need_entropy_probs && pos < static_cast<int>(gpu_entropy_block_buffer_.size())) {
+                                entropy_active.push_back(std::move(gpu_entropy_block_buffer_[pos]));
                             }
                         }
                         sampled = true;

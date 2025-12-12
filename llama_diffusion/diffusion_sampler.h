@@ -89,6 +89,10 @@ public:
     bool use_gpu_sampler_ = false;
     SamplerTelemetry sampler_metrics_;
     int last_logits_count_ = 0;
+    // Reusable buffers for full-block GPU sampling in micro-block path
+    std::vector<llama_token> gpu_sampled_block_buffer_;
+    std::vector<float> gpu_conf_block_buffer_;
+    std::vector<std::vector<float>> gpu_entropy_block_buffer_;
 #if defined(DIFFUSION_ENABLE_CUDA)
     float* device_logits_compact_ = nullptr;
     size_t device_logits_compact_bytes_ = 0;

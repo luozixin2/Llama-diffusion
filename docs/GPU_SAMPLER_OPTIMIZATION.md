@@ -354,6 +354,29 @@ test_configs = [
 
 ---
 
+## 11. 2025-12-12 更新：微块调度与采样（当前实现）
+
+### 11.1 调度流程
+- 整块 decode 固定化：无论 micro_block_size，先整块 KV 清理、整块 decode，并将 block 内所有 token 的 `logits=true`，确保任意位置可取 logits。
+- 活跃位采样：remask 后得到 `active_positions`，CPU 采样使用 `llama_get_logits_ith(ctx_, pos_in_block)` 读取对应 logits，避免下标错位。
+- GPU 采样复用整块缓冲：微块场景也复用整块 `gpu_sampled_block_buffer_` / `gpu_conf_block_buffer_` / `gpu_entropy_block_buffer_`，GPU 成功后按 `active_positions` 回拣，失败回退 CPU。
+- KV 策略：维持整块 KV 清理，避免被重掩码的非活跃位读取旧 KV。曾尝试“仅清理活跃微块”导致质量退化，已回退。
+
+### 11.2 关键实现位置
+- `llama_diffusion/diffusion_sampler.cpp` / `diffusion_sampler_profiled.cpp`：微块分支 (`active_count < block_length`) 仍整块 decode；GPU 分支使用复用缓冲并在采样后回拣活跃位。
+- `sample_active_tokens_cpu`：以 `active_positions[idx]` 作为 logits 下标，与整块 decode 对齐。
+- 遥测/日志：GPU 命中/回退沿用既有 telemetry；日志等级由 `diffusion_logging.h` 控制。
+
+### 11.3 验证结果
+- 质量：微块配置（如 block=4, micro=2）文本正常，无重复/机械输出。
+- 性能：`test_profiling.py` 显示 GPU 吞吐约为 CPU 的 1.3–1.45x，GPU 采样命中正常，无回退（见 `profile_runs/20251212_074649`）。
+
+### 11.4 后续方向
+- 在保证质量前提下，评估安全复用非活跃 logits/KV 的条件，降低全量 decode/清理成本。
+- 进一步减少活跃位回拣与 entropy 回收的小循环开销。
+
+---
+
 ## 附录：测试结果存档
 
 所有 profiling 结果保存在 `profile_runs/` 目录：
