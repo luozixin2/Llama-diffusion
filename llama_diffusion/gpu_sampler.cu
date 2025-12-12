@@ -518,18 +518,30 @@ public:
             return false;
         }
 
+        // Device logits: allow sampling fewer rows (<= block_length_) to support active-position sampling.
+        if (logits_on_device) {
+            if (vocab_size_ <= 0 || (logits_size % static_cast<size_t>(vocab_size_) != 0)) {
+                DIFF_LOGE("[GpuSampler] device sample_impl invalid size: got=%zu vocab=%d\n",
+                          logits_size, vocab_size_);
+                return false;
+            }
+            const int num_rows = static_cast<int>(logits_size / static_cast<size_t>(vocab_size_));
+            if (num_rows <= 0 || num_rows > block_length_) {
+                DIFF_LOGE("[GpuSampler] device sample_impl rows out of range: rows=%d block=%d vocab=%d size=%zu\n",
+                          num_rows, block_length_, vocab_size_, logits_size);
+                return false;
+            }
+            return sample_impl_single_stream_device(logits_ptr, logits_size, remasking_strategy,
+                                                    rng, sampled_tokens, confidences, token_probs, stats,
+                                                    num_rows,
+                                                    force_non_fused);
+        }
+
         const size_t expected = static_cast<size_t>(block_length_) * vocab_size_;
         if (logits_size != expected) {
             DIFF_LOGE("[GpuSampler] sample_impl size mismatch: got=%zu expected=%zu (block=%d vocab=%d)\n",
                       logits_size, expected, block_length_, vocab_size_);
             return false;
-        }
-
-        // Device logits: allow non-fused path when requested by caller
-        if (logits_on_device) {
-            return sample_impl_single_stream_device(logits_ptr, logits_size, remasking_strategy,
-                                                    rng, sampled_tokens, confidences, token_probs, stats,
-                                                    force_non_fused);
         }
 
         // Use multi-stream path if available and block_length is large enough
@@ -944,11 +956,12 @@ public:
         std::vector<float>& confidences,
         std::vector<std::vector<float>>* token_probs,
         GpuSamplerStats* stats,
+        int num_rows,
         bool force_non_fused = false
     ) {
         DIFF_LOGD("[GpuSampler][debug] device path start ptr=%p size=%zu force_non_fused=%d block=%d vocab=%d\n",
-                  (const void*)logits_ptr, logits_size, force_non_fused ? 1 : 0, block_length_, vocab_size_);
-        const size_t expected = static_cast<size_t>(block_length_) * vocab_size_;
+                  (const void*)logits_ptr, logits_size, force_non_fused ? 1 : 0, num_rows, vocab_size_);
+        const size_t expected = static_cast<size_t>(num_rows) * vocab_size_;
         cudaStream_t stream = streams_[0];
 
         const bool need_probs = (remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED) && token_probs;
@@ -1032,7 +1045,7 @@ public:
         if (safe_vocab_device < vocab_size_) {
             const int threads_mask = 256;
             const int blocks_mask = block_length_;
-            mask_tail_kernel<<<blocks_mask, threads_mask, 0, stream>>>(d_logits_, vocab_size_, block_length_, safe_vocab_device);
+            mask_tail_kernel<<<blocks_mask, threads_mask, 0, stream>>>(d_logits_, vocab_size_, num_rows, safe_vocab_device);
             if (stats) {
                 stats->n_vocab_limit = safe_vocab_device;
             }
@@ -1045,15 +1058,15 @@ public:
             std::uniform_int_distribution<uint64_t> dist64;
             uint64_t seed = dist64(rng);
             int rand_threads = 256;
-            int rand_blocks = (block_length_ + rand_threads - 1) / rand_threads;
-            fill_random_kernel<<<rand_blocks, rand_threads, 0, stream>>>(d_random_vals_, seed, block_length_);
+            int rand_blocks = (num_rows + rand_threads - 1) / rand_threads;
+            fill_random_kernel<<<rand_blocks, rand_threads, 0, stream>>>(d_random_vals_, seed, num_rows);
             cudaEventRecord(ev_after_rng, stream);
 
             int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
             const size_t sample_smem = (sample_threads * 2 + 1) * sizeof(float) + sizeof(int);
             const float inv_temp_fused = 1.0f; // logits 已按需温度缩放
 
-            fused_softmax_sample_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
+            fused_softmax_sample_kernel<<<num_rows, sample_threads, sample_smem, stream>>>(
                 d_logits_,
                 vocab_size_,
                 block_length_,
@@ -1065,10 +1078,10 @@ public:
             cudaEventRecord(ev_after_sample, stream);
 
             cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
-                            block_length_ * sizeof(int),
+                            num_rows * sizeof(int),
                             cudaMemcpyDeviceToHost, stream);
             cudaMemcpyAsync(confidences.data(), d_confidences_,
-                            block_length_ * sizeof(float),
+                            num_rows * sizeof(float),
                             cudaMemcpyDeviceToHost, stream);
             cudaEventRecord(ev_after_d2h, stream);
             cudaEventRecord(ev_whole_end, stream);
@@ -1077,7 +1090,7 @@ public:
             // Clamp any out-of-range ids defensively
             if (safe_vocab_device < vocab_size_) {
                 const int clamp_id = safe_vocab_device - 1;
-                for (int i = 0; i < block_length_; ++i) {
+                for (int i = 0; i < num_rows; ++i) {
                     if (sampled_tokens[i] >= safe_vocab_device) {
                         sampled_tokens[i] = clamp_id;
                         confidences[i] = 0.0f;
@@ -1151,17 +1164,17 @@ public:
 
         const int threads_per_block = 256;
         const size_t smem_size = threads_per_block * sizeof(float);
-        find_row_max_kernel<<<block_length_, threads_per_block, smem_size, stream>>>(
+        find_row_max_kernel<<<num_rows, threads_per_block, smem_size, stream>>>(
             d_logits_, d_row_max_, vocab_size_, block_length_);
         err = cudaGetLastError();
         DIFF_LOGD("[GpuSampler][debug] device find_row_max err=%d\n", int(err));
 
-        softmax_exp_sum_kernel<<<block_length_, threads_per_block, smem_size, stream>>>(
+        softmax_exp_sum_kernel<<<num_rows, threads_per_block, smem_size, stream>>>(
             d_logits_, d_row_max_, d_probs_, d_row_sum_, vocab_size_, block_length_);
         err = cudaGetLastError();
         DIFF_LOGD("[GpuSampler][debug] device softmax_exp_sum err=%d\n", int(err));
 
-        softmax_normalize_kernel<<<block_length_, threads_per_block, 0, stream>>>(
+        softmax_normalize_kernel<<<num_rows, threads_per_block, 0, stream>>>(
             d_probs_, d_row_sum_, vocab_size_, block_length_);
         err = cudaGetLastError();
         DIFF_LOGD("[GpuSampler][debug] device softmax_normalize err=%d\n", int(err));
@@ -1175,23 +1188,23 @@ public:
             std::uniform_int_distribution<uint64_t> dist64;
             uint64_t seed = dist64(rng);
             int threads = 256;
-            int blocks = (block_length_ + threads - 1) / threads;
-            fill_random_kernel<<<blocks, threads, 0, stream>>>(d_random_vals_, seed, block_length_);
+            int blocks = (num_rows + threads - 1) / threads;
+            fill_random_kernel<<<blocks, threads, 0, stream>>>(d_random_vals_, seed, num_rows);
 
             int sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
             const size_t sample_smem = sample_threads * sizeof(float) + sample_threads * sizeof(int);
-            sample_tokens_kernel<<<block_length_, sample_threads, sample_smem, stream>>>(
+            sample_tokens_kernel<<<num_rows, sample_threads, sample_smem, stream>>>(
                 d_probs_, d_random_vals_,
                 d_sampled_tokens_, d_confidences_,
-                vocab_size_, block_length_,
+                vocab_size_, num_rows,
                 config_.top_k, config_.top_p
             );
 
             cudaMemcpyAsync(sampled_tokens.data(), d_sampled_tokens_,
-                            block_length_ * sizeof(int),
+                            num_rows * sizeof(int),
                             cudaMemcpyDeviceToHost, stream);
             cudaMemcpyAsync(confidences.data(), d_confidences_,
-                            block_length_ * sizeof(float),
+                            num_rows * sizeof(float),
                             cudaMemcpyDeviceToHost, stream);
             cudaDeviceSynchronize();
             err = cudaGetLastError();
@@ -1206,7 +1219,7 @@ public:
             const int clamp_limit = config_.n_vocab_limit > 0 ? config_.n_vocab_limit : vocab_size_;
             if (clamp_limit < vocab_size_) {
                 const int clamp_id = clamp_limit - 1;
-                for (int i = 0; i < block_length_; ++i) {
+                for (int i = 0; i < num_rows; ++i) {
                     if (sampled_tokens[i] >= clamp_limit) {
                         sampled_tokens[i] = clamp_id;
                         confidences[i] = 0.0f;

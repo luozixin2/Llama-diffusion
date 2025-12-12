@@ -65,6 +65,22 @@ std::vector<llama_token> DiffusionSampler::generate(const std::vector<llama_toke
     }
     std::copy(prompt.begin(), prompt.end(), sequence.begin());
 
+    auto env_flag = [](const char* key) {
+        const char* v = std::getenv(key);
+        if (!v) return false;
+        if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+        return true;
+    };
+    const bool disable_gpu_sampler = env_flag("DIFFUSION_DISABLE_GPU_SAMPLER");
+    const bool force_cpu_sampling = env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+    const bool disable_partial_kv = env_flag("DIFFUSION_DISABLE_PARTIAL_KV_REUSE");
+    const bool force_full_decode = env_flag("DIFFUSION_FORCE_FULL_BLOCK_DECODE");
+    DIFF_LOGI("[DiffusionSampler][info] flags: disable_gpu_sampler=%d force_cpu_sampling=%d disable_partial_kv=%d force_full_decode=%d\n",
+              disable_gpu_sampler ? 1 : 0,
+              force_cpu_sampling ? 1 : 0,
+              disable_partial_kv ? 1 : 0,
+              force_full_decode ? 1 : 0);
+
     // Prefill phase
     const int prefill_blocks = static_cast<int>(prompt_length / config_.block_length);
     const size_t prefill_length = static_cast<size_t>(prefill_blocks) * config_.block_length;
@@ -336,6 +352,10 @@ void DiffusionSampler::denoise_block(
         }
     }
 
+    // partial KV/logits reuse 需要跨 step 追踪“哪些微块的 token 在上一轮被更新过”（否则 KV 会停留在旧 token 上）
+    // 初始设为全 dirty：如果第 0 步就触发 partial，则会保守地重算这些微块。
+    std::vector<char> dirty_micros(static_cast<size_t>(micro_count), 1);
+
     for (int step = 0; step < config_.denoising_steps; step++) {
         if (remaining_masks == 0) {
             break;
@@ -361,30 +381,126 @@ void DiffusionSampler::denoise_block(
             break;
         }
 
-        // 清理整块 KV，确保无残留；解码仍用整块 logits
-        llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
-
         const int active_count = static_cast<int>(active_positions.size());
-        llama_batch batch = llama_batch_init(config_.block_length, 0, 1);
-        for (int i = 0; i < config_.block_length; i++) {
-            batch.token[i] = current_block[i];
-            batch.pos[i] = static_cast<llama_pos>(block_start + i);
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = true;
+        // active position -> index mapping (avoids O(block_len * active_count) scans later)
+        std::vector<int> active_pos2idx(config_.block_length, -1);
+        for (int i = 0; i < active_count; ++i) {
+            const int pos = active_positions[i];
+            if (pos >= 0 && pos < config_.block_length) active_pos2idx[pos] = i;
         }
-        batch.n_tokens = config_.block_length;
-        last_logits_count_ = config_.block_length;
+        const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
+        auto env_flag = [](const char* key) {
+            const char* v = std::getenv(key);
+            if (!v) return false;
+            if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+            return true;
+        };
 
+        // 需要清理/重算的微块：仍含 mask 的微块 + 上一轮 token 发生过更新的微块
+        std::vector<int> micros_to_decode;
+        micros_to_decode.reserve(static_cast<size_t>(micro_count));
+        for (int m = 0; m < micro_count; ++m) {
+            if (masks_per_micro[m] > 0 || dirty_micros[static_cast<size_t>(m)]) {
+                micros_to_decode.push_back(m);
+            }
+        }
+        std::vector<int> decode_positions;
+        decode_positions.reserve(static_cast<size_t>(micros_to_decode.size()) * static_cast<size_t>(micro_size));
+        for (int m : micros_to_decode) {
+            const int base = m * micro_size;
+            for (int j = 0; j < micro_size; ++j) {
+                decode_positions.push_back(base + j);
+            }
+        }
+        const int decode_count = static_cast<int>(decode_positions.size());
+
+        // Experimental: guarded partial KV/logits reuse
+        bool do_partial_kv = env_flag("DIFFUSION_PARTIAL_KV_REUSE")
+            && !env_flag("DIFFUSION_DISABLE_PARTIAL_KV_REUSE")
+            && !env_flag("DIFFUSION_FORCE_FULL_BLOCK_DECODE")
+            && !need_entropy_probs
+            && config_.top_k <= 0
+            && config_.top_p >= 1.0f
+            && !use_gpu_sampler_
+            && active_count < config_.block_length
+            && decode_count > 0
+            && decode_count < config_.block_length;
+
+        auto decode_full_block = [&]() -> bool {
+            llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
+            llama_batch b = llama_batch_init(config_.block_length, 0, 1);
+            for (int i = 0; i < config_.block_length; i++) {
+                b.token[i] = current_block[i];
+                b.pos[i] = static_cast<llama_pos>(block_start + i);
+                b.n_seq_id[i] = 1;
+                b.seq_id[i][0] = 0;
+                b.logits[i] = true;
+            }
+            b.n_tokens = config_.block_length;
+            last_logits_count_ = config_.block_length;
+            const int rc = llama_decode(ctx_, b);
+            llama_batch_free(b);
+            return rc == 0;
+        };
+
+        llama_batch batch = llama_batch_init(do_partial_kv ? decode_count : config_.block_length, 0, 1);
+
+        // KV 清理（整块 or 仅需要重算的微块）
+        if (do_partial_kv) {
+            sampler_metrics_.partial_kv_attempt++;
+            for (int m : micros_to_decode) {
+                const int start_pos = block_start + m * micro_size;
+                llama_memory_seq_rm(memory, 0, start_pos, start_pos + micro_size);
+            }
+        } else {
+            llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
+        }
+
+        // batch 构造（整块 or compact 需要重算的微块）
+        if (do_partial_kv) {
+            for (int i = 0; i < decode_count; i++) {
+                const int pos = decode_positions[i];
+                batch.token[i] = current_block[pos];
+                batch.pos[i] = static_cast<llama_pos>(block_start + pos);
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                // 仅对 mask token 请求 logits（用于采样）；非 mask 仅为更新 KV
+                batch.logits[i] = (current_block[pos] == config_.mask_token_id);
+            }
+            batch.n_tokens = decode_count;
+            last_logits_count_ = decode_count;
+        } else {
+            for (int i = 0; i < config_.block_length; i++) {
+                batch.token[i] = current_block[i];
+                batch.pos[i] = static_cast<llama_pos>(block_start + i);
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = true;
+            }
+            batch.n_tokens = config_.block_length;
+            last_logits_count_ = config_.block_length;
+        }
+
+        // decode（失败则回退到整块）
         if (llama_decode(ctx_, batch) != 0) {
             llama_batch_free(batch);
-            assert(false && "llama_decode failed inside denoise_block!");
-            return;
+            if (do_partial_kv) {
+                sampler_metrics_.partial_kv_fallback++;
+                do_partial_kv = false;
+                if (!decode_full_block()) {
+                    assert(false && "llama_decode failed inside denoise_block (fallback full)!");
+                    return;
+                }
+                // 重新创建一个占位 batch，保证后续 llama_batch_free 逻辑不变
+                batch = llama_batch_init(config_.block_length, 0, 1);
+            } else {
+                assert(false && "llama_decode failed inside denoise_block!");
+                return;
+            }
         }
 
         // 采样：整块 logits 计算，只对活跃位置采样（优先 GPU）
         const int n_vocab = get_vocab_size();
-        const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
 
         std::vector<llama_token> sampled_tokens_active(active_count);
         std::vector<float> confidences_active(active_count);
@@ -403,7 +519,53 @@ void DiffusionSampler::denoise_block(
             );
             sampled = true;
         } else {
-            // 分支2：活跃为子集，先尝试 GPU 采样整块后回收活跃位置；失败则回退 CPU 子集采样
+            // 分支2：活跃为子集
+            // 2A) partial KV/logits：compact decode（仅重算必要微块）后仅 CPU 子集采样（用 override 映射 logits index）
+            if (do_partial_kv) {
+                // 建 pos -> batch_idx 映射，并校验每个活跃位置都有 logits
+                std::vector<int> pos2idx(config_.block_length, -1);
+                for (int i = 0; i < decode_count; ++i) {
+                    const int pos = decode_positions[i];
+                    if (pos >= 0 && pos < config_.block_length) pos2idx[pos] = i;
+                }
+                std::vector<int> logits_override(active_count);
+                bool ok = true;
+                for (int i = 0; i < active_count; ++i) {
+                    const int pos = active_positions[i];
+                    const int li = (pos >= 0 && pos < config_.block_length) ? pos2idx[pos] : -1;
+                    if (li < 0) { ok = false; break; }
+                    logits_override[i] = li;
+                    if (!batch.logits[li] || llama_get_logits_ith(ctx_, li) == nullptr) { ok = false; break; }
+                }
+
+                if (!ok) {
+                    sampler_metrics_.partial_kv_fallback++;
+                    do_partial_kv = false;
+                    // 回退到整块 decode，确保 logits index == 块内位置
+                    if (!decode_full_block()) {
+                        llama_batch_free(batch);
+                        assert(false && "llama_decode failed inside denoise_block (fallback full)!");
+                        return;
+                    }
+                } else {
+                    diffusion::ProfilerTimer cpu_timer_total;
+                    sample_active_tokens_cpu(
+                        n_vocab,
+                        active_positions,
+                        sampled_tokens_active,
+                        confidences_active,
+                        nullptr,
+                        &logits_override
+                    );
+                    DiffusionProfiler::instance().record_custom("sampler_cpu_sampling_ms", cpu_timer_total.elapsed_ms());
+                    sampler_metrics_.cpu_sampling_ms += cpu_timer_total.elapsed_ms();
+                    sampler_metrics_.cpu_sampling_calls++;
+                    sampler_metrics_.partial_kv_used++;
+                    sampled = true;
+                }
+            }
+
+            // 2B) 非 partial：先尝试 GPU 采样整块后回收活跃位置；失败则回退 CPU 子集采样
             if (use_gpu_sampler_) {
                 auto env_flag = [](const char* key) {
                     const char* v = std::getenv(key);
@@ -413,6 +575,12 @@ void DiffusionSampler::denoise_block(
                 };
                 const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
                 const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
+                const bool allow_gpu_sampling = !env_flag("DIFFUSION_DISABLE_GPU_SAMPLER") && !env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+
+                if (!allow_gpu_sampling && gpu_only_mode) {
+                    llama_batch_free(batch);
+                    throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampling 被禁用 (DIFFUSION_DISABLE_GPU_SAMPLER/DIFFUSION_FORCE_CPU_SAMPLING)");
+                }
 
                 if (static_cast<int>(gpu_sampled_block_buffer_.size()) != config_.block_length) {
                     gpu_sampled_block_buffer_.assign(config_.block_length, 0);
@@ -431,6 +599,7 @@ void DiffusionSampler::denoise_block(
 
                 diffusion::ProfilerTimer total_timer;
                 double gpu_elapsed_ms = 0.0;
+                if (allow_gpu_sampling) {
                 if (try_sample_with_gpu(
                         n_vocab,
                         need_entropy_probs,
@@ -445,15 +614,18 @@ void DiffusionSampler::denoise_block(
                     sampler_metrics_.gpu_overhead_ms += overhead;
 
                     // 仅回收活跃位置
+                    if (need_entropy_probs) entropy_active.resize(static_cast<size_t>(active_count));
                     for (int i = 0; i < active_count; ++i) {
                         const int pos = active_positions[i];
                         sampled_tokens_active[i] = sampled_block[pos];
                         confidences_active[i] = confidences_block[pos];
                         if (need_entropy_probs && pos < static_cast<int>(gpu_entropy_block_buffer_.size())) {
-                            entropy_active.push_back(std::move(gpu_entropy_block_buffer_[pos]));
+                            entropy_active[static_cast<size_t>(i)] = std::move(gpu_entropy_block_buffer_[pos]);
                         }
                     }
                     sampled = true;
+                }
+
                 } else {
                     if (gpu_only_mode) {
                         llama_batch_free(batch);
@@ -523,18 +695,19 @@ void DiffusionSampler::denoise_block(
         }
 
         // 更新 block，减少掩码计数
+        std::vector<char> next_dirty(static_cast<size_t>(micro_count), 0);
         for (size_t i = 0; i < transfer_indices.size(); ++i) {
             if (!transfer_indices[i]) continue;
             if (current_block[i] == config_.mask_token_id) {
-                // 找到对应的采样结果
-                auto it = std::find(active_positions.begin(), active_positions.end(), static_cast<int>(i));
-                if (it == active_positions.end()) continue;
-                int idx = static_cast<int>(std::distance(active_positions.begin(), it));
-                current_block[i] = sampled_tokens_active[idx];
+                const int idx = (i < active_pos2idx.size()) ? active_pos2idx[i] : -1;
+                if (idx < 0) continue;
+                current_block[i] = sampled_tokens_active[static_cast<size_t>(idx)];
                 remaining_masks--;
                 masks_per_micro[i / micro_size] = std::max(0, masks_per_micro[i / micro_size] - 1);
+                next_dirty[i / micro_size] = 1;
             }
         }
+        dirty_micros.swap(next_dirty);
 
         // 下一次循环开始时才再次清理 KV
     }
@@ -695,7 +868,11 @@ bool DiffusionSampler::sample_block_tokens(
     diffusion::ProfilerTimer total_timer;
     double gpu_elapsed_ms = 0.0;
 
-    if (try_sample_with_gpu(
+    const bool allow_gpu_sampling = use_gpu_sampler_
+        && !env_flag("DIFFUSION_DISABLE_GPU_SAMPLER")
+        && !env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+
+    if (allow_gpu_sampling && try_sample_with_gpu(
             n_vocab,
             need_entropy_probs,
             sampled_tokens,
@@ -714,6 +891,12 @@ bool DiffusionSampler::sample_block_tokens(
         sampler_metrics_.gpu_total_ms += gpu_elapsed_ms;
         sampler_metrics_.gpu_overhead_ms += overhead;
         return true;
+    }
+
+    if (!allow_gpu_sampling) {
+        if (gpu_only_mode) {
+            throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampling 被禁用 (DIFFUSION_DISABLE_GPU_SAMPLER/DIFFUSION_FORCE_CPU_SAMPLING)");
+        }
     }
 
     // GPU 失败时的处理：GPU-only 模式下禁止访问 host logits，直接报错
@@ -848,7 +1031,8 @@ void DiffusionSampler::sample_active_tokens_cpu(
     const std::vector<int>& active_positions,
     std::vector<llama_token>& sampled_tokens,
     std::vector<float>& confidences,
-    std::vector<std::vector<float>>* entropy_probs_storage
+    std::vector<std::vector<float>>* entropy_probs_storage,
+    const std::vector<int>* logits_positions_override
 ) {
     diffusion::ProfilerTimer cpu_timer;
     const int active_count = static_cast<int>(active_positions.size());
@@ -864,9 +1048,10 @@ void DiffusionSampler::sample_active_tokens_cpu(
 
     for (int idx = 0; idx < active_count; ++idx) {
         // llama_get_logits_ith 接受 batch 内序号，需与构造的 batch 顺序一致
-        // 按块内真实位置取 logits，确保与整块 decode 顺序一致
-        int pos_in_block = active_positions[idx];
-        float* logits = llama_get_logits_ith(ctx_, pos_in_block);
+        // - 默认：整块 decode，logits index == 块内位置
+        // - 可选：compact decode（仅活跃 token 入 batch），logits index 由 override 提供
+        const int logits_idx = logits_positions_override ? (*logits_positions_override)[idx] : active_positions[idx];
+        float* logits = llama_get_logits_ith(ctx_, logits_idx);
         if (logits == nullptr) {
             sampled_tokens[idx] = config_.mask_token_id;
             confidences[idx] = 0.0f;

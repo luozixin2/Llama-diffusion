@@ -2,12 +2,13 @@
 Quick quality/speed baseline for micro-block decoding.
 
 Default:
-- block_length in {4, 8}, micro_block_size in {2, 4}, gen_length=512
+- block_length in {4}, micro_block_size in {2, 4}, gen_length=512
 - Prompt list includes the music-robot paragraph used previously.
 
 It prints a human-readable summary and saves JSON + text reports under
 `profile_runs/` with a timestamp. Quality is for manual reading; speed is
-measured as wall time and tokens/sec.
+measured as wall time and tokens/sec (by default: **generated tokens/sec**,
+excluding the prompt tokens when the backend returns prompt+gen tokens).
 """
 
 import argparse
@@ -77,7 +78,19 @@ def run_case(
         use_gpu_sampler=use_gpu_sampler,
     )
     elapsed = time.perf_counter() - start
-    tokens_per_sec = len(out_tokens) / elapsed if elapsed > 0 else 0.0
+
+    # NOTE: C++ DiffusionSampler::generate() returns prompt+gen tokens.
+    # For throughput, we report generated tokens/sec (exclude prompt tokens)
+    # when the output starts with the prompt.
+    prompt_ids = prompt_entry["prompt_ids"]
+    prompt_len = len(prompt_ids)
+    total_tokens = len(out_tokens)
+    if total_tokens >= prompt_len and out_tokens[:prompt_len] == prompt_ids:
+        generated_tokens = total_tokens - prompt_len
+    else:
+        generated_tokens = total_tokens
+
+    gen_tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
     decoded = tokenizer.decode(out_tokens, skip_special_tokens=True)
     return {
         "prompt_name": prompt_entry["name"],
@@ -86,8 +99,12 @@ def run_case(
         "gen_length": gen_length,
         "use_gpu_sampler": use_gpu_sampler,
         "elapsed_sec": elapsed,
-        "tokens": len(out_tokens),
-        "tokens_per_sec": tokens_per_sec,
+        "prompt_tokens": prompt_len,
+        "total_tokens": total_tokens,
+        "generated_tokens": generated_tokens,
+        "tokens": total_tokens,  # backward-compat alias
+        "tokens_per_sec": gen_tokens_per_sec,  # default: generated tokens/sec
+        "gen_tokens_per_sec": gen_tokens_per_sec,
         "output_text": decoded,
     }
 
@@ -102,7 +119,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--use-gpu-sampler", action="store_true", default=False)
-    parser.add_argument("--block-lengths", type=int, nargs="+", default=[4, 8])
+    parser.add_argument("--block-lengths", type=int, nargs="+", default=[4])
     parser.add_argument("--micro-block-sizes", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--n-gpu-layers", type=int, default=35)
     parser.add_argument("--n-ctx", type=int, default=8192)
@@ -156,8 +173,8 @@ def main():
                 results.append(res)
                 lines.append(
                     f"[{p['name']}] block={b} micro={m} "
-                    f"elapsed={res['elapsed_sec']:.2f}s tps={res['tokens_per_sec']:.2f} "
-                    f"len={res['tokens']}"
+                    f"elapsed={res['elapsed_sec']:.2f}s gen_tps={res['gen_tokens_per_sec']:.2f} "
+                    f"gen={res['generated_tokens']} total={res['total_tokens']} prompt={res['prompt_tokens']}"
                 )
                 lines.append(res["output_text"])
                 lines.append("")

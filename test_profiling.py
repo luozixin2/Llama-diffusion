@@ -15,6 +15,19 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
 os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
 
+def _compute_token_counts(prompt, tokens):
+    """Return (prompt_tokens, total_tokens, generated_tokens, has_prompt_prefix)."""
+    prompt_tokens = len(prompt) if prompt is not None else 0
+    total_tokens = len(tokens) if tokens is not None else 0
+    has_prefix = False
+    if prompt is not None and tokens is not None and total_tokens >= prompt_tokens:
+        try:
+            has_prefix = (tokens[:prompt_tokens] == prompt)
+        except Exception:
+            has_prefix = False
+    generated_tokens = (total_tokens - prompt_tokens) if has_prefix else total_tokens
+    return prompt_tokens, total_tokens, generated_tokens, has_prefix
+
 class DiffusionProfiler:
     def __init__(self, model_path: str, n_ctx: int = 8192, n_gpu_layers: int = 0):
         self.model = llama_diffusion_profiled.LlamaDiffusionProfiled(
@@ -132,10 +145,15 @@ class DiffusionProfiler:
         end_time = time.time()
         total_wall_time = (end_time - start_time) * 1000  # Convert to ms
         
+        prompt_tokens, total_tokens, generated_tokens, has_prefix = _compute_token_counts(prompt, tokens)
         return {
             'tokens': tokens,
             'profile': profile,
             'wall_time_ms': total_wall_time,
+            'prompt_tokens': prompt_tokens,
+            'total_tokens': total_tokens,
+            'generated_tokens': generated_tokens,
+            'has_prompt_prefix': has_prefix,
             'config': {
                 'gen_length': gen_length,
                 'block_length': block_length,
@@ -226,6 +244,10 @@ class DiffusionProfiler:
         avg_result = {
             'tokens': run_results[0]['tokens'],  # 使用第一次的tokens
             'wall_time_ms': sum(r['wall_time_ms'] for r in run_results) / len(run_results),
+            'prompt_tokens': run_results[0].get('prompt_tokens', 0),
+            'total_tokens': run_results[0].get('total_tokens', len(run_results[0].get('tokens', []))),
+            'generated_tokens': run_results[0].get('generated_tokens', len(run_results[0].get('tokens', []))),
+            'has_prompt_prefix': run_results[0].get('has_prompt_prefix', False),
             'config': run_results[0]['config'],
             'profile': {}
         }
@@ -273,8 +295,15 @@ class DiffusionProfiler:
         if header:
             lines.append(header)
         lines.append(f"Wall Time: {result['wall_time_ms']:.2f} ms")
-        lines.append(f"Tokens Generated: {len(result['tokens'])}")
-        lines.append(f"Throughput: {len(result['tokens']) / (result['wall_time_ms'] / 1000):.2f} tokens/sec")
+        prompt_tokens = int(result.get('prompt_tokens', 0))
+        total_tokens = int(result.get('total_tokens', len(result.get('tokens', []))))
+        gen_tokens = int(result.get('generated_tokens', total_tokens))
+        wall_s = (result['wall_time_ms'] / 1000) if result['wall_time_ms'] > 0 else 0.0
+        total_tps = (total_tokens / wall_s) if wall_s > 0 else 0.0
+        gen_tps = (gen_tokens / wall_s) if wall_s > 0 else 0.0
+        lines.append(f"Tokens: gen={gen_tokens} total={total_tokens} prompt={prompt_tokens}")
+        lines.append(f"Throughput (gen): {gen_tps:.2f} tokens/sec")
+        lines.append(f"Throughput (total): {total_tps:.2f} tokens/sec")
 
         if 'total_generation' in profile:
             total_gen = profile['total_generation']
@@ -378,7 +407,8 @@ class DiffusionProfiler:
 
         baseline_time = results[0]['wall_time_ms']
         for result in results:
-            tokens_per_sec = len(result['tokens']) / (result['wall_time_ms'] / 1000)
+            gen_tokens = int(result.get('generated_tokens', len(result.get('tokens', []))))
+            tokens_per_sec = gen_tokens / (result['wall_time_ms'] / 1000)
             speedup = baseline_time / result['wall_time_ms'] if result['wall_time_ms'] > 0 else 0
             lines.append(f"{result.get('config_name','Unknown'):<30} "
                          f"{result['wall_time_ms']:<15.2f} "
@@ -738,11 +768,17 @@ class DiffusionProfiler:
         export_data = []
         
         for result in results:
+            prompt_tokens = int(result.get('prompt_tokens', 0))
+            total_tokens = int(result.get('total_tokens', len(result.get('tokens', []))))
+            gen_tokens = int(result.get('generated_tokens', total_tokens))
             data = {
                 'config_name': result.get('config_name', 'Unknown'),
                 'wall_time_ms': result['wall_time_ms'],
-                'tokens_generated': len(result['tokens']),
-                'throughput_tokens_per_sec': len(result['tokens']) / (result['wall_time_ms'] / 1000),
+                'prompt_tokens': prompt_tokens,
+                'total_tokens': total_tokens,
+                'generated_tokens': gen_tokens,
+                'gen_tokens_per_sec': gen_tokens / (result['wall_time_ms'] / 1000) if result['wall_time_ms'] > 0 else 0.0,
+                'total_tokens_per_sec': total_tokens / (result['wall_time_ms'] / 1000) if result['wall_time_ms'] > 0 else 0.0,
                 'config': result['config'],
                 'profile': result['profile']
             }
@@ -752,7 +788,9 @@ class DiffusionProfiler:
                 data['individual_runs'] = [
                     {
                         'wall_time_ms': r['wall_time_ms'],
-                        'tokens_generated': len(r['tokens'])
+                        'prompt_tokens': int(r.get('prompt_tokens', 0)),
+                        'total_tokens': int(r.get('total_tokens', len(r.get('tokens', [])))),
+                        'generated_tokens': int(r.get('generated_tokens', len(r.get('tokens', []))))
                     }
                     for r in result['individual_runs']
                 ]
@@ -763,6 +801,45 @@ class DiffusionProfiler:
             json.dump(export_data, f, indent=2)
         
         print(f"\nResults exported to {output_file}")
+
+        # Also export a flat CSV for quick experiment-matrix diffs
+        try:
+            rows = []
+            telemetry_keys = [
+                'telemetry_gpu_fast_path',
+                'telemetry_gpu_device_fast_path',
+                'telemetry_gpu_path_device_hit',
+                'telemetry_gpu_path_device_miss',
+                'telemetry_gpu_path_need_entropy',
+                'telemetry_gpu_stage_total',
+                'telemetry_gpu_stage_whole_gpu_ms',
+                'telemetry_gpu_stage_whole_wall_ms',
+                'sampler_gpu_total_ms',
+                'sampler_gpu_overhead_ms',
+            ]
+            for d in export_data:
+                cfg = d.get('config', {})
+                prof = d.get('profile', {})
+                row = {'config_name': d.get('config_name')}
+                row.update(cfg)
+                for k in ('wall_time_ms','prompt_tokens','total_tokens','generated_tokens','gen_tokens_per_sec','total_tokens_per_sec'):
+                    if k in d:
+                        row[k] = d[k]
+                for k in telemetry_keys:
+                    if k in prof:
+                        s = prof[k]
+                        if isinstance(s, dict):
+                            row[k] = s.get('count', s.get('total_ms', None))
+                        else:
+                            row[k] = s
+                rows.append(row)
+            df = pd.DataFrame(rows)
+            csv_file = output_file.replace('.json', '_flat.csv')
+            df.to_csv(csv_file, index=False)
+            print(f"Flat CSV exported to {csv_file}")
+        except Exception as e:
+            print(f"[warn] failed to export flat CSV: {e}")
+
         
         archive_subdir = None
         if archive:
@@ -777,7 +854,12 @@ class DiffusionProfiler:
             # 复制JSON文件
             archive_json = os.path.join(archive_subdir, output_file)
             shutil.copy2(output_file, archive_json)
-            
+
+            # 复制 flat CSV（如果存在）
+            flat_csv = output_file.replace('.json', '_flat.csv')
+            if os.path.exists(flat_csv):
+                shutil.copy2(flat_csv, os.path.join(archive_subdir, flat_csv))
+
             # 复制所有profile图片
             for i in range(len(results)):
                 profile_png = f'profile_{i}.png'
@@ -792,8 +874,15 @@ class DiffusionProfiler:
 def main():
     """示例测试"""
     # 配置
-    MODEL_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf"
-    TOKENIZER_PATH = "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat"
+    # Allow overriding paths via env (useful when models live outside /home).
+    MODEL_PATH = os.environ.get(
+        "TEST_PROFILING_MODEL_PATH",
+        "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf",
+    )
+    TOKENIZER_PATH = os.environ.get(
+        "TEST_PROFILING_TOKENIZER_PATH",
+        "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat",
+    )
     SUMMARY_LOG = "profile_summary.txt"
     RUNS_PER_CONFIG = int(os.environ.get("TEST_PROFILING_RUNS_PER_CONFIG", "3"))
     
@@ -951,6 +1040,25 @@ def main():
         },
     ]
     
+
+    # Optional: override configs from external JSON (experiment matrix)
+    cfg_json = os.environ.get('TEST_PROFILING_CONFIGS_JSON', '').strip()
+    if cfg_json:
+        with open(cfg_json, "r") as f:
+            test_configs = json.load(f)
+        if not isinstance(test_configs, list):
+            raise ValueError('TEST_PROFILING_CONFIGS_JSON must be a JSON list of dict configs')
+
+    # Optional: filter configs by a specific block_length (e.g. "64")
+    only_block = os.environ.get("TEST_PROFILING_ONLY_BLOCK", "").strip()
+    if only_block:
+        try:
+            only_block_i = int(only_block)
+        except ValueError:
+            raise ValueError(f"Invalid TEST_PROFILING_ONLY_BLOCK={only_block!r}, expected int")
+        test_configs = [cfg for cfg in test_configs if cfg.get("block_length") == only_block_i]
+        if not test_configs:
+            raise RuntimeError(f"No configs matched TEST_PROFILING_ONLY_BLOCK={only_block_i}")
     # 运行对比测试 (自动warmup + 每个配置运行3次取平均)
     results = profiler.run_comparative_test(
         prompt, 
@@ -985,7 +1093,8 @@ def main():
     
     baseline_time = results[0]['wall_time_ms']
     for result in results:
-        tokens_per_sec = len(result['tokens']) / (result['wall_time_ms'] / 1000)
+        gen_tokens = int(result.get('generated_tokens', len(result.get('tokens', []))))
+        tokens_per_sec = gen_tokens / (result['wall_time_ms'] / 1000)
         speedup = baseline_time / result['wall_time_ms']
         print(f"{result['config_name']:<30} "
               f"{result['wall_time_ms']:<15.2f} "

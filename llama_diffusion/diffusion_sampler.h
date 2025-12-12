@@ -60,6 +60,11 @@ struct SamplerTelemetry {
     double cpu_loop_ms = 0.0;
     int cpu_loop_calls = 0;
 
+    // Partial KV/logits reuse telemetry (experimental)
+    int partial_kv_attempt = 0;
+    int partial_kv_used = 0;
+    int partial_kv_fallback = 0;
+
     void reset() {
         *this = SamplerTelemetry{};
     }
@@ -146,7 +151,8 @@ public:
         const std::vector<int>& active_positions,
         std::vector<llama_token>& sampled_tokens,
         std::vector<float>& confidences,
-        std::vector<std::vector<float>>* entropy_probs_storage
+        std::vector<std::vector<float>>* entropy_probs_storage,
+        const std::vector<int>* logits_positions_override = nullptr
     );
 
     bool should_stop(const std::vector<llama_token>& tokens, size_t start_idx);
