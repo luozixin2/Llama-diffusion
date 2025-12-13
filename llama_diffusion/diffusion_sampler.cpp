@@ -1980,20 +1980,19 @@ bool DiffusionSampler::try_sample_with_gpu(
     diffusion::ProfilerTimer pack_timer;
     std::vector<float*> logits_ptrs(config_.block_length);
     // Avoid llama.cpp "invalid logits id" by checking output_ids mapping first
+    // NOTE: llama.cpp fills the out_count parameter with n_outputs (rows in packed logits buffer),
+    // which is NOT the mapping length (mapping length == batch.n_tokens).
     int out_count_host = 0;
     const int32_t* out_ids_host = llama_get_logits_output_ids(ctx_, &out_count_host);
-    if (!out_ids_host || out_count_host < config_.block_length) {
-        use_gpu_sampler_ = false;
+    if (!out_ids_host) {
         return false;
     }
     for (int i = 0; i < config_.block_length; ++i) {
         if (out_ids_host[i] < 0) {
-            use_gpu_sampler_ = false;
             return false;
         }
         float* logits = llama_get_logits_ith(ctx_, i);
         if (logits == nullptr) {
-            use_gpu_sampler_ = false;
             return false;
         }
         logits_ptrs[i] = logits;
