@@ -8,6 +8,8 @@
 #include <cassert>
 #include <stdexcept>
 #include <vector>
+#include <cstdlib>
+#include <cerrno>
 #if defined(DIFFUSION_ENABLE_CUDA)
 #include <cuda_runtime.h>
 #endif
@@ -21,8 +23,27 @@ DiffusionSampler::DiffusionSampler(llama_context* ctx, llama_model* model, const
         throw std::runtime_error("[DiffusionSampler] micro_block_size must be >0, <= block_length, and divide block_length.");
     }
 
-    std::random_device rd;
-    rng_.seed(rd());
+    auto env_u64 = [](const char* key, bool* ok_out) -> uint64_t {
+        if (ok_out) *ok_out = false;
+        const char* v = std::getenv(key);
+        if (!v || !*v) return 0;
+        errno = 0;
+        char* end = nullptr;
+        unsigned long long x = std::strtoull(v, &end, 10);
+        if (errno != 0 || end == v) return 0;
+        if (ok_out) *ok_out = true;
+        return static_cast<uint64_t>(x);
+    };
+
+    bool ok_seed = false;
+    const uint64_t seed = env_u64("DIFFUSION_SEED", &ok_seed);
+    if (ok_seed) {
+        rng_.seed(static_cast<uint32_t>(seed));
+        DIFF_LOGI("[DiffusionSampler][info] DIFFUSION_SEED=%llu\n", (unsigned long long) seed);
+    } else {
+        std::random_device rd;
+        rng_.seed(rd());
+    }
 
     reset_sampler_metrics();
 
@@ -1181,7 +1202,7 @@ void DiffusionSampler::sample_block_on_cpu(
     logits_buf.resize(static_cast<size_t>(n_vocab));
     probs_buf.resize(static_cast<size_t>(n_vocab));
 
-    int out_count = 0; // n_outputs (not used for indexing)
+    int out_count = 0; // n_outputs (packed logits rows; output_ids length == batch.n_tokens)
     const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
     for (int i = 0; i < config_.block_length; i++) {
         // Avoid llama.cpp "invalid logits id" by checking output_ids mapping first
@@ -1293,7 +1314,7 @@ void DiffusionSampler::sample_active_tokens_cpu(
     logits_buf.resize(static_cast<size_t>(n_vocab));
     probs_buf.resize(static_cast<size_t>(n_vocab));
 
-    int out_count = 0; // n_outputs
+    int out_count = 0; // n_outputs (packed logits rows; output_ids length == batch.n_tokens)
     const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
     int mapping_len = config_.block_length;
     if (logits_positions_override && !logits_positions_override->empty()) {
