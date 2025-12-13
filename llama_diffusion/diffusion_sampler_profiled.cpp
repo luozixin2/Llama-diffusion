@@ -416,12 +416,21 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                     }
                     std::vector<int> logits_override(active_count);
                     bool ok = true;
+                    // llama.cpp output_ids: batch index -> logits row (or -1 if batch.logits[i] != true)
+                    int out_count_check = 0; // n_outputs (not mapping length)
+                    const int32_t* out_ids_check = llama_get_logits_output_ids(ctx_, &out_count_check);
                     for (int i = 0; i < active_count; ++i) {
                         const int pos = active_positions[i];
                         const int li = (pos >= 0 && pos < config_.block_length) ? pos2idx[pos] : -1;
                         if (li < 0) { ok = false; break; }
                         logits_override[i] = li;
-                        if (!batch.logits[li] || llama_get_logits_ith(ctx_, li) == nullptr) { ok = false; break; }
+                        if (!batch.logits[li] ||
+                            !out_ids_check ||
+                            // output_ids mapping length == batch.n_tokens (here: decode_count)
+                            out_ids_check[li] < 0) {
+                            ok = false;
+                            break;
+                        }
                     }
 
                     if (!ok) {
@@ -529,11 +538,26 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                                 if (!sampled_partial) {
                                     std::vector<float*> logits_ptrs;
                                     logits_ptrs.reserve(static_cast<size_t>(active_count));
+                                    int out_count_host = 0; // n_outputs
+                                    const int32_t* out_ids_host = llama_get_logits_output_ids(ctx_, &out_count_host);
+                                    bool ok_host = (out_ids_host != nullptr);
                                     for (int i = 0; i < active_count; ++i) {
                                         const int li = logits_override[i];
+                                        if (!ok_host || li < 0 || li >= decode_count || out_ids_host[li] < 0) {
+                                            ok_host = false;
+                                            break;
+                                        }
                                         const float* lp = llama_get_logits_ith(ctx_, li);
+                                        if (!lp) {
+                                            ok_host = false;
+                                            break;
+                                        }
                                         logits_ptrs.push_back(const_cast<float*>(lp));
                                     }
+                                    if (!ok_host) {
+                                        ok_gpu = false;
+                                        sampled_partial = false;
+                                    } else {
                                     std::vector<llama_token> gpu_tokens;
                                     std::vector<float> gpu_confs;
                                     ok_gpu = gpu_sampler_->sample_from_scatter_ptrs(
@@ -553,6 +577,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                                         sampled_tokens_active = std::move(gpu_tokens);
                                         confidences_active = std::move(gpu_confs);
                                         sampled_partial = true;
+                                    }
                                     }
                                 }
 

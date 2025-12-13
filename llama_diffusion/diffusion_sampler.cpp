@@ -620,12 +620,22 @@ void DiffusionSampler::denoise_block(
                 }
                 std::vector<int> logits_override(active_count);
                 bool ok = true;
+                // llama.cpp output_ids: batch index -> logits row (or -1 if batch.logits[i] != true)
+                int out_count_check = 0; // note: this is n_outputs, not mapping length
+                const int32_t* out_ids_check = llama_get_logits_output_ids(ctx_, &out_count_check);
                 for (int i = 0; i < active_count; ++i) {
                     const int pos = active_positions[i];
                     const int li = (pos >= 0 && pos < config_.block_length) ? pos2idx[pos] : -1;
                     if (li < 0) { ok = false; break; }
                     logits_override[i] = li;
-                    if (!batch.logits[li] || llama_get_logits_ith(ctx_, li) == nullptr) { ok = false; break; }
+                    if (!batch.logits[li] ||
+                        !out_ids_check ||
+                        // output_ids mapping length == batch.n_tokens (here: decode_count), so li is safe to index.
+                        // out_count_check is n_outputs and can be < decode_count when only some rows request logits.
+                        out_ids_check[li] < 0) {
+                        ok = false;
+                        break;
+                    }
                 }
 
                 if (!ok) {
@@ -721,11 +731,27 @@ void DiffusionSampler::denoise_block(
                             if (!sampled_partial) {
                                 std::vector<float*> logits_ptrs;
                                 logits_ptrs.reserve(static_cast<size_t>(active_count));
+                                int out_count_host = 0; // n_outputs
+                                const int32_t* out_ids_host = llama_get_logits_output_ids(ctx_, &out_count_host);
+                                bool ok_host = (out_ids_host != nullptr);
                                 for (int i = 0; i < active_count; ++i) {
                                     const int li = logits_override[i];
+                                    // output_ids mapping length == batch.n_tokens (here: decode_count)
+                                    if (!ok_host || li < 0 || li >= decode_count || out_ids_host[li] < 0) {
+                                        ok_host = false;
+                                        break;
+                                    }
                                     const float* lp = llama_get_logits_ith(ctx_, li);
+                                    if (!lp) {
+                                        ok_host = false;
+                                        break;
+                                    }
                                     logits_ptrs.push_back(const_cast<float*>(lp));
                                 }
+                                if (!ok_host) {
+                                    ok_gpu = false;
+                                    sampled_partial = false;
+                                } else {
                                 std::vector<llama_token> gpu_tokens;
                                 std::vector<float> gpu_confs;
                                 ok_gpu = gpu_sampler_->sample_from_scatter_ptrs(
@@ -745,6 +771,7 @@ void DiffusionSampler::denoise_block(
                                     sampled_tokens_active = std::move(gpu_tokens);
                                     confidences_active = std::move(gpu_confs);
                                     sampled_partial = true;
+                                }
                                 }
                             }
 
@@ -1154,7 +1181,15 @@ void DiffusionSampler::sample_block_on_cpu(
     logits_buf.resize(static_cast<size_t>(n_vocab));
     probs_buf.resize(static_cast<size_t>(n_vocab));
 
+    int out_count = 0; // n_outputs (not used for indexing)
+    const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
     for (int i = 0; i < config_.block_length; i++) {
+        // Avoid llama.cpp "invalid logits id" by checking output_ids mapping first
+        if (!out_ids || out_ids[i] < 0) {
+            sampled_tokens[i] = config_.mask_token_id;
+            confidences[i] = 0.0f;
+            continue;
+        }
         float* logits = llama_get_logits_ith(ctx_, i);
         if (logits == nullptr) {
             sampled_tokens[i] = config_.mask_token_id;
@@ -1258,11 +1293,28 @@ void DiffusionSampler::sample_active_tokens_cpu(
     logits_buf.resize(static_cast<size_t>(n_vocab));
     probs_buf.resize(static_cast<size_t>(n_vocab));
 
+    int out_count = 0; // n_outputs
+    const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
+    int mapping_len = config_.block_length;
+    if (logits_positions_override && !logits_positions_override->empty()) {
+        int max_idx = -1;
+        for (int v : *logits_positions_override) max_idx = std::max(max_idx, v);
+        mapping_len = std::max(mapping_len, max_idx + 1);
+    }
     for (int idx = 0; idx < active_count; ++idx) {
         // llama_get_logits_ith 接受 batch 内序号，需与构造的 batch 顺序一致
         // - 默认：整块 decode，logits index == 块内位置
         // - 可选：compact decode（仅活跃 token 入 batch），logits index 由 override 提供
         const int logits_idx = logits_positions_override ? (*logits_positions_override)[idx] : active_positions[idx];
+        // Avoid llama.cpp "invalid logits id" by checking output_ids mapping first
+        if (!out_ids || logits_idx < 0 || logits_idx >= mapping_len || out_ids[logits_idx] < 0) {
+            sampled_tokens[idx] = config_.mask_token_id;
+            confidences[idx] = 0.0f;
+            if (entropy_probs_storage) {
+                entropy_probs_storage->emplace_back(static_cast<size_t>(n_vocab), 0.0f);
+            }
+            continue;
+        }
         float* logits = llama_get_logits_ith(ctx_, logits_idx);
         if (logits == nullptr) {
             sampled_tokens[idx] = config_.mask_token_id;
@@ -1906,7 +1958,18 @@ bool DiffusionSampler::try_sample_with_gpu(
     // 使用 scatter 指针，直接传递 logits 指针数组，避免 CPU 拼接拷贝
     diffusion::ProfilerTimer pack_timer;
     std::vector<float*> logits_ptrs(config_.block_length);
+    // Avoid llama.cpp "invalid logits id" by checking output_ids mapping first
+    int out_count_host = 0;
+    const int32_t* out_ids_host = llama_get_logits_output_ids(ctx_, &out_count_host);
+    if (!out_ids_host || out_count_host < config_.block_length) {
+        use_gpu_sampler_ = false;
+        return false;
+    }
     for (int i = 0; i < config_.block_length; ++i) {
+        if (out_ids_host[i] < 0) {
+            use_gpu_sampler_ = false;
+            return false;
+        }
         float* logits = llama_get_logits_ith(ctx_, i);
         if (logits == nullptr) {
             use_gpu_sampler_ = false;
