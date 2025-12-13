@@ -4,6 +4,7 @@
 #include "diffusion_types.h"
 #include "llama.h"
 #include <functional>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -64,6 +65,30 @@ struct SamplerTelemetry {
     int partial_kv_attempt = 0;
     int partial_kv_used = 0;
     int partial_kv_fallback = 0;
+
+    // Micro-block scheduling / KV reuse effectiveness telemetry (CPU+GPU)
+    // These are counters (not ms) and are used to understand why block scaling regresses.
+    int denoise_step_count = 0; // total denoising steps executed (across all blocks)
+
+    long long active_count_sum = 0;
+    int active_count_samples = 0;
+    int active_count_min = (std::numeric_limits<int>::max)();
+    int active_count_max = 0;
+
+    long long decode_count_sum = 0;
+    int decode_count_samples = 0;
+    int decode_count_min = (std::numeric_limits<int>::max)();
+    int decode_count_max = 0;
+    int decode_full_steps = 0;    // decode_count == block_length
+    int decode_partial_steps = 0; // decode_count <  block_length
+
+    int kv_rm_calls = 0;
+    int kv_rm_full_calls = 0;
+    int kv_rm_partial_calls = 0;
+    long long kv_rm_tokens = 0; // total tokens cleared via llama_memory_seq_rm
+
+    int llama_decode_calls = 0;
+    long long llama_decode_tokens = 0; // total tokens passed to llama_decode (batch.n_tokens)
 
     void reset() {
         *this = SamplerTelemetry{};

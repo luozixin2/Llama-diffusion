@@ -126,6 +126,11 @@ public:
             stats["count"] = count;
             py_profile[py::str(key)] = stats;
         };
+        auto add_count64 = [&](const char* key, long long count) {
+            py::dict stats;
+            stats["count"] = py::int_(count);
+            py_profile[py::str(key)] = stats;
+        };
         add_metric("telemetry_gpu_logit_pack", telemetry.gpu_logit_pack_ms, telemetry.gpu_logit_pack_calls);
         add_metric("telemetry_gpu_invoke", telemetry.gpu_invoke_ms, telemetry.gpu_invoke_calls);
         add_metric("telemetry_gpu_stage_prepare", telemetry.gpu_stage_prepare_ms, telemetry.gpu_success);
@@ -166,6 +171,33 @@ public:
         add_count("telemetry_gpu_fallback_compact_fail", telemetry.gpu_fallback_compact_fail);
         add_count("telemetry_gpu_fallback_device_unavail", telemetry.gpu_fallback_device_unavail);
         add_count("telemetry_gpu_sampler_unavailable", telemetry.gpu_sampler_unavailable);
+        
+        // Partial KV cache reuse telemetry
+        add_count("telemetry_partial_kv_attempt", telemetry.partial_kv_attempt);
+        add_count("telemetry_partial_kv_used", telemetry.partial_kv_used);
+        add_count("telemetry_partial_kv_fallback", telemetry.partial_kv_fallback);
+
+        // Micro-block scheduling / KV reuse effectiveness telemetry
+        add_count("telemetry_denoise_step_count", telemetry.denoise_step_count);
+        add_count("telemetry_active_count_samples", telemetry.active_count_samples);
+        add_count("telemetry_active_count_min", telemetry.active_count_samples > 0 ? telemetry.active_count_min : 0);
+        add_count("telemetry_active_count_max", telemetry.active_count_max);
+        add_count64("telemetry_active_count_sum", telemetry.active_count_sum);
+
+        add_count("telemetry_decode_count_samples", telemetry.decode_count_samples);
+        add_count("telemetry_decode_count_min", telemetry.decode_count_samples > 0 ? telemetry.decode_count_min : 0);
+        add_count("telemetry_decode_count_max", telemetry.decode_count_max);
+        add_count64("telemetry_decode_count_sum", telemetry.decode_count_sum);
+        add_count("telemetry_decode_full_steps", telemetry.decode_full_steps);
+        add_count("telemetry_decode_partial_steps", telemetry.decode_partial_steps);
+
+        add_count("telemetry_kv_rm_calls", telemetry.kv_rm_calls);
+        add_count("telemetry_kv_rm_full_calls", telemetry.kv_rm_full_calls);
+        add_count("telemetry_kv_rm_partial_calls", telemetry.kv_rm_partial_calls);
+        add_count64("telemetry_kv_rm_tokens", telemetry.kv_rm_tokens);
+
+        add_count("telemetry_llama_decode_calls", telemetry.llama_decode_calls);
+        add_count64("telemetry_llama_decode_tokens", telemetry.llama_decode_tokens);
         
         std::vector<int> int_result(result.begin(), result.end());
         return std::make_pair(int_result, py_profile);

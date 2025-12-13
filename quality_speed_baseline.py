@@ -80,22 +80,43 @@ def run_case(
     elapsed = time.perf_counter() - start
 
     # NOTE: C++ DiffusionSampler::generate() returns prompt+gen tokens.
-    # For throughput, we report generated tokens/sec (exclude prompt tokens)
-    # when the output starts with the prompt.
+    # For throughput, we report generated tokens/sec (exclude prompt tokens).
+    # Calculate actual generated tokens by extracting the generated part from decoded text.
+    # This is more accurate than counting tokens in the list, as it handles early stops correctly.
     prompt_ids = prompt_entry["prompt_ids"]
     prompt_len = len(prompt_ids)
     total_tokens = len(out_tokens)
-    if total_tokens >= prompt_len and out_tokens[:prompt_len] == prompt_ids:
-        generated_tokens = total_tokens - prompt_len
+    decoded = tokenizer.decode(out_tokens, skip_special_tokens=True)
+    
+    # Extract the generated part from decoded text
+    # Use same skip_special_tokens setting for both to ensure matching
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+    if decoded.startswith(prompt_text):
+        # Extract the generated part (after prompt)
+        generated_text = decoded[len(prompt_text):].strip()
+        # Re-encode to get accurate token count of actual generated content
+        generated_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
     else:
-        generated_tokens = total_tokens
+        # If output doesn't start with prompt, try to find "assistant" marker
+        if "assistant" in decoded.lower():
+            # Extract text after "assistant" marker
+            parts = decoded.split("assistant", 1)
+            if len(parts) > 1:
+                generated_text = parts[-1].strip()
+                generated_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
+            else:
+                # Fallback: count all tokens minus prompt
+                generated_tokens = total_tokens - prompt_len if total_tokens >= prompt_len else total_tokens
+        else:
+            # Fallback: count all tokens minus prompt
+            generated_tokens = total_tokens - prompt_len if total_tokens >= prompt_len else total_tokens
 
     gen_tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
-    decoded = tokenizer.decode(out_tokens, skip_special_tokens=True)
     return {
         "prompt_name": prompt_entry["name"],
         "block_length": block_length,
         "micro_block_size": micro_block_size,
+        "denoising_steps": denoising_steps,
         "gen_length": gen_length,
         "use_gpu_sampler": use_gpu_sampler,
         "elapsed_sec": elapsed,
@@ -114,7 +135,7 @@ def main():
     parser.add_argument("--model-path", default="/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf")
     parser.add_argument("--tokenizer-path", default="/home/lzx/SDAR/training/model/SDAR-1.7B-Chat")
     parser.add_argument("--gen-length", type=int, default=512)
-    parser.add_argument("--denoising-steps", type=int, default=4)
+    parser.add_argument("--denoising-steps", type=int, default=0, help="If 0, auto-set to block_length (b=s)")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -124,6 +145,19 @@ def main():
     parser.add_argument("--n-gpu-layers", type=int, default=35)
     parser.add_argument("--n-ctx", type=int, default=8192)
     args = parser.parse_args()
+
+    # Set optimization environment variables
+    # GPU sampler optimizations: device logits for faster GPU sampling
+    if args.use_gpu_sampler:
+        os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
+        os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
+    
+    # Skip synchronization after get_output_ids to reduce host overhead
+    os.environ.setdefault("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS", "1")
+    
+    # Enable partial KV cache reuse for better performance
+    # Note: This is only effective when conditions are met (no entropy probs, no top-k/p, no GPU sampler)
+    os.environ.setdefault("DIFFUSION_PARTIAL_KV_REUSE", "1")
 
     # Load tokenizer/model once
     print("Loading tokenizer...")
@@ -146,17 +180,22 @@ def main():
     results = []
     lines = []
     lines.append(f"LLAMA_ENABLE_DEVICE_LOGITS={os.environ.get('LLAMA_ENABLE_DEVICE_LOGITS')}")
+    lines.append(f"LLAMA_DEVICE_LOGITS_ASYNC={os.environ.get('LLAMA_DEVICE_LOGITS_ASYNC')}")
+    lines.append(f"DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS={os.environ.get('DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS')}")
+    lines.append(f"DIFFUSION_PARTIAL_KV_REUSE={os.environ.get('DIFFUSION_PARTIAL_KV_REUSE')}")
     lines.append(f"use_gpu_sampler={args.use_gpu_sampler}")
     lines.append(f"block_lengths={args.block_lengths}, micro_block_sizes={args.micro_block_sizes}, gen_length={args.gen_length}")
     lines.append("")
 
     for b in args.block_lengths:
+        # Auto-set denoising_steps to block_length if not explicitly provided
+        denoising_steps = args.denoising_steps if args.denoising_steps > 0 else b
         for m in args.micro_block_sizes:
             if b % m != 0:
                 print(f"Skip: block_length {b} not divisible by micro_block_size {m}")
                 continue
             for p in prompts:
-                print(f"\n=== Running prompt={p['name']} block={b} micro={m} ===")
+                print(f"\n=== Running prompt={p['name']} block={b} micro={m} steps={denoising_steps} ===")
                 res = run_case(
                     model=model,
                     tokenizer=tokenizer,
@@ -165,14 +204,14 @@ def main():
                     micro_block_size=m,
                     gen_length=args.gen_length,
                     use_gpu_sampler=args.use_gpu_sampler,
-                    denoising_steps=args.denoising_steps,
+                    denoising_steps=denoising_steps,
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
                 )
                 results.append(res)
                 lines.append(
-                    f"[{p['name']}] block={b} micro={m} "
+                    f"[{p['name']}] block={b} micro={m} steps={denoising_steps} "
                     f"elapsed={res['elapsed_sec']:.2f}s gen_tps={res['gen_tokens_per_sec']:.2f} "
                     f"gen={res['generated_tokens']} total={res['total_tokens']} prompt={res['prompt_tokens']}"
                 )

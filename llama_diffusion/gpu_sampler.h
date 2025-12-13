@@ -87,6 +87,21 @@ public:
         bool force_non_fused = false
     );
 
+    // Device pointer (strided) version - when logits already on GPU but rows have a stride >= vocab_size.
+    // Packs each row's first vocab_size elements into a contiguous buffer (D2D 2D copy) before sampling.
+    bool sample_from_device_ptr_strided(
+        const float* device_logits_ptr,
+        int64_t stride_tokens,
+        int num_rows,
+        RemaskingStrategy remasking_strategy,
+        std::mt19937& rng,
+        std::vector<llama_token>& sampled_tokens,
+        std::vector<float>& confidences,
+        std::vector<std::vector<float>>* token_probs,
+        Stats* stats,
+        bool force_non_fused = false
+    );
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -128,6 +143,18 @@ public:
         std::vector<float>&,
         std::vector<std::vector<float>>*,
         Stats*
+    ) { return false; }
+    bool sample_from_device_ptr_strided(
+        const float*,
+        int64_t,
+        int,
+        RemaskingStrategy,
+        std::mt19937&,
+        std::vector<llama_token>&,
+        std::vector<float>&,
+        std::vector<std::vector<float>>*,
+        Stats*,
+        bool
     ) { return false; }
 };
 

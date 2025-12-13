@@ -14,6 +14,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 # GPU 采样依赖 device logits，必须在模型创建前设置，后续即使临时 unset 也不会丢失分配。
 os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
 os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
+# 优化环境变量：跳过 get_output_ids 后的同步，减少主机端开销
+os.environ.setdefault("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS", "1")
+# 优化环境变量：启用部分 KV 缓存复用（在满足条件时生效）
+os.environ.setdefault("DIFFUSION_PARTIAL_KV_REUSE", "1")
 
 def _compute_token_counts(prompt, tokens):
     """Return (prompt_tokens, total_tokens, generated_tokens, has_prompt_prefix)."""
@@ -816,6 +820,32 @@ class DiffusionProfiler:
                 'telemetry_gpu_stage_whole_wall_ms',
                 'sampler_gpu_total_ms',
                 'sampler_gpu_overhead_ms',
+                # Active-subset GPU sampling (used by partial KV path)
+                'sampler_gpu_subset_total_ms',
+                'sampler_gpu_subset_rows',
+                'sampler_gpu_subset_active_rows',
+                'sampler_gpu_subset_device_logits',
+                # Micro-block scheduling / KV reuse effectiveness (counters)
+                'telemetry_denoise_step_count',
+                'telemetry_active_count_samples',
+                'telemetry_active_count_min',
+                'telemetry_active_count_max',
+                'telemetry_active_count_sum',
+                'telemetry_decode_count_samples',
+                'telemetry_decode_count_min',
+                'telemetry_decode_count_max',
+                'telemetry_decode_count_sum',
+                'telemetry_decode_full_steps',
+                'telemetry_decode_partial_steps',
+                'telemetry_kv_rm_calls',
+                'telemetry_kv_rm_full_calls',
+                'telemetry_kv_rm_partial_calls',
+                'telemetry_kv_rm_tokens',
+                'telemetry_llama_decode_calls',
+                'telemetry_llama_decode_tokens',
+                'telemetry_partial_kv_attempt',
+                'telemetry_partial_kv_used',
+                'telemetry_partial_kv_fallback',
             ]
             for d in export_data:
                 cfg = d.get('config', {})
@@ -906,6 +936,7 @@ def main():
             'name': 'CPU (block=4, steps=4)',
             'gen_length': 128,
             'block_length': 4,
+            'micro_block_size': 2,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
             'env_overrides': {
@@ -919,6 +950,7 @@ def main():
             'name': 'CPU (block=8, steps=8)',
             'gen_length': 128,
             'block_length': 8,
+            'micro_block_size': 2,
             'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic',
             'env_overrides': {
@@ -932,6 +964,7 @@ def main():
             'name': 'CPU (block=16, steps=16)',
             'gen_length': 128,
             'block_length': 16,
+            'micro_block_size': 2,
             'denoising_steps': 16,
             'remasking_strategy': 'low_confidence_dynamic',
             'env_overrides': {
@@ -945,6 +978,7 @@ def main():
             'name': 'CPU (block=32, steps=32)',
             'gen_length': 128,
             'block_length': 32,
+            'micro_block_size': 2,
             'denoising_steps': 32,
             'remasking_strategy': 'low_confidence_dynamic',
             'env_overrides': {
@@ -958,6 +992,7 @@ def main():
             'name': 'CPU (block=64, steps=64)',
             'gen_length': 128,
             'block_length': 64,
+            'micro_block_size': 2,
             'denoising_steps': 64,
             'remasking_strategy': 'low_confidence_dynamic',
             'env_overrides': {
@@ -972,6 +1007,7 @@ def main():
             'name': 'GPU (block=4, steps=4)',
             'gen_length': 128,
             'block_length': 4,
+            'micro_block_size': 2,
             'denoising_steps': 4,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
@@ -986,6 +1022,7 @@ def main():
             'name': 'GPU (block=8, steps=8)',
             'gen_length': 128,
             'block_length': 8,
+            'micro_block_size': 2,
             'denoising_steps': 8,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
@@ -1000,6 +1037,7 @@ def main():
             'name': 'GPU (block=16, steps=16)',
             'gen_length': 128,
             'block_length': 16,
+            'micro_block_size': 2,
             'denoising_steps': 16,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
@@ -1014,6 +1052,7 @@ def main():
             'name': 'GPU (block=32, steps=32)',
             'gen_length': 128,
             'block_length': 32,
+            'micro_block_size': 2,
             'denoising_steps': 32,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
@@ -1028,6 +1067,7 @@ def main():
             'name': 'GPU (block=64, steps=64)',
             'gen_length': 128,
             'block_length': 64,
+            'micro_block_size': 2,
             'denoising_steps': 64,
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
