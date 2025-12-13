@@ -464,11 +464,20 @@ void DiffusionSampler::denoise_block(
         }
 
         // Experimental: guarded partial KV/logits reuse
+        //
+        // Quality guard:
+        // In practice, partial-KV reuse together with GPU sampling can degrade text quality
+        // (repetition / garbled tokens) under common remasking strategies.
+        // Therefore: when GPU sampler is active, partial-KV is disabled by default unless
+        // explicitly enabled via DIFFUSION_PARTIAL_KV_REUSE_GPU=1.
         const bool env_partial_kv_reuse = env_flag("DIFFUSION_PARTIAL_KV_REUSE");
+        const bool env_partial_kv_reuse_gpu = env_flag("DIFFUSION_PARTIAL_KV_REUSE_GPU");
         const bool env_disable_partial_kv = env_flag("DIFFUSION_DISABLE_PARTIAL_KV_REUSE");
         const bool env_force_full_decode = env_flag("DIFFUSION_FORCE_FULL_BLOCK_DECODE");
+        const bool allow_partial_kv = !use_gpu_sampler_ || env_partial_kv_reuse_gpu;
         
         bool do_partial_kv = env_partial_kv_reuse
+            && allow_partial_kv
             && !env_disable_partial_kv
             && !env_force_full_decode
             && !need_entropy_probs
@@ -489,6 +498,9 @@ void DiffusionSampler::denoise_block(
                          block_start, active_count, config_.block_length, decode_count, config_.block_length);
             } else if (env_partial_kv_reuse) {
                 DIFF_LOGI("[DiffusionSampler][partial_kv] Block %d: Partial KV reuse disabled. Reasons:\n", block_start);
+                if (!allow_partial_kv) {
+                    DIFF_LOGI("  - GPU sampler is enabled; partial_kv is disabled by default (set DIFFUSION_PARTIAL_KV_REUSE_GPU=1 to allow)\n");
+                }
                 if (env_disable_partial_kv) {
                     DIFF_LOGI("  - DIFFUSION_DISABLE_PARTIAL_KV_REUSE is set\n");
                 }

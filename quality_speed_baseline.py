@@ -46,6 +46,36 @@ def build_prompts(tokenizer) -> List[Dict[str, Any]]:
     return prompts
 
 
+def _extract_assistant_text(decoded: str) -> str:
+    # Keep it simple and robust to the chat template differences.
+    if "\nassistant" in decoded:
+        return decoded.split("\nassistant", 1)[1].strip()
+    return decoded.strip()
+
+
+def _repetition_metrics(text: str) -> Dict[str, float]:
+    # Heuristic metrics: adjacent duplicate word rate + max run length.
+    words = [w for w in text.split() if w]
+    if len(words) < 2:
+        return {"dup_word_rate": 0.0, "max_dup_run": 0.0}
+
+    dup = 0
+    max_run = 1
+    run = 1
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            dup += 1
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 1
+
+    return {
+        "dup_word_rate": dup / (len(words) - 1),
+        "max_dup_run": float(max_run),
+    }
+
+
 def run_case(
     model,
     tokenizer,
@@ -87,6 +117,8 @@ def run_case(
     prompt_len = len(prompt_ids)
     total_tokens = len(out_tokens)
     decoded = tokenizer.decode(out_tokens, skip_special_tokens=True)
+    assistant_text = _extract_assistant_text(decoded)
+    rep = _repetition_metrics(assistant_text)
     
     # Extract the generated part from decoded text
     # Use same skip_special_tokens setting for both to ensure matching
@@ -126,6 +158,8 @@ def run_case(
         "tokens": total_tokens,  # backward-compat alias
         "tokens_per_sec": gen_tokens_per_sec,  # default: generated tokens/sec
         "gen_tokens_per_sec": gen_tokens_per_sec,
+        "dup_word_rate": rep["dup_word_rate"],
+        "max_dup_run": rep["max_dup_run"],
         "output_text": decoded,
     }
 
@@ -140,6 +174,9 @@ def main():
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--use-gpu-sampler", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=-1, help="If set >=0, export DIFFUSION_SEED for reproducibility")
+    parser.add_argument("--partial-kv", action="store_true", default=False, help="Enable partial-KV reuse (quality may degrade)")
+    parser.add_argument("--force-full-decode", action="store_true", default=False, help="Force full block decode (disable partial-KV)")
     parser.add_argument("--block-lengths", type=int, nargs="+", default=[4])
     parser.add_argument("--micro-block-sizes", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--n-gpu-layers", type=int, default=35)
@@ -155,9 +192,22 @@ def main():
     # Skip synchronization after get_output_ids to reduce host overhead
     os.environ.setdefault("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS", "1")
     
-    # Enable partial KV cache reuse for better performance
-    # Note: This is only effective when conditions are met (no entropy probs, no top-k/p, no GPU sampler)
-    os.environ.setdefault("DIFFUSION_PARTIAL_KV_REUSE", "1")
+    if args.seed >= 0:
+        os.environ["DIFFUSION_SEED"] = str(args.seed)
+
+    # Partial-KV reuse toggle:
+    # - Default OFF for quality stability.
+    # - When GPU sampler is enabled, partial-KV also requires DIFFUSION_PARTIAL_KV_REUSE_GPU=1.
+    if args.force_full_decode:
+        os.environ["DIFFUSION_FORCE_FULL_BLOCK_DECODE"] = "1"
+        os.environ["DIFFUSION_PARTIAL_KV_REUSE"] = "0"
+        os.environ["DIFFUSION_PARTIAL_KV_REUSE_GPU"] = "0"
+    elif args.partial_kv:
+        os.environ["DIFFUSION_PARTIAL_KV_REUSE"] = "1"
+        os.environ["DIFFUSION_PARTIAL_KV_REUSE_GPU"] = "1" if args.use_gpu_sampler else "0"
+    else:
+        os.environ["DIFFUSION_PARTIAL_KV_REUSE"] = "0"
+        os.environ["DIFFUSION_PARTIAL_KV_REUSE_GPU"] = "0"
 
     # Load tokenizer/model once
     print("Loading tokenizer...")
@@ -183,6 +233,9 @@ def main():
     lines.append(f"LLAMA_DEVICE_LOGITS_ASYNC={os.environ.get('LLAMA_DEVICE_LOGITS_ASYNC')}")
     lines.append(f"DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS={os.environ.get('DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS')}")
     lines.append(f"DIFFUSION_PARTIAL_KV_REUSE={os.environ.get('DIFFUSION_PARTIAL_KV_REUSE')}")
+    lines.append(f"DIFFUSION_PARTIAL_KV_REUSE_GPU={os.environ.get('DIFFUSION_PARTIAL_KV_REUSE_GPU')}")
+    lines.append(f"DIFFUSION_FORCE_FULL_BLOCK_DECODE={os.environ.get('DIFFUSION_FORCE_FULL_BLOCK_DECODE')}")
+    lines.append(f"DIFFUSION_SEED={os.environ.get('DIFFUSION_SEED')}")
     lines.append(f"use_gpu_sampler={args.use_gpu_sampler}")
     lines.append(f"block_lengths={args.block_lengths}, micro_block_sizes={args.micro_block_sizes}, gen_length={args.gen_length}")
     lines.append("")
@@ -213,7 +266,8 @@ def main():
                 lines.append(
                     f"[{p['name']}] block={b} micro={m} steps={denoising_steps} "
                     f"elapsed={res['elapsed_sec']:.2f}s gen_tps={res['gen_tokens_per_sec']:.2f} "
-                    f"gen={res['generated_tokens']} total={res['total_tokens']} prompt={res['prompt_tokens']}"
+                    f"gen={res['generated_tokens']} total={res['total_tokens']} prompt={res['prompt_tokens']} "
+                    f"dup_rate={res['dup_word_rate']:.3f} max_run={int(res['max_dup_run'])}"
                 )
                 lines.append(res["output_text"])
                 lines.append("")
