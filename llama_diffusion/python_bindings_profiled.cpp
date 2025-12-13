@@ -100,6 +100,18 @@ public:
             py_profile[py::str(outer.first)] = inner_dict;
         }
         // Append custom metrics (record_custom)
+        //
+        // NOTE: record_custom is used for both time (ms) and counters (rows/hits/etc).
+        // For backward-compat with existing exporters:
+        // - If the metric name ends with "_ms", export as {"total_ms","avg_ms","call_count"}.
+        // - Otherwise export as {"count","avg","call_count"} so downstream code does not
+        //   accidentally interpret it as milliseconds.
+        auto ends_with = [](const std::string& s, const char* suffix) -> bool {
+            const size_t n = s.size();
+            const size_t m = std::strlen(suffix);
+            if (n < m) return false;
+            return std::memcmp(s.data() + (n - m), suffix, m) == 0;
+        };
         for (const auto& kv : custom_metrics) {
             const auto& name = kv.first;
             const auto& values = kv.second;
@@ -107,8 +119,13 @@ public:
             for (double v : values) total += v;
             double avg = values.empty() ? 0.0 : total / values.size();
             py::dict stats;
-            stats["total_ms"] = total;
-            stats["avg_ms"] = avg;
+            if (ends_with(name, "_ms")) {
+                stats["total_ms"] = total;
+                stats["avg_ms"] = avg;
+            } else {
+                stats["count"] = total;
+                stats["avg"] = avg;
+            }
             stats["call_count"] = static_cast<int>(values.size());
             py_profile[py::str(name)] = stats;
         }
