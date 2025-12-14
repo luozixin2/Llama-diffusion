@@ -414,6 +414,17 @@ void DiffusionSampler::denoise_block(
         }
     }
 
+    // Track which positions have ever been generated (were masked at least once),
+    // and keep the last confidence for those positions. This allows quality-friendly
+    // freeze gating (avoid freezing noisy tokens too early).
+    std::vector<char> ever_masked(static_cast<size_t>(config_.block_length), 0);
+    std::vector<float> last_confidences(static_cast<size_t>(config_.block_length), INFINITY);
+    for (int i = 0; i < config_.block_length; ++i) {
+        if (current_block[i] == config_.mask_token_id) {
+            ever_masked[static_cast<size_t>(i)] = 1;
+        }
+    }
+
     // Micro-freeze scheduling:
     // - Once a micro has no masks, it is considered "done" and we can stop requesting logits for it.
     // - Defaults are ON (when env var is absent) to match the intended scheduling behavior.
@@ -431,10 +442,69 @@ void DiffusionSampler::denoise_block(
     };
     const bool freeze_done_micro = env_flag_default_true("DIFFUSION_FREEZE_DONE_MICRO");
     const bool done_micro_no_logits = env_flag_default_true("DIFFUSION_DONE_MICRO_NO_LOGITS");
+    // Require a micro-block to stay mask-free for N consecutive steps before freezing it.
+    // This reduces the chance of locking in early garbage tokens when micro size is small.
+    const int freeze_stable_steps = ([]() -> int {
+        const char * v = std::getenv("DIFFUSION_FREEZE_DONE_MICRO_STABLE_STEPS");
+        if (!v || v[0] == '\0') return 2; // quality-friendly default
+        const int x = std::atoi(v);
+        return x < 0 ? 0 : x;
+    })();
+    const bool freeze_causal = env_flag_default_true("DIFFUSION_FREEZE_DONE_MICRO_CAUSAL");
+    const int freeze_max_per_step = ([]() -> int {
+        const char * v = std::getenv("DIFFUSION_FREEZE_DONE_MICRO_MAX_PER_STEP");
+        if (!v || v[0] == '\0') return 1; // conservative default: freeze gradually
+        const int x = std::atoi(v);
+        return x <= 0 ? 1 : x;
+    })();
+    const float freeze_min_conf = ([]() -> float {
+        const char * v = std::getenv("DIFFUSION_FREEZE_DONE_MICRO_MIN_CONF");
+        if (!v || v[0] == '\0') return 0.0f; // 0 disables confidence gating
+        char * end = nullptr;
+        const float x = std::strtof(v, &end);
+        if (end == v) return 0.0f;
+        return x;
+    })();
     std::vector<char> frozen_micros(static_cast<size_t>(micro_count), 0);
+    std::vector<int> done_stable(static_cast<size_t>(micro_count), 0);
     if (freeze_done_micro) {
         for (int m = 0; m < micro_count; ++m) {
-            if (masks_per_micro[m] == 0) frozen_micros[static_cast<size_t>(m)] = 1;
+            if (masks_per_micro[m] == 0) {
+                done_stable[static_cast<size_t>(m)] = 1;
+            }
+        }
+        // Apply initial freezing (typically only prefix micros that are already unmasked).
+        // Note: confidence gating only applies to ever-masked positions; prompt tokens are treated as stable.
+        auto micro_conf_ok = [&](int m) -> bool {
+            if (freeze_min_conf <= 0.0f) return true;
+            const int start = m * micro_size;
+            const int end = std::min(config_.block_length, start + micro_size);
+            for (int p = start; p < end; ++p) {
+                const size_t pi = static_cast<size_t>(p);
+                if (ever_masked[pi] && last_confidences[pi] < freeze_min_conf) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (freeze_stable_steps <= 1) {
+            if (freeze_causal) {
+                int frozen_now = 0;
+                for (int m = 0; m < micro_count && frozen_now < freeze_max_per_step; ++m) {
+                    const size_t mi = static_cast<size_t>(m);
+                    if (masks_per_micro[m] != 0) break;
+                    if (!micro_conf_ok(m)) break;
+                    frozen_micros[mi] = 1;
+                    frozen_now++;
+                }
+            } else {
+                for (int m = 0; m < micro_count; ++m) {
+                    const size_t mi = static_cast<size_t>(m);
+                    if (masks_per_micro[m] == 0 && micro_conf_ok(m)) {
+                        frozen_micros[mi] = 1;
+                    }
+                }
+            }
         }
     }
 
@@ -1140,9 +1210,6 @@ void DiffusionSampler::denoise_block(
                         llama_batch_free(batch);
                         throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampler 不可用或执行失败，已禁止回退到 host logits。");
                     }
-                    if (device_logits_env) {
-                        DIFF_LOGW("[DiffusionSampler][warn] device logits 启用但 GPU 采样未命中，回退 CPU 采样，可能触发 host/device 混用。\n");
-                    }
                 }
             }
 
@@ -1173,6 +1240,8 @@ void DiffusionSampler::denoise_block(
         for (int i = 0; i < active_count; ++i) {
             const int pos = active_positions[i];
             block_confidences[pos] = confidences_active[i];
+            last_confidences[static_cast<size_t>(pos)] = confidences_active[i];
+            ever_masked[static_cast<size_t>(pos)] = 1;
             if (need_entropy_probs && i < static_cast<int>(entropy_active.size())) {
                 entropy_probs_full[pos] = std::move(entropy_active[i]);
             }
@@ -1231,10 +1300,61 @@ void DiffusionSampler::denoise_block(
         }
         dirty_micros.swap(next_dirty);
 
-        // Update frozen micros after mask updates (monotonic: once frozen, always frozen).
+        // Update frozen micros after mask updates.
+        // Quality guard: require (a) N consecutive steps without masks, (b) optional confidence threshold,
+        // and (c) optional causal prefix-freeze (only freeze from front to back).
         if (freeze_done_micro) {
+            auto micro_conf_ok = [&](int m) -> bool {
+                if (freeze_min_conf <= 0.0f) return true;
+                const int start = m * micro_size;
+                const int end = std::min(config_.block_length, start + micro_size);
+                for (int p = start; p < end; ++p) {
+                    const size_t pi = static_cast<size_t>(p);
+                    if (ever_masked[pi] && last_confidences[pi] < freeze_min_conf) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            // Update stability counters
             for (int m = 0; m < micro_count; ++m) {
-                if (masks_per_micro[m] == 0) frozen_micros[static_cast<size_t>(m)] = 1;
+                const size_t mi = static_cast<size_t>(m);
+                if (frozen_micros[mi]) continue;
+                if (masks_per_micro[m] == 0 && micro_conf_ok(m)) {
+                    done_stable[mi] += 1;
+                } else {
+                    done_stable[mi] = 0;
+                }
+            }
+
+            // Freeze eligible micros
+            if (freeze_stable_steps <= 0) {
+                // disabled
+            } else if (freeze_causal) {
+                int frontier = 0;
+                while (frontier < micro_count && frozen_micros[static_cast<size_t>(frontier)]) {
+                    frontier++;
+                }
+                int frozen_this_step = 0;
+                for (int m = frontier; m < micro_count && frozen_this_step < freeze_max_per_step; ++m) {
+                    const size_t mi = static_cast<size_t>(m);
+                    if (frozen_micros[mi]) continue;
+                    if (masks_per_micro[m] != 0) break;
+                    if (done_stable[mi] < freeze_stable_steps) break;
+                    if (!micro_conf_ok(m)) break;
+                    frozen_micros[mi] = 1;
+                    frozen_this_step++;
+                }
+            } else {
+                for (int m = 0; m < micro_count; ++m) {
+                    const size_t mi = static_cast<size_t>(m);
+                    if (frozen_micros[mi]) continue;
+                    if (masks_per_micro[m] != 0) continue;
+                    if (done_stable[mi] < freeze_stable_steps) continue;
+                    if (!micro_conf_ok(m)) continue;
+                    frozen_micros[mi] = 1;
+                }
             }
         }
 
@@ -1434,8 +1554,9 @@ bool DiffusionSampler::sample_block_tokens(
         throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampler 不可用或执行失败，已禁止回退到 host logits。");
     }
 
-    // 设备 logits 模式下回退 CPU，打印告警
-    if (device_logits_env) {
+    // 只有在“本来允许 GPU 采样且启用了 GPU sampler”时，才把 CPU 回退视为异常并打印告警；
+    // 否则（例如用户显式走 CPU 路径）LLAMA_ENABLE_DEVICE_LOGITS 可能仍为 1，这不应刷屏告警。
+    if (device_logits_env && allow_gpu_sampling && use_gpu_sampler_) {
         DIFF_LOGW("[DiffusionSampler][warn] device logits 启用但 GPU 采样未命中，回退 CPU 采样，可能触发 host/device 混用。\n");
     }
 
@@ -1757,9 +1878,9 @@ bool DiffusionSampler::try_sample_with_gpu(
     }
 
     // Experimental: device logits path (CUDA only, when enabled upstream)
-    // NOTE: Syncing here improves correctness in async mode, but can be very expensive.
-    // We gate it behind DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS=0 (quality-first mode).
-    if (device_logits_env && !skip_sync_after_output_ids) {
+    // NOTE: Only async device-logits needs a synchronize for correctness; doing it in sync mode wastes time badly.
+    // We additionally gate it behind DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS=0 (quality-first mode).
+    if (device_logits_env && device_logits_async && !skip_sync_after_output_ids) {
         diffusion::ProfilerTimer sync_before_get_device_timer;
         llama_synchronize(ctx_);
         host_pre_sync_before_get_device_ms = sync_before_get_device_timer.elapsed_ms();

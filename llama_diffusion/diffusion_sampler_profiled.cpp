@@ -158,6 +158,14 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
         }
     }
 
+    std::vector<char> ever_masked(static_cast<size_t>(config_.block_length), 0);
+    std::vector<float> last_confidences(static_cast<size_t>(config_.block_length), INFINITY);
+    for (int i = 0; i < config_.block_length; ++i) {
+        if (current_block[i] == config_.mask_token_id) {
+            ever_masked[static_cast<size_t>(i)] = 1;
+        }
+    }
+
     // Micro-freeze scheduling (defaults ON):
     // - Once a micro has no masks, it is considered "done" and we can stop requesting logits for it.
     auto env_flag = [](const char* key) {
@@ -174,10 +182,65 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
     };
     const bool freeze_done_micro = env_flag_default_true("DIFFUSION_FREEZE_DONE_MICRO");
     const bool done_micro_no_logits = env_flag_default_true("DIFFUSION_DONE_MICRO_NO_LOGITS");
+    const int freeze_stable_steps = ([]() -> int {
+        const char * v = std::getenv("DIFFUSION_FREEZE_DONE_MICRO_STABLE_STEPS");
+        if (!v || v[0] == '\0') return 2;
+        const int x = std::atoi(v);
+        return x < 0 ? 0 : x;
+    })();
+    const bool freeze_causal = env_flag_default_true("DIFFUSION_FREEZE_DONE_MICRO_CAUSAL");
+    const int freeze_max_per_step = ([]() -> int {
+        const char * v = std::getenv("DIFFUSION_FREEZE_DONE_MICRO_MAX_PER_STEP");
+        if (!v || v[0] == '\0') return 1;
+        const int x = std::atoi(v);
+        return x <= 0 ? 1 : x;
+    })();
+    const float freeze_min_conf = ([]() -> float {
+        const char * v = std::getenv("DIFFUSION_FREEZE_DONE_MICRO_MIN_CONF");
+        if (!v || v[0] == '\0') return 0.0f;
+        char * end = nullptr;
+        const float x = std::strtof(v, &end);
+        if (end == v) return 0.0f;
+        return x;
+    })();
     std::vector<char> frozen_micros(static_cast<size_t>(micro_count), 0);
+    std::vector<int> done_stable(static_cast<size_t>(micro_count), 0);
     if (freeze_done_micro) {
         for (int m = 0; m < micro_count; ++m) {
-            if (masks_per_micro[m] == 0) frozen_micros[static_cast<size_t>(m)] = 1;
+            if (masks_per_micro[m] == 0) {
+                done_stable[static_cast<size_t>(m)] = 1;
+            }
+        }
+        auto micro_conf_ok = [&](int m) -> bool {
+            if (freeze_min_conf <= 0.0f) return true;
+            const int start = m * micro_size;
+            const int end = std::min(config_.block_length, start + micro_size);
+            for (int p = start; p < end; ++p) {
+                const size_t pi = static_cast<size_t>(p);
+                if (ever_masked[pi] && last_confidences[pi] < freeze_min_conf) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (freeze_stable_steps <= 1) {
+            if (freeze_causal) {
+                int frozen_now = 0;
+                for (int m = 0; m < micro_count && frozen_now < freeze_max_per_step; ++m) {
+                    const size_t mi = static_cast<size_t>(m);
+                    if (masks_per_micro[m] != 0) break;
+                    if (!micro_conf_ok(m)) break;
+                    frozen_micros[mi] = 1;
+                    frozen_now++;
+                }
+            } else {
+                for (int m = 0; m < micro_count; ++m) {
+                    const size_t mi = static_cast<size_t>(m);
+                    if (masks_per_micro[m] == 0 && micro_conf_ok(m)) {
+                        frozen_micros[mi] = 1;
+                    }
+                }
+            }
         }
     }
 
@@ -725,14 +788,14 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                             const bool device_logits_async = env_flag("LLAMA_DEVICE_LOGITS_ASYNC");
                             const bool skip_sync_after_output_ids = env_flag("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS");
                             int64_t stride_tokens = 0;
-                            if (device_logits_env_local && !skip_sync_after_output_ids) {
+                            if (device_logits_env_local && device_logits_async && !skip_sync_after_output_ids) {
                                 llama_synchronize(ctx_);
                             }
                             const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
                             int out_count = 0;
                             const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
 #if defined(DIFFUSION_ENABLE_CUDA)
-                            if (device_logits_env_local && !skip_sync_after_output_ids) {
+                            if (device_logits_env_local && device_logits_async && !skip_sync_after_output_ids) {
                                 cudaDeviceSynchronize();
                             } else if (device_logits_env_local && device_logits_async && skip_sync_after_output_ids) {
                                 // Skip-sync is an experimental perf knob; may degrade quality if logits are not ready.
@@ -862,7 +925,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                             llama_batch_free(batch);
                             throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampler 不可用或执行失败，已禁止回退到 host logits。");
                         }
-                        if (device_logits_env) {
+                        if (device_logits_env && allow_gpu_sampling && use_gpu_sampler_) {
                             DIFF_LOGW("[DiffusionSampler][warn] device logits 启用但 GPU 采样未命中，回退 CPU 采样，可能触发 host/device 混用。\n");
                         }
                     }
@@ -896,6 +959,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
         for (int i = 0; i < active_count; ++i) {
             const int pos = active_positions[i];
             block_confidences[pos] = confidences_active[i];
+            last_confidences[static_cast<size_t>(pos)] = confidences_active[i];
+            ever_masked[static_cast<size_t>(pos)] = 1;
             if (need_entropy_probs && i < static_cast<int>(entropy_active.size())) {
                 entropy_probs_full[pos] = std::move(entropy_active[i]);
             }
@@ -958,10 +1023,57 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
             }
             dirty_micros.swap(next_dirty);
 
-            // Update frozen micros after mask updates (monotonic).
+            // Update frozen micros after mask updates.
             if (freeze_done_micro) {
+                auto micro_conf_ok = [&](int m) -> bool {
+                    if (freeze_min_conf <= 0.0f) return true;
+                    const int start = m * micro_size;
+                    const int end = std::min(config_.block_length, start + micro_size);
+                    for (int p = start; p < end; ++p) {
+                        const size_t pi = static_cast<size_t>(p);
+                        if (ever_masked[pi] && last_confidences[pi] < freeze_min_conf) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
                 for (int m = 0; m < micro_count; ++m) {
-                    if (masks_per_micro[m] == 0) frozen_micros[static_cast<size_t>(m)] = 1;
+                    const size_t mi = static_cast<size_t>(m);
+                    if (frozen_micros[mi]) continue;
+                    if (masks_per_micro[m] == 0 && micro_conf_ok(m)) {
+                        done_stable[mi] += 1;
+                    } else {
+                        done_stable[mi] = 0;
+                    }
+                }
+
+                if (freeze_stable_steps <= 0) {
+                    // disabled
+                } else if (freeze_causal) {
+                    int frontier = 0;
+                    while (frontier < micro_count && frozen_micros[static_cast<size_t>(frontier)]) {
+                        frontier++;
+                    }
+                    int frozen_this_step = 0;
+                    for (int m = frontier; m < micro_count && frozen_this_step < freeze_max_per_step; ++m) {
+                        const size_t mi = static_cast<size_t>(m);
+                        if (frozen_micros[mi]) continue;
+                        if (masks_per_micro[m] != 0) break;
+                        if (done_stable[mi] < freeze_stable_steps) break;
+                        if (!micro_conf_ok(m)) break;
+                        frozen_micros[mi] = 1;
+                        frozen_this_step++;
+                    }
+                } else {
+                    for (int m = 0; m < micro_count; ++m) {
+                        const size_t mi = static_cast<size_t>(m);
+                        if (frozen_micros[mi]) continue;
+                        if (masks_per_micro[m] != 0) continue;
+                        if (done_stable[mi] < freeze_stable_steps) continue;
+                        if (!micro_conf_ok(m)) continue;
+                        frozen_micros[mi] = 1;
+                    }
                 }
             }
         }

@@ -44,3 +44,6 @@ concurrent_throughput_results.json
 ANDROID_IMPROVEMENTS.md
 CONCURRENT_THROUGHPUT_TEST_SUMMARY.md
 OPTIMIZATION_REPORT.md
+
+# Local analysis notes (do not track)
+KV_CACHE_REUSE_ANALYSIS.md

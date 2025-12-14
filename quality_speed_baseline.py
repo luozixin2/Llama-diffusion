@@ -52,6 +52,24 @@ def _extract_assistant_text(decoded: str) -> str:
         return decoded.split("\nassistant", 1)[1].strip()
     return decoded.strip()
 
+def _filter_token_id(token_ids: List[int], token_id: int | None) -> List[int]:
+    if token_id is None:
+        return token_ids
+    return [t for t in token_ids if t != token_id]
+
+def _clean_generated_text(text: str) -> str:
+    # Remove common control tokens and diffusion masks for readability.
+    for t in (
+        "<|MASK|>",
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "</s>",
+        "<s>",
+    ):
+        text = text.replace(t, "")
+    return text.strip()
+
 
 def _repetition_metrics(text: str) -> Dict[str, float]:
     # Heuristic metrics: adjacent duplicate word rate + max run length.
@@ -88,8 +106,19 @@ def run_case(
     temperature: float,
     top_k: int,
     top_p: float,
+    confidence_threshold: float,
+    repetition_penalty: float,
+    remasking_strategy: str,
 ) -> Dict[str, Any]:
-    mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+    # NOTE:
+    # Diffusion generation returns prompt+gen tokens. For correctness, we should always slice by token length
+    # rather than attempting to align via decoded text (chat templates + skip_special_tokens can break that).
+    mask_id = tokenizer.convert_tokens_to_ids(getattr(tokenizer, "mask_token", None))
+    if mask_id is None or mask_id < 0:
+        raise RuntimeError(
+            "Tokenizer does not define a valid mask_token. "
+            "Please pass a tokenizer that contains the diffusion mask token (e.g. <|MASK|>)."
+        )
     eos_id = tokenizer.eos_token_id
 
     start = time.perf_counter()
@@ -103,45 +132,29 @@ def run_case(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        remasking_strategy="low_confidence_dynamic",
-        stop_token_ids=[eos_id],
+        remasking_strategy=remasking_strategy,
+        confidence_threshold=confidence_threshold,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=[eos_id] if os.environ.get("DIFFUSION_USE_STOP_EOS", "0") in ("1", "true", "True") else [],
         use_gpu_sampler=use_gpu_sampler,
     )
     elapsed = time.perf_counter() - start
 
-    # NOTE: C++ DiffusionSampler::generate() returns prompt+gen tokens.
-    # For throughput, we report generated tokens/sec (exclude prompt tokens).
-    # Calculate actual generated tokens by extracting the generated part from decoded text.
-    # This is more accurate than counting tokens in the list, as it handles early stops correctly.
     prompt_ids = prompt_entry["prompt_ids"]
     prompt_len = len(prompt_ids)
     total_tokens = len(out_tokens)
-    decoded = tokenizer.decode(out_tokens, skip_special_tokens=True)
-    assistant_text = _extract_assistant_text(decoded)
+
+    # Token-accurate generated part (do NOT truncate at EOS: diffusion may place EOS-like tokens transiently).
+    gen_tokens_list = out_tokens[prompt_len:] if total_tokens >= prompt_len else out_tokens
+    generated_tokens = len(gen_tokens_list)
+
+    # Decode WITHOUT dropping special tokens; we can post-filter known control tokens.
+    decoded_full = tokenizer.decode(out_tokens, skip_special_tokens=False)
+    # For readability, filter out EOS token id (if any) but keep the rest.
+    decoded_gen = tokenizer.decode(_filter_token_id(gen_tokens_list, eos_id), skip_special_tokens=False)
+    decoded_gen_clean = _clean_generated_text(decoded_gen)
+    assistant_text = decoded_gen_clean
     rep = _repetition_metrics(assistant_text)
-    
-    # Extract the generated part from decoded text
-    # Use same skip_special_tokens setting for both to ensure matching
-    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
-    if decoded.startswith(prompt_text):
-        # Extract the generated part (after prompt)
-        generated_text = decoded[len(prompt_text):].strip()
-        # Re-encode to get accurate token count of actual generated content
-        generated_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
-    else:
-        # If output doesn't start with prompt, try to find "assistant" marker
-        if "assistant" in decoded.lower():
-            # Extract text after "assistant" marker
-            parts = decoded.split("assistant", 1)
-            if len(parts) > 1:
-                generated_text = parts[-1].strip()
-                generated_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
-            else:
-                # Fallback: count all tokens minus prompt
-                generated_tokens = total_tokens - prompt_len if total_tokens >= prompt_len else total_tokens
-        else:
-            # Fallback: count all tokens minus prompt
-            generated_tokens = total_tokens - prompt_len if total_tokens >= prompt_len else total_tokens
 
     gen_tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
     return {
@@ -160,7 +173,10 @@ def run_case(
         "gen_tokens_per_sec": gen_tokens_per_sec,
         "dup_word_rate": rep["dup_word_rate"],
         "max_dup_run": rep["max_dup_run"],
-        "output_text": decoded,
+        # Print-friendly view first; keep debug fields for inspection.
+        "output_text": decoded_gen_clean,
+        "output_text_debug_full": decoded_full,
+        "output_text_debug_gen": decoded_gen,
     }
 
 
@@ -169,10 +185,18 @@ def main():
     parser.add_argument("--model-path", default="/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf")
     parser.add_argument("--tokenizer-path", default="/home/lzx/SDAR/training/model/SDAR-1.7B-Chat")
     parser.add_argument("--gen-length", type=int, default=512)
-    parser.add_argument("--denoising-steps", type=int, default=0, help="If 0, auto-set to block_length (b=s)")
+    parser.add_argument("--denoising-steps", type=int, default=0, help="If 0, auto-set to min(block_length, 8)")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--confidence-threshold", type=float, default=0.85)
+    parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument(
+        "--remasking-strategy",
+        type=str,
+        default="low_confidence_dynamic",
+        choices=["sequential", "low_confidence_static", "low_confidence_dynamic", "entropy_bounded"],
+    )
     parser.add_argument("--use-gpu-sampler", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=-1, help="If set >=0, export DIFFUSION_SEED for reproducibility")
     parser.add_argument("--partial-kv", action="store_true", default=False, help="Enable partial-KV reuse (quality may degrade)")
@@ -181,6 +205,12 @@ def main():
     parser.add_argument("--micro-block-sizes", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--n-gpu-layers", type=int, default=35)
     parser.add_argument("--n-ctx", type=int, default=8192)
+    parser.add_argument("--use-stop-eos", action="store_true", default=False,
+                        help="Enable EOS early stop (not recommended for diffusion; can stop too early)")
+    parser.add_argument("--freeze-done-micro", action="store_true", default=False,
+                        help="Enable freezing finished micro-blocks (perf feature; can hurt quality for small micro sizes)")
+    parser.add_argument("--done-micro-no-logits", action="store_true", default=False,
+                        help="When freezing is enabled, do not request logits for frozen micro-blocks (max perf; may hurt quality)")
     args = parser.parse_args()
 
     # Set optimization environment variables
@@ -196,6 +226,11 @@ def main():
     
     if args.seed >= 0:
         os.environ["DIFFUSION_SEED"] = str(args.seed)
+    os.environ["DIFFUSION_USE_STOP_EOS"] = "1" if args.use_stop_eos else "0"
+
+    # Quality-first defaults: keep micro-freeze OFF unless explicitly requested.
+    os.environ["DIFFUSION_FREEZE_DONE_MICRO"] = "1" if args.freeze_done_micro else "0"
+    os.environ["DIFFUSION_DONE_MICRO_NO_LOGITS"] = "1" if args.done_micro_no_logits else "0"
 
     # Partial-KV reuse toggle:
     # - Default OFF for quality stability.
@@ -243,8 +278,8 @@ def main():
     lines.append("")
 
     for b in args.block_lengths:
-        # Auto-set denoising_steps to block_length if not explicitly provided
-        denoising_steps = args.denoising_steps if args.denoising_steps > 0 else b
+        # Auto-set denoising_steps to a quality-friendly default if not explicitly provided
+        denoising_steps = args.denoising_steps if args.denoising_steps > 0 else min(b, 8)
         for m in args.micro_block_sizes:
             if b % m != 0:
                 print(f"Skip: block_length {b} not divisible by micro_block_size {m}")
@@ -263,6 +298,9 @@ def main():
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
+                    confidence_threshold=args.confidence_threshold,
+                    repetition_penalty=args.repetition_penalty,
+                    remasking_strategy=args.remasking_strategy,
                 )
                 results.append(res)
                 lines.append(

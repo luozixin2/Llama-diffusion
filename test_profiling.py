@@ -8,16 +8,76 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import copy
 
-# 默认锁定到单卡，避免 llama.cpp 多卡流水线在 profiling 下偶发崩溃（exit 139）。
-# 如需自行控制显卡，可在外部预先设置 CUDA_VISIBLE_DEVICES 再运行脚本。
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-# GPU 采样依赖 device logits，必须在模型创建前设置，后续即使临时 unset 也不会丢失分配。
-os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
-os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
-# 优化环境变量：跳过 get_output_ids 后的同步，减少主机端开销
-os.environ.setdefault("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS", "1")
-# 优化环境变量：启用部分 KV 缓存复用（在满足条件时生效）
-os.environ.setdefault("DIFFUSION_PARTIAL_KV_REUSE", "1")
+def _maybe_autopick_cuda_visible_devices() -> None:
+    """If CUDA_VISIBLE_DEVICES is unset, pick the GPU with the most free memory.
+
+    This reduces flaky OOM when other jobs occupy GPU0.
+    """
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+        return
+    if os.environ.get("TEST_PROFILING_AUTO_PICK_GPU", "1").lower() not in ("1", "true", "yes"):
+        return
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+        best_idx = None
+        best_free = -1
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 2:
+                continue
+            idx = int(parts[0])
+            free = int(parts[1])
+            if free > best_free:
+                best_free = free
+                best_idx = idx
+        if best_idx is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(best_idx)
+            print(f"[test_profiling] Auto-picked CUDA_VISIBLE_DEVICES={best_idx} (free={best_free} MiB)")
+    except Exception as e:
+        print(f"[test_profiling][warn] failed to auto-pick GPU via nvidia-smi: {e}")
+
+
+def _clean_generated_text(text: str) -> str:
+    # Keep consistent with quality_speed_baseline.py
+    for t in (
+        "<|MASK|>",
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "</s>",
+        "<s>",
+    ):
+        text = text.replace(t, "")
+    return text.strip()
+
+
+def _repetition_metrics(text: str) -> Dict[str, float]:
+    # Keep consistent with quality_speed_baseline.py
+    words = [w for w in text.split() if w]
+    if len(words) < 2:
+        return {"dup_word_rate": 0.0, "max_dup_run": 0.0}
+    dup = 0
+    max_run = 1
+    run = 1
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            dup += 1
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 1
+    return {"dup_word_rate": dup / (len(words) - 1), "max_dup_run": float(max_run)}
 
 def _compute_token_counts(prompt, tokens):
     """Return (prompt_tokens, total_tokens, generated_tokens, has_prompt_prefix)."""
@@ -902,217 +962,335 @@ class DiffusionProfiler:
 
 
 def main():
-    """示例测试"""
-    # 配置
-    # Allow overriding paths via env (useful when models live outside /home).
-    MODEL_PATH = os.environ.get(
-        "TEST_PROFILING_MODEL_PATH",
-        "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat/SDAR-1.7B-Chat-F16.gguf",
+    """按“统一 b64 模型 + 自动选择最快 micro + 15 配置矩阵”运行 profiling。"""
+
+    def _find_first_gguf(dir_path: str) -> str:
+        try:
+            for name in sorted(os.listdir(dir_path)):
+                if name.endswith(".gguf"):
+                    return os.path.join(dir_path, name)
+        except Exception:
+            return ""
+        return ""
+
+    # 1) 统一使用 b64 模型（它支持 1~64 的全部块长）
+    MODEL_DIR_B64 = os.environ.get(
+        "TEST_PROFILING_MODEL_DIR",
+        "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat-b64",
     )
-    TOKENIZER_PATH = os.environ.get(
-        "TEST_PROFILING_TOKENIZER_PATH",
-        "/home/lzx/SDAR/training/model/SDAR-1.7B-Chat",
-    )
+    MODEL_PATH = os.environ.get("TEST_PROFILING_MODEL_PATH", "").strip()
+    if not MODEL_PATH:
+        MODEL_PATH = _find_first_gguf(MODEL_DIR_B64)
+    if not MODEL_PATH:
+        raise RuntimeError(
+            "No b64 GGUF model found.\n"
+            "Please set TEST_PROFILING_MODEL_PATH to a .gguf, "
+            "or place a .gguf under TEST_PROFILING_MODEL_DIR (default: /home/lzx/SDAR/training/model/SDAR-1.7B-Chat-b64)."
+        )
+
+    TOKENIZER_PATH = os.environ.get("TEST_PROFILING_TOKENIZER_PATH", "").strip() or MODEL_DIR_B64
+
     SUMMARY_LOG = "profile_summary.txt"
     RUNS_PER_CONFIG = int(os.environ.get("TEST_PROFILING_RUNS_PER_CONFIG", "3"))
-    
-    # 加载tokenizer获取真实的prompt
+
+    # 2) 在构造模型前准备环境变量（device logits 必须提前开启）
+    _maybe_autopick_cuda_visible_devices()
+    os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
+    os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", os.environ.get("TEST_PROFILING_DEVICE_LOGITS_ASYNC", "0"))
+
+    # 3) tokenizer / prompt
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
     MASK_TOKEN_ID = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-    
-    # 使用真实的prompt
-    messages = [{"role": "user", "content": "写一个关于一个机器人第一次发现音乐的短篇故事。"}]
-    prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
-    
-    # 初始化 profiler
-    profiler = DiffusionProfiler(MODEL_PATH, n_ctx=8192, n_gpu_layers=35)
-    
-    # 定义测试配置（仅包含质量过关的配置）
-    # Allow tweaking strict GPU-only mode / device-logits async for debugging or CI stability.
+
+    def _encode_chat(user_text: str) -> List[int]:
+        msgs = [{"role": "user", "content": user_text}]
+        txt = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        return tokenizer.encode(txt, add_special_tokens=False)
+
+    # Primary profiling prompt (keep fixed to control variables)
+    prompt = _encode_chat("Write a short story about a robot discovering music for the first time.")
+
+    # Micro-sweep quality gate prompts: two different prompts, take worst-case repetition signal.
+    micro_sweep_prompts = [
+        _encode_chat("Write a short story about a robot discovering music for the first time."),
+        _encode_chat("Why is the sky blue? Give a clear, factual explanation."),
+    ]
+
+    # 4) profiler
+    n_ctx = int(os.environ.get("TEST_PROFILING_N_CTX", "8192"))
+    n_gpu_layers = int(os.environ.get("TEST_PROFILING_N_GPU_LAYERS", "35"))
+    profiler = DiffusionProfiler(MODEL_PATH, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers)
+
+    # 5) 质量门槛（与 quality_speed_baseline.py 的 dup_rate/max_run 一致，并额外加一个字符级兜底）
+    QUALITY_MAX_DUP_RATE = float(os.environ.get("TEST_PROFILING_QUALITY_MAX_DUP_RATE", "0.05"))
+    QUALITY_MAX_RUN = int(os.environ.get("TEST_PROFILING_QUALITY_MAX_RUN", "3"))
+    QUALITY_MIN_CHARS = int(os.environ.get("TEST_PROFILING_QUALITY_MIN_CHARS", "40"))
+
+    def _char_repetition(text: str) -> Dict[str, float]:
+        chars = [c for c in text if c.strip()]
+        if len(chars) < 2:
+            return {"dup_char_rate": 0.0, "max_char_run": 0.0}
+        dup = 0
+        max_run = 1
+        run = 1
+        for i in range(1, len(chars)):
+            if chars[i] == chars[i - 1]:
+                dup += 1
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 1
+        return {"dup_char_rate": dup / (len(chars) - 1), "max_char_run": float(max_run)}
+
+    def _quality_pass(tokens: List[int], prompt_ids: List[int]) -> Dict[str, object]:
+        _, _, _, has_prefix = _compute_token_counts(prompt_ids, tokens)
+        gen_ids = tokens[len(prompt_ids):] if has_prefix else tokens
+        text = tokenizer.decode(gen_ids, skip_special_tokens=False)
+        text = _clean_generated_text(text)
+        rep_w = _repetition_metrics(text)
+        rep_c = _char_repetition(text)
+        ok = True
+        if len(text) < QUALITY_MIN_CHARS:
+            ok = False
+        if rep_w["dup_word_rate"] > QUALITY_MAX_DUP_RATE or rep_w["max_dup_run"] > QUALITY_MAX_RUN:
+            ok = False
+        if rep_c["max_char_run"] > max(QUALITY_MAX_RUN, 6):
+            ok = False
+        return {"ok": ok, "text": text, "rep_words": rep_w, "rep_chars": rep_c}
+
+    # 6) micro 扫描：为每个 block 选择“质量过关且最快”的 micro_block_size
+    MICRO_AUTO = os.environ.get("TEST_PROFILING_MICRO_AUTO", "1").lower() in ("1", "true", "yes")
+    MICRO_SWEEP_GEN = int(os.environ.get("TEST_PROFILING_MICRO_SWEEP_GEN_LENGTH", "128"))
+
+    def _micro_candidates(block_len: int) -> List[int]:
+        raw = os.environ.get("TEST_PROFILING_MICRO_CANDIDATES", "").strip()
+        if raw:
+            xs = []
+            for s in raw.split(","):
+                s = s.strip()
+                if not s:
+                    continue
+                try:
+                    v = int(s)
+                except Exception:
+                    continue
+                if 1 <= v <= block_len:
+                    xs.append(v)
+            xs = sorted(set(xs), reverse=True)
+            if block_len not in xs:
+                xs.insert(0, block_len)
+            return xs
+        # default: powers-of-two divisors
+        xs = []
+        v = block_len
+        while v >= 1:
+            xs.append(v)
+            if v == 1:
+                break
+            v //= 2
+        return xs
+
+    # Quality-verified knobs:
+    # - partial-KV and mask-only-logits are still disabled by default here.
+    # - micro-freeze-no-logits has shown quality regressions on GPU for b64; keep it OFF for GPU-OPT unless explicitly enabled.
+    FREEZE_ENV_CPU = {
+        "DIFFUSION_FREEZE_DONE_MICRO": "1",
+        "DIFFUSION_DONE_MICRO_NO_LOGITS": "1",
+        "DIFFUSION_FREEZE_DONE_MICRO_CAUSAL": os.environ.get("TEST_PROFILING_FREEZE_CAUSAL", "1"),
+        "DIFFUSION_FREEZE_DONE_MICRO_STABLE_STEPS": os.environ.get("TEST_PROFILING_FREEZE_STABLE_STEPS", "2"),
+        "DIFFUSION_FREEZE_DONE_MICRO_MAX_PER_STEP": os.environ.get("TEST_PROFILING_FREEZE_MAX_PER_STEP", "1"),
+        "DIFFUSION_FREEZE_DONE_MICRO_MIN_CONF": os.environ.get("TEST_PROFILING_FREEZE_MIN_CONF", "0.90"),
+        "DIFFUSION_PARTIAL_KV_REUSE": "0",
+        "DIFFUSION_PARTIAL_KV_REUSE_GPU": "0",
+        "DIFFUSION_MASK_ONLY_LOGITS": "0",
+    }
+    GPU_ENABLE_FREEZE = os.environ.get("TEST_PROFILING_GPU_ENABLE_FREEZE", "0").lower() in ("1", "true", "yes")
+    FREEZE_ENV_GPU = dict(FREEZE_ENV_CPU) if GPU_ENABLE_FREEZE else {
+        "DIFFUSION_FREEZE_DONE_MICRO": "0",
+        "DIFFUSION_DONE_MICRO_NO_LOGITS": "0",
+        "DIFFUSION_PARTIAL_KV_REUSE": "0",
+        "DIFFUSION_PARTIAL_KV_REUSE_GPU": "0",
+        "DIFFUSION_MASK_ONLY_LOGITS": "0",
+    }
+
+    # 这两项在历史上有过“质量/同步”争议：默认不开，用户可自行 env 覆盖
+    SKIP_SYNC = os.environ.get("TEST_PROFILING_SKIP_SYNC_AFTER_OUTPUT_IDS", "0")
+    DEVICE_LOGITS_ASYNC = os.environ.get("TEST_PROFILING_DEVICE_LOGITS_ASYNC", "0")
     GPU_ONLY = os.environ.get("TEST_PROFILING_GPU_ONLY", "1")
-    DEVICE_LOGITS_ASYNC = os.environ.get("TEST_PROFILING_DEVICE_LOGITS_ASYNC", "1")
     DEBUG_DEVICE_LOGITS = os.environ.get("TEST_PROFILING_DEBUG_DEVICE_LOGITS", "").strip()
     DEBUG_DEVICE_LOGITS = DEBUG_DEVICE_LOGITS if DEBUG_DEVICE_LOGITS not in ("", "0", "false", "False", "no", "No") else None
 
-    test_configs = [
-        # CPU 基线（关闭 GPU 相关环境）
-        {
-            'name': 'CPU (block=4, steps=4)',
-            'gen_length': 128,
-            'block_length': 4,
-            'micro_block_size': 2,
-            'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': None,
-                'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-            },
-        },
-        {
-            'name': 'CPU (block=8, steps=8)',
-            'gen_length': 128,
-            'block_length': 8,
-            'micro_block_size': 2,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': None,
-                'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-            },
-        },
-        {
-            'name': 'CPU (block=16, steps=16)',
-            'gen_length': 128,
-            'block_length': 16,
-            'micro_block_size': 2,
-            'denoising_steps': 16,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': None,
-                'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-            },
-        },
-        {
-            'name': 'CPU (block=32, steps=32)',
-            'gen_length': 128,
-            'block_length': 32,
-            'micro_block_size': 2,
-            'denoising_steps': 32,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': None,
-                'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-            },
-        },
-        {
-            'name': 'CPU (block=64, steps=64)',
-            'gen_length': 128,
-            'block_length': 64,
-            'micro_block_size': 2,
-            'denoising_steps': 64,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': None,
-                'LLAMA_ENABLE_DEVICE_LOGITS': None,
-                'LLAMA_DEVICE_LOGITS_ASYNC': None,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
-            },
-        },
-        # GPU 采样（GPU-only + device logits + async）
-        {
-            'name': 'GPU (block=4, steps=4)',
-            'gen_length': 128,
-            'block_length': 4,
-            'micro_block_size': 2,
-            'denoising_steps': 4,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True,
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': GPU_ONLY,
-                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
-            },
-        },
-        {
-            'name': 'GPU (block=8, steps=8)',
-            'gen_length': 128,
-            'block_length': 8,
-            'micro_block_size': 2,
-            'denoising_steps': 8,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True,
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': GPU_ONLY,
-                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
-            },
-        },
-        {
-            'name': 'GPU (block=16, steps=16)',
-            'gen_length': 128,
-            'block_length': 16,
-            'micro_block_size': 2,
-            'denoising_steps': 16,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True,
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': GPU_ONLY,
-                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
-            },
-        },
-        {
-            'name': 'GPU (block=32, steps=32)',
-            'gen_length': 128,
-            'block_length': 32,
-            'micro_block_size': 2,
-            'denoising_steps': 32,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True,
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': GPU_ONLY,
-                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
-            },
-        },
-        {
-            'name': 'GPU (block=64, steps=64)',
-            'gen_length': 128,
-            'block_length': 64,
-            'micro_block_size': 2,
-            'denoising_steps': 64,
-            'remasking_strategy': 'low_confidence_dynamic',
-            'use_gpu_sampler': True,
-            'env_overrides': {
-                'DIFFUSION_GPU_ONLY': GPU_ONLY,
-                'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
-            },
-        },
-    ]
-    
+    def _pick_best_micro(block_len: int) -> int:
+        if not MICRO_AUTO:
+            return block_len
+        best = block_len
+        best_ms = None
+        print(f"\n{'='*80}")
+        print(f"[micro-sweep] block={block_len} candidates={_micro_candidates(block_len)}")
+        print(f"{'='*80}")
+        for micro in _micro_candidates(block_len):
+            try:
+                cfg = {
+                    "name": f"_micro_sweep_gpu(block={block_len}, micro={micro})",
+                    "gen_length": MICRO_SWEEP_GEN,
+                    "block_length": block_len,
+                    "micro_block_size": micro,
+                    "denoising_steps": block_len,
+                    "use_gpu_sampler": True,
+                    "remasking_strategy": "low_confidence_dynamic",
+                    "confidence_threshold": 0.85,
+                    "env_overrides": {
+                        "DIFFUSION_GPU_ONLY": GPU_ONLY,
+                        "LLAMA_ENABLE_DEVICE_LOGITS": "1",
+                        "LLAMA_DEVICE_LOGITS_ASYNC": DEVICE_LOGITS_ASYNC,
+                        "DIFFUSION_DEBUG_DEVICE_LOGITS": DEBUG_DEVICE_LOGITS,
+                        "DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS": SKIP_SYNC,
+                    **FREEZE_ENV_GPU,
+                    },
+                }
 
-    # Optional: override configs from external JSON (experiment matrix)
-    cfg_json = os.environ.get('TEST_PROFILING_CONFIGS_JSON', '').strip()
-    if cfg_json:
-        with open(cfg_json, "r") as f:
-            test_configs = json.load(f)
-        if not isinstance(test_configs, list):
-            raise ValueError('TEST_PROFILING_CONFIGS_JSON must be a JSON list of dict configs')
+                total_ms = 0.0
+                ok_all = True
+                worst_dup = 0.0
+                worst_run = 0
+                worst_char_run = 0
+                for p_ids in micro_sweep_prompts:
+                    r = profiler.run_profiling_test(
+                        prompt=p_ids,
+                        mask_token_id=MASK_TOKEN_ID,
+                        ensure_warmup=True,
+                        **cfg,
+                    )
+                    q = _quality_pass(r["tokens"], p_ids)
+                    total_ms += r["wall_time_ms"]
+                    worst_dup = max(worst_dup, float(q["rep_words"]["dup_word_rate"]))
+                    worst_run = max(worst_run, int(q["rep_words"]["max_dup_run"]))
+                    worst_char_run = max(worst_char_run, int(q["rep_chars"]["max_char_run"]))
+                    if not q["ok"]:
+                        ok_all = False
+                tps = (MICRO_SWEEP_GEN * len(micro_sweep_prompts)) / (total_ms / 1000.0) if total_ms > 0 else 0.0
+                print(
+                    f"[micro-sweep] micro={micro:<3d} wall_sum={total_ms:.2f}ms "
+                    f"tps~={tps:.2f} ok={1 if ok_all else 0} "
+                    f"worst_dup={worst_dup:.3f} worst_run={worst_run} worst_char_run={worst_char_run}"
+                )
+                if not ok_all:
+                    continue
+                if best_ms is None or total_ms < best_ms:
+                    best_ms = total_ms
+                    best = micro
+            except Exception as e:
+                print(f"[micro-sweep][warn] micro={micro} failed: {e}")
+        print(f"[micro-sweep] selected micro={best} for block={block_len}\n")
+        return best
 
-    # Optional: filter configs by a specific block_length (e.g. "64")
+    # 7) 生成 15 个配置：BASE / CPU-OPT / GPU-OPT
+    BLOCKS = [4, 8, 16, 32, 64]
     only_block = os.environ.get("TEST_PROFILING_ONLY_BLOCK", "").strip()
     if only_block:
         try:
             only_block_i = int(only_block)
         except ValueError:
             raise ValueError(f"Invalid TEST_PROFILING_ONLY_BLOCK={only_block!r}, expected int")
-        test_configs = [cfg for cfg in test_configs if cfg.get("block_length") == only_block_i]
-        if not test_configs:
-            raise RuntimeError(f"No configs matched TEST_PROFILING_ONLY_BLOCK={only_block_i}")
-    # 运行对比测试 (自动warmup + 每个配置运行3次取平均)
+        BLOCKS = [b for b in BLOCKS if b == only_block_i]
+
+    # Micro selection policy:
+    # - CPU-OPT: auto-pick best micro under the (heuristic) quality gate, then we still manually audit key outputs.
+    # - GPU-OPT: for now, force micro=block for quality. We have observed garbled/control-token-heavy output
+    #   when micro < block on GPU sampler for b64. We'll revisit after root-cause fix.
+    best_micro_for_cpu = {b: _pick_best_micro(b) for b in BLOCKS}
+    best_micro_for_gpu = {b: b for b in BLOCKS}
+
+    GEN_LENGTH = int(os.environ.get("TEST_PROFILING_GEN_LENGTH", "256"))
+
+    def mk_base_cfg(b: int) -> Dict:
+        # 完全无优化：块=微块，全量解码，全量 logits，CPU 采样
+        return {
+            "name": f"BASE (block={b}, micro={b})",
+            "gen_length": GEN_LENGTH,
+            "block_length": b,
+            "micro_block_size": b,
+            "denoising_steps": b,
+            "remasking_strategy": "low_confidence_dynamic",
+            "confidence_threshold": 0.85,
+            "env_overrides": {
+                "DIFFUSION_GPU_ONLY": None,
+                "DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS": "0",
+                "LLAMA_DEVICE_LOGITS_ASYNC": "0",
+                "DIFFUSION_FREEZE_DONE_MICRO": "0",
+                "DIFFUSION_DONE_MICRO_NO_LOGITS": "0",
+                "DIFFUSION_FORCE_FULL_BLOCK_DECODE": "1",
+                "DIFFUSION_PARTIAL_KV_REUSE": "0",
+                "DIFFUSION_PARTIAL_KV_REUSE_GPU": "0",
+                "DIFFUSION_MASK_ONLY_LOGITS": "0",
+                "DIFFUSION_DEBUG_DEVICE_LOGITS": None,
+            },
+        }
+
+    def mk_cpu_opt_cfg(b: int) -> Dict:
+        micro = best_micro_for_cpu[b]
+        return {
+            "name": f"CPU-OPT (block={b}, micro={micro})",
+            "gen_length": GEN_LENGTH,
+            "block_length": b,
+            "micro_block_size": micro,
+            "denoising_steps": b,
+            "remasking_strategy": "low_confidence_dynamic",
+            "confidence_threshold": 0.85,
+            "env_overrides": {
+                "DIFFUSION_GPU_ONLY": None,
+                "DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS": "0",
+                "LLAMA_DEVICE_LOGITS_ASYNC": "0",
+                **FREEZE_ENV_CPU,
+            },
+        }
+
+    def mk_gpu_opt_cfg(b: int) -> Dict:
+        micro = best_micro_for_gpu[b]
+        return {
+            "name": f"GPU-OPT (block={b}, micro={micro})",
+            "gen_length": GEN_LENGTH,
+            "block_length": b,
+            "micro_block_size": micro,
+            "denoising_steps": b,
+            "remasking_strategy": "low_confidence_dynamic",
+            "confidence_threshold": 0.85,
+            "use_gpu_sampler": True,
+            "env_overrides": {
+                "DIFFUSION_GPU_ONLY": GPU_ONLY,
+                "LLAMA_ENABLE_DEVICE_LOGITS": "1",
+                "LLAMA_DEVICE_LOGITS_ASYNC": DEVICE_LOGITS_ASYNC,
+                "DIFFUSION_DEBUG_DEVICE_LOGITS": DEBUG_DEVICE_LOGITS,
+                "DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS": SKIP_SYNC,
+                # Quality-first: force full decode / full logits on GPU until micro<block root-cause is fixed.
+                "DIFFUSION_FORCE_FULL_BLOCK_DECODE": "1",
+                **FREEZE_ENV_GPU,
+            },
+        }
+
+    test_configs = []
+    for b in BLOCKS:
+        test_configs.append(mk_base_cfg(b))
+        test_configs.append(mk_cpu_opt_cfg(b))
+        test_configs.append(mk_gpu_opt_cfg(b))
+
+    # Optional: external JSON override (debugging)
+    cfg_json = os.environ.get("TEST_PROFILING_CONFIGS_JSON", "").strip()
+    if cfg_json:
+        with open(cfg_json, "r") as f:
+            test_configs = json.load(f)
+        if not isinstance(test_configs, list):
+            raise ValueError("TEST_PROFILING_CONFIGS_JSON must be a JSON list of dict configs")
+
+    # 8) 运行 15 配置对比
     results = profiler.run_comparative_test(
-        prompt, 
-        MASK_TOKEN_ID, 
+        prompt,
+        MASK_TOKEN_ID,
         test_configs,
         warmup_before_test=True,
-        runs_per_config=RUNS_PER_CONFIG,  # 默认3次，可通过 TEST_PROFILING_RUNS_PER_CONFIG 覆盖
-        summary_log_path=SUMMARY_LOG
+        runs_per_config=RUNS_PER_CONFIG,
+        summary_log_path=SUMMARY_LOG,
     )
     
     # 详细分析每个结果

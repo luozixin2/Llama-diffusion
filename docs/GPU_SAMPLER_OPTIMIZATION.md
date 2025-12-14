@@ -377,6 +377,56 @@ test_configs = [
 
 ---
 
+## 12. 2025-12-14 更新：质量门禁、同步修复与“质量可信”性能表
+
+### 12.1 重要结论（质量优先）
+- **`dup_rate/max_run` 只能作为启发式指标**：它主要衡量相邻重复词，无法识别“控制 token 夹杂/断句碎片化/语义崩坏”等更严重的质量回归；必须做人工抽检。
+- **GPU sampler 在 `block=64, steps=64` 场景下**：
+  - 当 `micro < block` 且启用 GPU sampler 时，实测会出现大量 `<|endoftext|>` 在词间夹杂、句子碎片化等问题（即使关闭冻结/partial-KV），**质量不达标**。
+  - 当回退到 **`micro=block` + `DIFFUSION_FORCE_FULL_BLOCK_DECODE=1`（全量解码、全量 logits）** 时，输出恢复正常可读，质量达标。
+
+因此：在根因修复完成前，`test_profiling.py` 的 **GPU-OPT** 默认采用 **质量安全模式**：
+- `micro_block_size = block_length`
+- `DIFFUSION_FORCE_FULL_BLOCK_DECODE=1`
+- 并默认关闭 `DIFFUSION_FREEZE_DONE_MICRO/DIFFUSION_DONE_MICRO_NO_LOGITS`（可用 `TEST_PROFILING_GPU_ENABLE_FREEZE=1` 显式开启实验）
+
+### 12.2 同步修复（性能与正确性）
+修复了 `try_sample_with_gpu()` 在 `LLAMA_DEVICE_LOGITS_ASYNC=0`（同步 device logits）时仍做 `llama_synchronize()` 的问题：
+- 旧行为：同步模式也强制同步，造成 `sampler_gpu_host_pre_sync_before_get_device_ms` 巨大，严重拖慢 GPU sampler。
+- 新行为：仅当 `LLAMA_DEVICE_LOGITS_ASYNC=1` 且质量模式要求同步时才同步；同步 logits 模式不再额外同步。
+
+同时降噪了告警：`LLAMA_ENABLE_DEVICE_LOGITS=1` 且用户走 CPU-only 配置时，不再刷“device logits 启用但回退 CPU”误报告警。
+
+### 12.3 质量可信性能表（15 配置，b64 模型统一，runs=1）
+
+说明：
+- 模型：`SDAR-1.7B-Chat-b64-F16.gguf`（支持 1~64 block）
+- `denoising_steps = block_length`
+- **BASE**：完全无优化（强制全量解码，CPU 采样，micro=block）
+- **CPU-OPT**：开启已验证的 CPU 加速选项（包含微块/冻结相关开关），禁用 GPU 采样与未验证质量的选项
+- **GPU-OPT**：开启已验证的 GPU 采样与性能开关，但**强制 full decode + micro=block（质量安全）**
+
+| 配置 | Wall Time (ms) | Tokens/sec (gen) |
+|------|----------------:|-----------------:|
+| BASE (block=4, micro=4) | 2429.16 | 105.39 |
+| CPU-OPT (block=4, micro=4) | 2406.53 | 106.38 |
+| GPU-OPT (block=4, micro=4) | 1546.87 | 165.50 |
+| BASE (block=8, micro=8) | 2915.23 | 87.81 |
+| CPU-OPT (block=8, micro=8) | 3062.85 | 83.58 |
+| GPU-OPT (block=8, micro=8) | 534.13 | 479.28 |
+| BASE (block=16, micro=16) | 4461.31 | 57.38 |
+| CPU-OPT (block=16, micro=16) | 4792.90 | 53.41 |
+| GPU-OPT (block=16, micro=16) | 679.81 | 376.58 |
+| BASE (block=32, micro=32) | 8172.08 | 31.33 |
+| CPU-OPT (block=32, micro=4) | 7603.69 | 33.67 |
+| GPU-OPT (block=32, micro=32) | 650.83 | 393.34 |
+| BASE (block=64, micro=64) | 17252.55 | 14.84 |
+| CPU-OPT (block=64, micro=64) | 17887.56 | 14.31 |
+| GPU-OPT (block=64, micro=64) | 836.18 | 306.15 |
+
+归档目录：`profile_runs/20251214_0932xx/`（详见 `profile_results_flat.csv` / `profile_summary.txt`）。
+
+
 ## 附录：测试结果存档
 
 所有 profiling 结果保存在 `profile_runs/` 目录：
