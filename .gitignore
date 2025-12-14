@@ -21,6 +21,7 @@ dist/
 profile_*.png
 profile_results.json
 profile_results_flat.csv
+profile_summary.txt
 profiling_output.log
 llama_diffusion/build/
 llama_diffusion/out/
