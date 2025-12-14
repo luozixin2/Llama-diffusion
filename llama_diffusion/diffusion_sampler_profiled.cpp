@@ -598,6 +598,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                             };
                             const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
                             const bool allow_gpu_sampling = !env_flag("DIFFUSION_DISABLE_GPU_SAMPLER") && !env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+                            const bool allow_fused = env_flag("DIFFUSION_GPU_ALLOW_FUSED");
+                            const bool force_non_fused = !allow_fused || env_flag("DIFFUSION_GPU_FORCE_NON_FUSED");
                             if (!allow_gpu_sampling && gpu_only_mode) {
                                 llama_batch_free(batch);
                                 throw std::runtime_error("[DiffusionSamplerProfiled] gpu_only_mode=true 但 GPU sampling 被禁用 (DIFFUSION_DISABLE_GPU_SAMPLER/DIFFUSION_FORCE_CPU_SAMPLING)");
@@ -628,7 +630,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                                             gpu_confs_out,
                                             nullptr,
                                             &gpu_stats,
-                                            /*force_non_fused=*/false
+                                            /*force_non_fused=*/force_non_fused
                                         );
                                     } else {
                                         ok_gpu = gpu_sampler_->sample_from_device_ptr_strided(
@@ -641,7 +643,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                                             gpu_confs_out,
                                             nullptr,
                                             &gpu_stats,
-                                            /*force_non_fused=*/false
+                                            /*force_non_fused=*/force_non_fused
                                         );
                                     }
                                     if (ok_gpu && static_cast<int>(gpu_tokens_out.size()) == out_count && static_cast<int>(gpu_confs_out.size()) == out_count) {
@@ -750,6 +752,8 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                     const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
                     const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
                     const bool allow_gpu_sampling = !env_flag("DIFFUSION_DISABLE_GPU_SAMPLER") && !env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+                    const bool allow_fused = env_flag("DIFFUSION_GPU_ALLOW_FUSED");
+                    const bool force_non_fused = !allow_fused || env_flag("DIFFUSION_GPU_FORCE_NON_FUSED");
 
                     if (!allow_gpu_sampling && gpu_only_mode) {
                         llama_batch_free(batch);
@@ -787,17 +791,24 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                             const bool device_logits_env_local = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
                             const bool device_logits_async = env_flag("LLAMA_DEVICE_LOGITS_ASYNC");
                             const bool skip_sync_after_output_ids = env_flag("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS");
-                            int64_t stride_tokens = 0;
-                            if (device_logits_env_local && device_logits_async && !skip_sync_after_output_ids) {
-                                llama_synchronize(ctx_);
-                            }
-                            const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
                             int out_count = 0;
                             const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
+                            int64_t stride_tokens = 0;
 #if defined(DIFFUSION_ENABLE_CUDA)
-                            if (device_logits_env_local && device_logits_async && !skip_sync_after_output_ids) {
+                            // output_ids may trigger output_reorder which can reorder/swap device logits buffers.
+                            // For correctness: sync (quality-first) then fetch the device logits pointer.
+                            if (device_logits_env_local && !skip_sync_after_output_ids) {
                                 cudaDeviceSynchronize();
-                            } else if (device_logits_env_local && device_logits_async && skip_sync_after_output_ids) {
+                            }
+#endif
+                            const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
+                            // llama.cpp may report stride in bytes in some builds; normalize to float elements.
+                            if (stride_tokens > 0 && stride_tokens != n_vocab && (stride_tokens % (int64_t) sizeof(float)) == 0) {
+                                const int64_t as_floats = stride_tokens / (int64_t) sizeof(float);
+                                if (as_floats >= n_vocab) stride_tokens = as_floats;
+                            }
+#if defined(DIFFUSION_ENABLE_CUDA)
+                            if (device_logits_env_local && device_logits_async && skip_sync_after_output_ids) {
                                 // Skip-sync is an experimental perf knob; may degrade quality if logits are not ready.
                             }
 #endif
@@ -815,7 +826,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                                         gpu_confs_out,
                                         nullptr,
                                         &gpu_stats,
-                                        /*force_non_fused=*/false
+                                        /*force_non_fused=*/force_non_fused
                                     );
                                 } else {
                                     ok_gpu = gpu_sampler_->sample_from_device_ptr_strided(
@@ -828,7 +839,7 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                                         gpu_confs_out,
                                         nullptr,
                                         &gpu_stats,
-                                        /*force_non_fused=*/false
+                                        /*force_non_fused=*/force_non_fused
                                     );
                                 }
                                 if (ok_gpu && static_cast<int>(gpu_tokens_out.size()) == out_count && static_cast<int>(gpu_confs_out.size()) == out_count) {

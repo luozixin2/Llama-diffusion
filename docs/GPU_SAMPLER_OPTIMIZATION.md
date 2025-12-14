@@ -397,34 +397,34 @@ test_configs = [
 
 同时降噪了告警：`LLAMA_ENABLE_DEVICE_LOGITS=1` 且用户走 CPU-only 配置时，不再刷“device logits 启用但回退 CPU”误报告警。
 
-### 12.3 质量可信性能表（15 配置，b64 模型统一，runs=1）
+### 12.3 质量可信性能表（15 配置，b64 模型统一，runs=3）
 
 说明：
 - 模型：`SDAR-1.7B-Chat-b64-F16.gguf`（支持 1~64 block）
 - `denoising_steps = block_length`
-- **BASE**：完全无优化（强制全量解码，CPU 采样，micro=block）
-- **CPU-OPT**：开启已验证的 CPU 加速选项（包含微块/冻结相关开关），禁用 GPU 采样与未验证质量的选项
-- **GPU-OPT**：开启已验证的 GPU 采样与性能开关，但**强制 full decode + micro=block（质量安全）**
+- **CPU**：CPU 基线（强制全量解码，CPU 采样，micro=block）
+- **GPU (no-device-logits)**：GPU 采样但 **禁用 device logits**（`LLAMA_ENABLE_DEVICE_LOGITS=0`），用于量化 device logits 的收益；仍采用质量安全模式（full decode + micro=block）
+- **GPU-OPT**：GPU 采样 + **启用 device logits**（`LLAMA_ENABLE_DEVICE_LOGITS=1`），且 **强制 full decode + micro=block（质量安全）**；本次 profiling **强制 non-fused**（`DIFFUSION_GPU_FORCE_NON_FUSED=1`，且 fused 默认 opt-in）
 
 | 配置 | Wall Time (ms) | Tokens/sec (gen) |
 |------|----------------:|-----------------:|
-| BASE (block=4, micro=4) | 2429.16 | 105.39 |
-| CPU-OPT (block=4, micro=4) | 2406.53 | 106.38 |
-| GPU-OPT (block=4, micro=4) | 1546.87 | 165.50 |
-| BASE (block=8, micro=8) | 2915.23 | 87.81 |
-| CPU-OPT (block=8, micro=8) | 3062.85 | 83.58 |
-| GPU-OPT (block=8, micro=8) | 534.13 | 479.28 |
-| BASE (block=16, micro=16) | 4461.31 | 57.38 |
-| CPU-OPT (block=16, micro=16) | 4792.90 | 53.41 |
-| GPU-OPT (block=16, micro=16) | 679.81 | 376.58 |
-| BASE (block=32, micro=32) | 8172.08 | 31.33 |
-| CPU-OPT (block=32, micro=4) | 7603.69 | 33.67 |
-| GPU-OPT (block=32, micro=32) | 650.83 | 393.34 |
-| BASE (block=64, micro=64) | 17252.55 | 14.84 |
-| CPU-OPT (block=64, micro=64) | 17887.56 | 14.31 |
-| GPU-OPT (block=64, micro=64) | 836.18 | 306.15 |
+| CPU (block=4, micro=4) | 2220.65 | 115.28 |
+| GPU (no-device-logits) (block=4, micro=4) | 2013.77 | 127.12 |
+| GPU-OPT (block=4, micro=4) | 1627.47 | 157.30 |
+| CPU (block=8, micro=8) | 3046.15 | 84.04 |
+| GPU (no-device-logits) (block=8, micro=8) | 2226.08 | 115.00 |
+| GPU-OPT (block=8, micro=8) | 578.45 | 442.57 |
+| CPU (block=16, micro=16) | 4746.19 | 53.94 |
+| GPU (no-device-logits) (block=16, micro=16) | 3310.67 | 77.33 |
+| GPU-OPT (block=16, micro=16) | 585.26 | 437.41 |
+| CPU (block=32, micro=32) | 9058.18 | 28.26 |
+| GPU (no-device-logits) (block=32, micro=32) | 7346.63 | 34.85 |
+| GPU-OPT (block=32, micro=32) | 619.39 | 413.31 |
+| CPU (block=64, micro=64) | 16474.16 | 15.54 |
+| GPU (no-device-logits) (block=64, micro=64) | 22544.89 | 11.36 |
+| GPU-OPT (block=64, micro=64) | 986.43 | 259.52 |
 
-归档目录：`profile_runs/20251214_0932xx/`（详见 `profile_results_flat.csv` / `profile_summary.txt`）。
+归档目录：`profile_runs/20251214_121405/`（详见 `profile_results_flat.csv` / `profile_summary.txt` / `profile_*.png`）。
 
 
 ## 附录：测试结果存档

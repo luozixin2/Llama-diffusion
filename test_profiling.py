@@ -1204,10 +1204,10 @@ def main():
 
     GEN_LENGTH = int(os.environ.get("TEST_PROFILING_GEN_LENGTH", "256"))
 
-    def mk_base_cfg(b: int) -> Dict:
-        # 完全无优化：块=微块，全量解码，全量 logits，CPU 采样
+    def mk_cpu_cfg(b: int) -> Dict:
+        # CPU 基线：块=微块，全量解码，全量 logits，CPU 采样
         return {
-            "name": f"BASE (block={b}, micro={b})",
+            "name": f"CPU (block={b}, micro={b})",
             "gen_length": GEN_LENGTH,
             "block_length": b,
             "micro_block_size": b,
@@ -1228,21 +1228,29 @@ def main():
             },
         }
 
-    def mk_cpu_opt_cfg(b: int) -> Dict:
-        micro = best_micro_for_cpu[b]
+    def mk_gpu_no_device_logits_cfg(b: int) -> Dict:
+        # GPU（不使用 device logits）：用于量化 device logits 的收益。
+        # 仍保持“安全策略”：micro=block + full decode/full logits + non-fused（由外部 env 控制）。
+        micro = best_micro_for_gpu[b]
         return {
-            "name": f"CPU-OPT (block={b}, micro={micro})",
+            "name": f"GPU (no-device-logits) (block={b}, micro={micro})",
             "gen_length": GEN_LENGTH,
             "block_length": b,
             "micro_block_size": micro,
             "denoising_steps": b,
             "remasking_strategy": "low_confidence_dynamic",
             "confidence_threshold": 0.85,
+            "use_gpu_sampler": True,
             "env_overrides": {
-                "DIFFUSION_GPU_ONLY": None,
-                "DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS": "0",
-                "LLAMA_DEVICE_LOGITS_ASYNC": "0",
-                **FREEZE_ENV_CPU,
+                "DIFFUSION_GPU_ONLY": GPU_ONLY,
+                # 禁用 device logits：强制走 host logits + H2D 的 GPU 采样路径
+                "LLAMA_ENABLE_DEVICE_LOGITS": "0",
+                "LLAMA_DEVICE_LOGITS_ASYNC": DEVICE_LOGITS_ASYNC,
+                "DIFFUSION_DEBUG_DEVICE_LOGITS": DEBUG_DEVICE_LOGITS,
+                "DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS": SKIP_SYNC,
+                # 安全优先：仍强制 full decode/full logits（微块 root-cause 修复前）
+                "DIFFUSION_FORCE_FULL_BLOCK_DECODE": "1",
+                **FREEZE_ENV_GPU,
             },
         }
 
@@ -1271,8 +1279,8 @@ def main():
 
     test_configs = []
     for b in BLOCKS:
-        test_configs.append(mk_base_cfg(b))
-        test_configs.append(mk_cpu_opt_cfg(b))
+        test_configs.append(mk_cpu_cfg(b))
+        test_configs.append(mk_gpu_no_device_logits_cfg(b))
         test_configs.append(mk_gpu_opt_cfg(b))
 
     # Optional: external JSON override (debugging)

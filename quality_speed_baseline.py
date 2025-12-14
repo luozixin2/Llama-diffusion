@@ -122,22 +122,41 @@ def run_case(
     eos_id = tokenizer.eos_token_id
 
     start = time.perf_counter()
-    out_tokens = model.generate(
-        prompt=prompt_entry["prompt_ids"],
-        mask_token_id=mask_id,
-        gen_length=gen_length,
-        block_length=block_length,
-        micro_block_size=micro_block_size,
-        denoising_steps=denoising_steps,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        remasking_strategy=remasking_strategy,
-        confidence_threshold=confidence_threshold,
-        repetition_penalty=repetition_penalty,
-        stop_token_ids=[eos_id] if os.environ.get("DIFFUSION_USE_STOP_EOS", "0") in ("1", "true", "True") else [],
-        use_gpu_sampler=use_gpu_sampler,
-    )
+    # Note: the profiled backend currently does not accept repetition_penalty.
+    # For quality comparison vs test_profiling.py (which uses profiled backend), keep repetition_penalty=1.0 there.
+    if hasattr(model, "generate_with_profiling"):
+        out_tokens, _profile = model.generate_with_profiling(
+            prompt=prompt_entry["prompt_ids"],
+            mask_token_id=mask_id,
+            gen_length=gen_length,
+            block_length=block_length,
+            denoising_steps=denoising_steps,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            remasking_strategy=remasking_strategy,
+            confidence_threshold=confidence_threshold,
+            stop_token_ids=[eos_id] if os.environ.get("DIFFUSION_USE_STOP_EOS", "0") in ("1", "true", "True") else [],
+            use_gpu_sampler=use_gpu_sampler,
+            micro_block_size=micro_block_size,
+        )
+    else:
+        out_tokens = model.generate(
+            prompt=prompt_entry["prompt_ids"],
+            mask_token_id=mask_id,
+            gen_length=gen_length,
+            block_length=block_length,
+            micro_block_size=micro_block_size,
+            denoising_steps=denoising_steps,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            remasking_strategy=remasking_strategy,
+            confidence_threshold=confidence_threshold,
+            repetition_penalty=repetition_penalty,
+            stop_token_ids=[eos_id] if os.environ.get("DIFFUSION_USE_STOP_EOS", "0") in ("1", "true", "True") else [],
+            use_gpu_sampler=use_gpu_sampler,
+        )
     elapsed = time.perf_counter() - start
 
     prompt_ids = prompt_entry["prompt_ids"]
@@ -198,6 +217,13 @@ def main():
         choices=["sequential", "low_confidence_static", "low_confidence_dynamic", "entropy_bounded"],
     )
     parser.add_argument("--use-gpu-sampler", action="store_true", default=False)
+    parser.add_argument(
+        "--profiled-backend",
+        action="store_true",
+        default=False,
+        help="Use the profiled backend (llama_diffusion_profiled) for quality validation. "
+             "This matches test_profiling.py, but currently does not support repetition_penalty.",
+    )
     parser.add_argument("--seed", type=int, default=-1, help="If set >=0, export DIFFUSION_SEED for reproducibility")
     parser.add_argument("--partial-kv", action="store_true", default=False, help="Enable partial-KV reuse (quality may degrade)")
     parser.add_argument("--force-full-decode", action="store_true", default=False, help="Force full block decode (disable partial-KV)")
@@ -250,11 +276,21 @@ def main():
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     print("Loading model...")
-    model = llama_diffusion.LlamaDiffusion(
-        model_path=args.model_path,
-        n_ctx=args.n_ctx,
-        n_gpu_layers=args.n_gpu_layers,
-    )
+    if args.profiled_backend:
+        from llama_diffusion.llama_diffusion_profiled import LlamaDiffusionProfiled
+        model = LlamaDiffusionProfiled(
+            model_path=args.model_path,
+            n_ctx=args.n_ctx,
+            n_gpu_layers=args.n_gpu_layers,
+        )
+        if args.repetition_penalty != 1.0:
+            print("[warn] --profiled-backend currently ignores repetition_penalty; please use --repetition-penalty 1.0 for apples-to-apples.")
+    else:
+        model = llama_diffusion.LlamaDiffusion(
+            model_path=args.model_path,
+            n_ctx=args.n_ctx,
+            n_gpu_layers=args.n_gpu_layers,
+        )
 
     prompts = build_prompts(tokenizer)
 

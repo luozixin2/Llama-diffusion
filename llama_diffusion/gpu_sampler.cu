@@ -173,10 +173,11 @@ __global__ void fused_softmax_sample_kernel(
     float* prefix_before = chunk_sums + nthreads;                           // 1 float
     int* target_chunk_ptr = reinterpret_cast<int*>(prefix_before + 1);      // 1 int
 
-    // 1) reduce max
+    // 1) reduce max (robust to NaN/Inf: treat as -inf, similar spirit to non-fused path)
     float local_max = -FLT_MAX;
     for (int i = tid; i < vocab_size; i += nthreads) {
         float val = row_logits[i] * inv_temp;
+        if (!isfinite(val)) val = -FLT_MAX;
         if (val > local_max) local_max = val;
     }
     sdata[tid] = local_max;
@@ -189,13 +190,14 @@ __global__ void fused_softmax_sample_kernel(
     }
     const float row_max = sdata[0];
 
-    // 2) reduce sum of exp(logit - max)
-    float local_sum = 0.0f;
+    // 2) compute total_sum with the SAME reduction pattern as non-fused softmax_exp_sum_kernel (strided + tree reduce)
+    float local_sum_strided = 0.0f;
     for (int i = tid; i < vocab_size; i += nthreads) {
-        float e = expf(row_logits[i] * inv_temp - row_max);
-        local_sum += e;
+        float val = row_logits[i] * inv_temp;
+        if (!isfinite(val) || val <= -FLT_MAX + 100.0f) continue;
+        local_sum_strided += expf(val - row_max);
     }
-    sdata[tid] = local_sum;
+    sdata[tid] = local_sum_strided;
     __syncthreads();
     for (int s = nthreads / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -203,29 +205,35 @@ __global__ void fused_softmax_sample_kernel(
         }
         __syncthreads();
     }
-    const float row_sum = sdata[0] + 1e-10f;
 
-    // 3) random threshold in [0, row_sum)
+    // Stash r in (0,1] and inv_total_sum for all threads
     if (tid == 0) {
-        const float r = random_vals[row] * row_sum;
-        prefix_before[0] = r;
-        target_chunk_ptr[0] = -1;
+        const float total_sum = sdata[0];
+        const float inv_total_sum = (isfinite(total_sum) && total_sum > 0.0f) ? (1.0f / (total_sum + 1e-10f)) : 0.0f;
+        sdata[0] = random_vals[row];
+        sdata[1] = inv_total_sum;
     }
     __syncthreads();
-    const float target_r = prefix_before[0];
 
-    // 4) chunk sums
+    const float r01 = sdata[0];
+    const float inv_total_sum = sdata[1];
+
+    // 3) build chunk CDF in token-id order, in probability space (matching sample_tokens_kernel semantics)
     const int chunk_size = (vocab_size + nthreads - 1) / nthreads;
     const int start_idx = tid * chunk_size;
     const int end_idx = min(start_idx + chunk_size, vocab_size);
-    float chunk_sum = 0.0f;
-    for (int i = start_idx; i < end_idx; ++i) {
-        chunk_sum += expf(row_logits[i] * inv_temp - row_max);
+
+    float local_chunk_prob_sum = 0.0f;
+    if (inv_total_sum > 0.0f) {
+        for (int i = start_idx; i < end_idx; ++i) {
+            float val = row_logits[i] * inv_temp;
+            if (!isfinite(val) || val <= -FLT_MAX + 100.0f) continue;
+            local_chunk_prob_sum += expf(val - row_max) * inv_total_sum;
+        }
     }
-    chunk_sums[tid] = chunk_sum;
+    chunk_sums[tid] = local_chunk_prob_sum;
     __syncthreads();
 
-    // 5) find target chunk
     if (tid == 0) {
         float prefix = 0.0f;
         float prefix_before_val = 0.0f;
@@ -233,14 +241,14 @@ __global__ void fused_softmax_sample_kernel(
         for (int c = 0; c < nthreads; ++c) {
             float old_prefix = prefix;
             prefix += chunk_sums[c];
-            if (tgt < 0 && prefix >= target_r) {
+            if (tgt < 0 && prefix >= r01) {
                 tgt = c;
-                prefix_before_val = old_prefix; // reuse to store prefix_before target
+                prefix_before_val = old_prefix;
             }
         }
         if (tgt < 0) {
             tgt = nthreads - 1;
-            prefix_before_val = prefix - chunk_sums[tgt]; // avoid uninitialized prefix_before
+            prefix_before_val = prefix - chunk_sums[tgt];
         }
         prefix_before[0] = prefix_before_val;
         target_chunk_ptr[0] = tgt;
@@ -249,16 +257,22 @@ __global__ void fused_softmax_sample_kernel(
 
     const int target_chunk = target_chunk_ptr[0];
     if (tid == target_chunk) {
-        float prefix = prefix_before[0]; // absolute mass before this chunk
+        float prefix = prefix_before[0];
         int sampled_idx = vocab_size - 1;
         float sampled_prob = 0.0f;
-        for (int i = start_idx; i < end_idx; ++i) {
-            float e = expf(row_logits[i] * inv_temp - row_max); // unnormalized mass
-            prefix += e;
-            if (prefix >= target_r) {
-                sampled_idx = i;
-                sampled_prob = e / row_sum; // normalized prob
-                break;
+        if (inv_total_sum > 0.0f) {
+            for (int i = start_idx; i < end_idx; ++i) {
+                float val = row_logits[i] * inv_temp;
+                float p = 0.0f;
+                if (isfinite(val) && val > -FLT_MAX + 100.0f) {
+                    p = expf(val - row_max) * inv_total_sum;
+                }
+                prefix += p;
+                if (prefix >= r01) {
+                    sampled_idx = i;
+                    sampled_prob = p;
+                    break;
+                }
             }
         }
         sampled_tokens[row] = sampled_idx;
@@ -300,7 +314,6 @@ __global__ void sample_tokens_kernel(
     
     // Step 1: 每个线程计算其 chunk 的累积和和第一个超过阈值的局部索引
     float local_sum = 0.0f;
-    int local_first_idx = -1;  // -1 表示此 chunk 中没有找到
     
     for (int i = start_idx; i < end_idx; ++i) {
         local_sum += row_probs[i];
@@ -1014,17 +1027,28 @@ public:
         cudaEventRecord(ev_after_copy, stream);
         // NOTE: avoid global sync here; rely on stream ordering + later sync for correctness
 
-        // ========== Fast path: GPU sampling without sort/topk/topp ==========
-        const bool fast_gpu_sample = !force_non_fused &&
-                                     use_gpu_sampling_ &&
-                                     !need_probs &&
-                                     config_.top_k <= 0 &&
-                                     config_.top_p >= 1.0f;
-        DIFF_LOGD("[GpuSampler][debug] device fast_gpu_sample=%d use_gpu_sampling=%d need_probs=%d top_k=%d top_p=%f\n",
-                  fast_gpu_sample ? 1 : 0, use_gpu_sampling_ ? 1 : 0, need_probs ? 1 : 0, config_.top_k, config_.top_p);
+        // ========== Device-logits sampling modes ==========
+        // IMPORTANT:
+        // - force_non_fused is a quality/debug knob to disable ONLY the fused softmax+sample kernel.
+        // - It must NOT disable the non-fused device-logits path (softmax kernels + sample_tokens_kernel).
+        const bool can_simple_sample =
+            use_gpu_sampling_ &&
+            !need_probs &&
+            config_.top_k <= 0 &&
+            config_.top_p >= 1.0f;
+        const bool fused_fast_path = (!force_non_fused) && can_simple_sample;
+        DIFF_LOGD("[GpuSampler][debug] device can_simple_sample=%d fused_fast_path=%d force_non_fused=%d use_gpu_sampling=%d need_probs=%d top_k=%d top_p=%f\n",
+                  can_simple_sample ? 1 : 0,
+                  fused_fast_path ? 1 : 0,
+                  force_non_fused ? 1 : 0,
+                  use_gpu_sampling_ ? 1 : 0,
+                  need_probs ? 1 : 0,
+                  config_.top_k,
+                  config_.top_p);
         static bool fastpath_warned_device = false;
-        if (!fast_gpu_sample && use_gpu_sampling_ && !need_probs && config_.top_k <= 0 && config_.top_p >= 1.0f && !fastpath_warned_device) {
-            DIFF_LOGI("[GpuSampler][info] fused fast path skipped on device logits (force_non_fused=%d)\n", force_non_fused ? 1 : 0);
+        if (!fused_fast_path && can_simple_sample && !fastpath_warned_device) {
+            DIFF_LOGI("[GpuSampler][info] fused fast path skipped on device logits (force_non_fused=%d)\n",
+                      force_non_fused ? 1 : 0);
             fastpath_warned_device = true;
         }
         // Temperature scaling (applied before fused branch so fused uses inv_temp=1.0)
@@ -1052,7 +1076,7 @@ public:
         cudaEventRecord(ev_after_rng, stream);
 
         // Fused fast path on device logits (skip softmax kernels)
-        if (fast_gpu_sample) {
+        if (fused_fast_path) {
             std::uniform_int_distribution<uint64_t> dist64;
             uint64_t seed = dist64(rng);
             int rand_threads = 256;
@@ -1094,6 +1118,72 @@ public:
                         confidences[i] = 0.0f;
                     }
                 }
+            }
+
+            // Optional debug: compare fused kernel vs non-fused GPU sampling on the SAME device logits + SAME random values.
+            // NOTE: use INFO log level so it shows up in default builds (compile-time default is INFO).
+            if (std::getenv("DIFFUSION_FUSED_VS_NONFUSED")) {
+                std::vector<llama_token> fused_tokens = sampled_tokens;
+                std::vector<float> fused_conf = confidences;
+
+                const int threads_per_block = 256;
+                const size_t smem_size = threads_per_block * sizeof(float);
+                find_row_max_kernel<<<num_rows, threads_per_block, smem_size, stream>>>(
+                    d_logits_, d_row_max_, vocab_size_, num_rows);
+                softmax_exp_sum_kernel<<<num_rows, threads_per_block, smem_size, stream>>>(
+                    d_logits_, d_row_max_, d_probs_, d_row_sum_, vocab_size_, num_rows);
+                softmax_normalize_kernel<<<num_rows, threads_per_block, 0, stream>>>(
+                    d_probs_, d_row_sum_, vocab_size_, num_rows);
+
+                int ref_sample_threads = (vocab_size_ <= 4096) ? 128 : 256;
+                const size_t ref_sample_smem = ref_sample_threads * sizeof(float) + ref_sample_threads * sizeof(int);
+                sample_tokens_kernel<<<num_rows, ref_sample_threads, ref_sample_smem, stream>>>(
+                    d_probs_, d_random_vals_,
+                    d_sampled_tokens_, d_confidences_,
+                    vocab_size_, num_rows,
+                    config_.top_k, config_.top_p
+                );
+
+                std::vector<llama_token> ref_tokens(num_rows);
+                std::vector<float> ref_conf(num_rows);
+                cudaMemcpyAsync(ref_tokens.data(), d_sampled_tokens_,
+                                num_rows * sizeof(int),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaMemcpyAsync(ref_conf.data(), d_confidences_,
+                                num_rows * sizeof(float),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+
+                if (safe_vocab_device < vocab_size_) {
+                    const int clamp_id_ref = safe_vocab_device - 1;
+                    for (int i = 0; i < num_rows; ++i) {
+                        if (ref_tokens[i] >= safe_vocab_device) {
+                            ref_tokens[i] = clamp_id_ref;
+                            ref_conf[i] = 0.0f;
+                        }
+                    }
+                }
+
+                int mism = 0;
+                int first_idx = -1;
+                for (int i = 0; i < num_rows; ++i) {
+                    if (fused_tokens[i] != ref_tokens[i]) {
+                        mism++;
+                        if (first_idx < 0) first_idx = i;
+                    }
+                }
+                if (mism > 0) {
+                    DIFF_LOGI("[fused_vs_nonfused][device] mismatch=%d/%d first=%d fused=%d ref=%d fused_p=%g ref_p=%g\n",
+                              mism, num_rows, first_idx,
+                              fused_tokens[first_idx], ref_tokens[first_idx],
+                              (double) fused_conf[first_idx], (double) ref_conf[first_idx]);
+                } else {
+                    DIFF_LOGI("[fused_vs_nonfused][device] match all (%d rows)\n", num_rows);
+                }
+
+                // Restore fused outputs as the return value
+                sampled_tokens.swap(fused_tokens);
+                confidences.swap(fused_conf);
             }
 
             float ms_copy = 0.0f, ms_temp = 0.0f, ms_mask = 0.0f, ms_rng = 0.0f, ms_prepare = 0.0f;
@@ -1172,8 +1262,9 @@ public:
             d_probs_, d_row_sum_, vocab_size_, num_rows);
         cudaEventRecord(ev_after_softmax, stream);
 
-        // Fast GPU sampling path (non-fused) on device logits
-        if (fast_gpu_sample) {
+        // Fast GPU sampling path (non-fused) on device logits.
+        // This remains enabled even when force_non_fused=1.
+        if (can_simple_sample) {
             std::uniform_int_distribution<uint64_t> dist64;
             uint64_t seed = dist64(rng);
             int threads = 256;

@@ -41,8 +41,8 @@ DiffusionSampler::DiffusionSampler(llama_context* ctx, llama_model* model, const
         rng_.seed(static_cast<uint32_t>(seed));
         DIFF_LOGI("[DiffusionSampler][info] DIFFUSION_SEED=%llu\n", (unsigned long long) seed);
     } else {
-        std::random_device rd;
-        rng_.seed(rd());
+    std::random_device rd;
+    rng_.seed(rd());
     }
 
     reset_sampler_metrics();
@@ -50,7 +50,7 @@ DiffusionSampler::DiffusionSampler(llama_context* ctx, llama_model* model, const
     // Validate/normalize vocab-related config:
     // - n_vocab_limit must not exceed model vocab
     // - mask_token_id may be out-of-vocab (common for tokenizer-added specials); keep it logically, but map to a safe id for llama_decode
-    const int vocab_size = get_vocab_size();
+        const int vocab_size = get_vocab_size();
     vocab_size_ = vocab_size;
     if (config_.n_vocab_limit <= 0 || config_.n_vocab_limit > vocab_size) {
         if (config_.n_vocab_limit > vocab_size) {
@@ -667,7 +667,7 @@ void DiffusionSampler::denoise_block(
 
         auto decode_full_block = [&]() -> bool {
             const bool mask_only_logits = env_flag("DIFFUSION_MASK_ONLY_LOGITS");
-            llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
+        llama_memory_seq_rm(memory, 0, block_start, block_start + config_.block_length);
             sampler_metrics_.kv_rm_calls++;
             sampler_metrics_.kv_rm_full_calls++;
             sampler_metrics_.kv_rm_tokens += config_.block_length;
@@ -744,25 +744,25 @@ void DiffusionSampler::denoise_block(
             const bool mask_only_logits = env_flag("DIFFUSION_MASK_ONLY_LOGITS");
             int logits_true = 0;
             last_logits_positions_.clear();
-            for (int i = 0; i < config_.block_length; i++) {
+        for (int i = 0; i < config_.block_length; i++) {
                 const llama_token tok = current_block[i];
                 batch.token[i] = (tok == config_.mask_token_id) ? mask_token_id_for_model_ : sanitize_token_for_model(tok);
-                batch.pos[i] = static_cast<llama_pos>(block_start + i);
-                batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = 0;
+            batch.pos[i] = static_cast<llama_pos>(block_start + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
                 if (mask_only_logits) {
                     batch.logits[i] = (current_block[i] == config_.mask_token_id);
                 } else if (freeze_done_micro && done_micro_no_logits && frozen_micros[static_cast<size_t>(i / micro_size)]) {
                     batch.logits[i] = false;
                 } else {
-                    batch.logits[i] = true;
+            batch.logits[i] = true;
                 }
                 if (batch.logits[i]) {
                     logits_true++;
                     last_logits_positions_.push_back(i);
                 }
-            }
-            batch.n_tokens = config_.block_length;
+        }
+        batch.n_tokens = config_.block_length;
             last_logits_count_ = logits_true;
         }
 
@@ -781,8 +781,8 @@ void DiffusionSampler::denoise_block(
                 // 重新创建一个占位 batch，保证后续 llama_batch_free 逻辑不变
                 batch = llama_batch_init(config_.block_length, 0, 1);
             } else {
-                assert(false && "llama_decode failed inside denoise_block!");
-                return;
+            assert(false && "llama_decode failed inside denoise_block!");
+            return;
             }
         }
 
@@ -874,7 +874,6 @@ void DiffusionSampler::denoise_block(
                             if (device_logits_env && !skip_sync_after_output_ids) {
                                 llama_synchronize(ctx_);
                             }
-                            const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
                             int out_count = 0;
                             const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
 #if defined(DIFFUSION_ENABLE_CUDA)
@@ -884,6 +883,14 @@ void DiffusionSampler::denoise_block(
                                 // Skip-sync is an experimental perf knob; may degrade quality if logits are not ready.
                             }
 #endif
+                            // output_ids may trigger output_reorder which can reorder/swap device logits buffers.
+                            // For correctness: fetch device pointer after output_ids.
+                            const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
+                            // llama.cpp may report stride in bytes in some builds; normalize to float elements.
+                            if (stride_tokens > 0 && stride_tokens != n_vocab && (stride_tokens % (int64_t) sizeof(float)) == 0) {
+                                const int64_t as_floats = stride_tokens / (int64_t) sizeof(float);
+                                if (as_floats >= n_vocab) stride_tokens = as_floats;
+                            }
 
                             // llama.cpp: out_ids is a mapping from batch index -> logits row (or -1 when batch.logits[i] != true).
                             // Here batch.n_tokens == decode_count, and out_count is the number of logits rows.
@@ -1068,7 +1075,6 @@ void DiffusionSampler::denoise_block(
                         if (device_logits_env && !skip_sync_after_output_ids) {
                             llama_synchronize(ctx_);
                         }
-                        const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
                         int out_count = 0;
                         const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
 #if defined(DIFFUSION_ENABLE_CUDA)
@@ -1078,6 +1084,14 @@ void DiffusionSampler::denoise_block(
                             // Skip-sync is an experimental perf knob; may degrade quality if logits are not ready.
                         }
 #endif
+                        // output_ids may trigger output_reorder which can reorder/swap device logits buffers.
+                        // For correctness: fetch device pointer after output_ids.
+                        const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
+                        // llama.cpp may report stride in bytes in some builds; normalize to float elements.
+                        if (stride_tokens > 0 && stride_tokens != n_vocab && (stride_tokens % (int64_t) sizeof(float)) == 0) {
+                            const int64_t as_floats = stride_tokens / (int64_t) sizeof(float);
+                            if (as_floats >= n_vocab) stride_tokens = as_floats;
+                        }
 
                         // Fast path: sample all logits rows on device, then pick only our active positions via out_ids mapping.
                         if (logits_dev && out_ids && out_count > 0 && stride_tokens >= n_vocab) {
@@ -1181,29 +1195,29 @@ void DiffusionSampler::denoise_block(
                     sampled_block = current_block;
                     std::fill(confidences_block.begin(), confidences_block.end(), -INFINITY);
                     if (!sampled && try_sample_with_gpu(
-                            n_vocab,
-                            need_entropy_probs,
-                            sampled_block,
-                            confidences_block,
-                            entropy_ptr_block,
-                            &gpu_elapsed_ms)) {
-                        DiffusionProfiler::instance().record_custom("sampler_gpu_total_ms", gpu_elapsed_ms);
-                        double overhead = std::max(0.0, total_timer.elapsed_ms() - gpu_elapsed_ms);
-                        DiffusionProfiler::instance().record_custom("sampler_gpu_overhead_ms", overhead);
-                        sampler_metrics_.gpu_total_ms += gpu_elapsed_ms;
-                        sampler_metrics_.gpu_overhead_ms += overhead;
+                        n_vocab,
+                        need_entropy_probs,
+                        sampled_block,
+                        confidences_block,
+                        entropy_ptr_block,
+                        &gpu_elapsed_ms)) {
+                    DiffusionProfiler::instance().record_custom("sampler_gpu_total_ms", gpu_elapsed_ms);
+                    double overhead = std::max(0.0, total_timer.elapsed_ms() - gpu_elapsed_ms);
+                    DiffusionProfiler::instance().record_custom("sampler_gpu_overhead_ms", overhead);
+                    sampler_metrics_.gpu_total_ms += gpu_elapsed_ms;
+                    sampler_metrics_.gpu_overhead_ms += overhead;
 
-                        // 仅回收活跃位置
+                    // 仅回收活跃位置
                         if (need_entropy_probs) entropy_active.resize(static_cast<size_t>(active_count));
-                        for (int i = 0; i < active_count; ++i) {
-                            const int pos = active_positions[i];
-                            sampled_tokens_active[i] = sampled_block[pos];
-                            confidences_active[i] = confidences_block[pos];
-                            if (need_entropy_probs && pos < static_cast<int>(gpu_entropy_block_buffer_.size())) {
+                    for (int i = 0; i < active_count; ++i) {
+                        const int pos = active_positions[i];
+                        sampled_tokens_active[i] = sampled_block[pos];
+                        confidences_active[i] = confidences_block[pos];
+                        if (need_entropy_probs && pos < static_cast<int>(gpu_entropy_block_buffer_.size())) {
                                 entropy_active[static_cast<size_t>(i)] = std::move(gpu_entropy_block_buffer_[pos]);
-                            }
                         }
-                        sampled = true;
+                    }
+                    sampled = true;
                     }
                 } else {
                     if (gpu_only_mode) {
@@ -1826,6 +1840,11 @@ bool DiffusionSampler::try_sample_with_gpu(
     };
     const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
     const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
+    // Fused GPU sampler fast path is currently quality-sensitive; keep it opt-in by default.
+    // - Set DIFFUSION_GPU_ALLOW_FUSED=1 to enable fused fast path.
+    // - Set DIFFUSION_GPU_FORCE_NON_FUSED=1 to force-disable it.
+    const bool allow_fused = env_flag("DIFFUSION_GPU_ALLOW_FUSED");
+    const bool force_non_fused = !allow_fused || env_flag("DIFFUSION_GPU_FORCE_NON_FUSED");
 
     const bool device_logits_async = env_flag("LLAMA_DEVICE_LOGITS_ASYNC");
     const bool skip_sync_after_output_ids = env_flag("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS");
@@ -1877,85 +1896,25 @@ bool DiffusionSampler::try_sample_with_gpu(
         return false;
     }
 
-    // Experimental: device logits path (CUDA only, when enabled upstream)
-    // NOTE: Only async device-logits needs a synchronize for correctness; doing it in sync mode wastes time badly.
-    // We additionally gate it behind DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS=0 (quality-first mode).
-    if (device_logits_env && device_logits_async && !skip_sync_after_output_ids) {
-        diffusion::ProfilerTimer sync_before_get_device_timer;
-        llama_synchronize(ctx_);
-        host_pre_sync_before_get_device_ms = sync_before_get_device_timer.elapsed_ms();
-    } else {
-        host_pre_sync_before_get_device_ms = 0.0;
-    }
-    DiffusionProfiler::instance().record_custom(
-        "sampler_gpu_host_pre_sync_before_get_device_ms",
-        host_pre_sync_before_get_device_ms
-    );
-    diffusion::ProfilerTimer get_device_timer;
-    int64_t logits_stride = 0;
-    const float* device_logits = llama_get_logits_device(ctx_, &logits_stride);
-    DIFF_LOGD("[DiffusionSampler][debug] device_logits ptr=%p stride=%lld\n",
-              (const void*)device_logits, (long long)logits_stride);
-    double get_device_ms = get_device_timer.elapsed_ms();
-    host_pre_checkpoint_ms[0] = get_device_ms;
-    host_pre_get_device_ms = get_device_ms;
-    host_pre_elapsed_after_get_device = host_phase_timer.elapsed_ms();
-    DiffusionProfiler::instance().record_custom(
-        "sampler_gpu_get_device_logits_ms",
-        get_device_ms
-    );
-    sampler_metrics_.gpu_overhead_get_device_logits_ms += get_device_ms;
-    const bool device_available = device_logits != nullptr;
-    const bool stride_ok = logits_stride == n_vocab;
-    bool local_stride_ok = stride_ok; // 允许在压缩后更新
+    // Device logits path (CUDA only, when enabled upstream).
+    //
+    // IMPORTANT correctness detail:
+    // llama_get_logits_output_ids() may trigger output_reorder(), which can reorder/swap the underlying
+    // device logits buffer. Therefore we must fetch output_ids FIRST, then fetch the device logits pointer.
     const bool full_logits = last_logits_count_ == config_.block_length;
     const int expected_rows_i = last_logits_count_;
     int debug_output_count = -1;
     const int32_t* output_ids_ptr = nullptr;
+    const bool debug_device = std::getenv("DIFFUSION_DEBUG_DEVICE_LOGITS") != nullptr;
     bool can_use_device_logits =
         device_logits_env &&
-        device_available &&
         expected_rows_i > 0 &&
         static_cast<int>(last_logits_positions_.size()) == expected_rows_i;
-    DIFF_LOGD("[DiffusionSampler][debug] device_available=%d stride_ok=%d full_logits=%d can_use_device_logits=%d last_logits_count=%d n_vocab=%d\n",
-              device_available ? 1 : 0,
-              stride_ok ? 1 : 0,
-              full_logits ? 1 : 0,
-              can_use_device_logits ? 1 : 0,
-              last_logits_count_,
-              n_vocab);
 
-    if (need_entropy_probs) {
-        sampler_metrics_.gpu_path_need_entropy++;
-    }
-
-    double local_gpu_ms = 0.0;
-    const bool debug_device = std::getenv("DIFFUSION_DEBUG_DEVICE_LOGITS") != nullptr;
-
-#if defined(DIFFUSION_ENABLE_CUDA)
-    auto ensure_compact_buffer = [&](size_t bytes) -> bool {
-        if (device_logits_compact_bytes_ < bytes) {
-            if (device_logits_compact_) {
-                cudaFree(device_logits_compact_);
-                device_logits_compact_ = nullptr;
-                device_logits_compact_bytes_ = 0;
-            }
-            if (cudaMalloc(&device_logits_compact_, bytes) != cudaSuccess) {
-                device_logits_compact_ = nullptr;
-                device_logits_compact_bytes_ = 0;
-                return false;
-            }
-            device_logits_compact_bytes_ = bytes;
-        }
-        return device_logits_compact_ != nullptr;
-    };
-#endif
-
-    if ((can_use_device_logits || debug_device) && device_available) {
+    if ((can_use_device_logits || debug_device) && device_logits_env) {
         diffusion::ProfilerTimer output_ids_timer;
-        output_ids_ptr = llama_get_logits_output_ids(ctx_, &debug_output_count); // also triggers output_reorder/sync
+        output_ids_ptr = llama_get_logits_output_ids(ctx_, &debug_output_count); // triggers output_reorder()
         double get_output_ids_ms = output_ids_timer.elapsed_ms();
-        host_pre_checkpoint_ms[1] = get_device_ms + get_output_ids_ms;
         host_pre_get_output_ids_ms = get_output_ids_ms;
         host_pre_elapsed_after_output_ids = host_phase_timer.elapsed_ms();
         DiffusionProfiler::instance().record_custom("sampler_gpu_get_output_ids_ms", get_output_ids_ms);
@@ -1973,7 +1932,6 @@ bool DiffusionSampler::try_sample_with_gpu(
                           int(sync_err_after_output_ids));
             }
         } else if (device_logits_env && skip_sync_after_output_ids && device_logits_async) {
-            // 在异步模式下可选择跳过同步，用于观察开销；风险：可能导致日志或生成乱码
             DiffusionProfiler::instance().record_custom(
                 "sampler_gpu_host_pre_sync_after_output_ids_ms",
                 0.0);
@@ -1996,6 +1954,121 @@ bool DiffusionSampler::try_sample_with_gpu(
                       debug_output_count, (const void*)output_ids_ptr);
         }
     }
+
+    // NOTE: Only async device-logits needs an explicit llama_synchronize in theory, but in practice
+    // output_reorder/device writes can still be in-flight. We rely on the cudaDeviceSynchronize above (quality-first),
+    // and only keep this pre-get-device sync for async mode (perf knob).
+    if (device_logits_env && device_logits_async && !skip_sync_after_output_ids) {
+        diffusion::ProfilerTimer sync_before_get_device_timer;
+        llama_synchronize(ctx_);
+        host_pre_sync_before_get_device_ms = sync_before_get_device_timer.elapsed_ms();
+    } else {
+        host_pre_sync_before_get_device_ms = 0.0;
+    }
+        DiffusionProfiler::instance().record_custom(
+            "sampler_gpu_host_pre_sync_before_get_device_ms",
+            host_pre_sync_before_get_device_ms
+        );
+    diffusion::ProfilerTimer get_device_timer;
+    int64_t logits_stride = 0;
+    const float* device_logits = llama_get_logits_device(ctx_, &logits_stride);
+    // llama.cpp may report stride in bytes in some builds; normalize to float elements.
+    if (logits_stride > 0 && logits_stride != n_vocab && (logits_stride % (int64_t) sizeof(float)) == 0) {
+        const int64_t as_floats = logits_stride / (int64_t) sizeof(float);
+        if (as_floats >= n_vocab) logits_stride = as_floats;
+    }
+    DIFF_LOGD("[DiffusionSampler][debug] device_logits ptr=%p stride=%lld\n",
+              (const void*)device_logits, (long long)logits_stride);
+    double get_device_ms = get_device_timer.elapsed_ms();
+    host_pre_checkpoint_ms[0] = get_device_ms;
+    host_pre_get_device_ms = get_device_ms;
+    host_pre_elapsed_after_get_device = host_phase_timer.elapsed_ms();
+    DiffusionProfiler::instance().record_custom(
+        "sampler_gpu_get_device_logits_ms",
+        get_device_ms
+    );
+    sampler_metrics_.gpu_overhead_get_device_logits_ms += get_device_ms;
+    const bool device_available = device_logits != nullptr;
+    can_use_device_logits = can_use_device_logits && device_available;
+    const bool stride_ok = logits_stride == n_vocab;
+    bool local_stride_ok = stride_ok; // 允许在压缩后更新
+    DIFF_LOGD("[DiffusionSampler][debug] device_available=%d stride_ok=%d full_logits=%d can_use_device_logits=%d last_logits_count=%d n_vocab=%d\n",
+              device_available ? 1 : 0,
+              stride_ok ? 1 : 0,
+              full_logits ? 1 : 0,
+              can_use_device_logits ? 1 : 0,
+              last_logits_count_,
+              n_vocab);
+
+    if (need_entropy_probs) {
+        sampler_metrics_.gpu_path_need_entropy++;
+    }
+
+    double local_gpu_ms = 0.0;
+
+#if defined(DIFFUSION_ENABLE_CUDA)
+    // Lightweight sanity check: verify how device logits rows map to host logits rows.
+    // This helps catch output_ids direction/meaning mismatches without expensive full-row comparisons.
+    if (device_logits_env && can_use_device_logits && output_ids_ptr && device_available &&
+        std::getenv("DIFFUSION_DEVICE_LOGITS_LIGHT_CHECK")) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            auto read_dev = [&](int row, int col) -> float {
+                float v = 0.0f;
+                const float* p = device_logits + static_cast<size_t>(row) * static_cast<size_t>(logits_stride) + static_cast<size_t>(col);
+                cudaMemcpy(&v, p, sizeof(float), cudaMemcpyDeviceToHost);
+                return v;
+            };
+            auto inv_lookup = [&](int pos) -> int {
+                // find r such that output_ids_ptr[r] == pos (scan small prefix; expected_rows_i is small e.g. <=64)
+                for (int r = 0; r < expected_rows_i; ++r) {
+                    if (output_ids_ptr[r] == pos) return r;
+                }
+                return -1;
+            };
+            const int test_cols[3] = {0, std::min(123, n_vocab - 1), std::max(0, n_vocab / 2)};
+            for (int pos = 0; pos < std::min(3, expected_rows_i); ++pos) {
+                const float* host_row = llama_get_logits_ith(ctx_, pos);
+                if (!host_row) continue;
+                const int mapped = output_ids_ptr[pos];
+                const int inv = inv_lookup(pos);
+                double d_direct = 0.0, d_mapped = 0.0, d_inv = 0.0;
+                for (int k = 0; k < 3; ++k) {
+                    const int c = test_cols[k];
+                    const double hv = host_row[c];
+                    const double dv = (pos < expected_rows_i) ? read_dev(pos, c) : 0.0;
+                    const double mv = (mapped >= 0 && mapped < debug_output_count) ? read_dev(mapped, c) : 0.0;
+                    const double iv = (inv >= 0 && inv < debug_output_count) ? read_dev(inv, c) : 0.0;
+                    d_direct += std::fabs(hv - dv);
+                    d_mapped += std::fabs(hv - mv);
+                    d_inv += std::fabs(hv - iv);
+                }
+                DIFF_LOGI("[device_logits_check] pos=%d out_ids[pos]=%d inv=%d stride=%lld out_count=%d |diff| direct=%.6f mapped=%.6f inv=%.6f\n",
+                          pos, mapped, inv, (long long) logits_stride, debug_output_count, d_direct, d_mapped, d_inv);
+            }
+        }
+    }
+    auto ensure_compact_buffer = [&](size_t bytes) -> bool {
+        if (device_logits_compact_bytes_ < bytes) {
+            if (device_logits_compact_) {
+                cudaFree(device_logits_compact_);
+                device_logits_compact_ = nullptr;
+                device_logits_compact_bytes_ = 0;
+            }
+            if (cudaMalloc(&device_logits_compact_, bytes) != cudaSuccess) {
+                device_logits_compact_ = nullptr;
+                device_logits_compact_bytes_ = 0;
+                return false;
+            }
+            device_logits_compact_bytes_ = bytes;
+        }
+        return device_logits_compact_ != nullptr;
+    };
+#endif
+
+    // output_ids is now fetched before device_logits to avoid pointer invalidation by output_reorder().
+    host_pre_checkpoint_ms[1] = host_pre_get_device_ms + host_pre_get_output_ids_ms;
 
 #if defined(DIFFUSION_ENABLE_CUDA)
     // Debug: host vs device logits diff to catch reorder/stride issues
@@ -2192,7 +2265,7 @@ bool DiffusionSampler::try_sample_with_gpu(
             row_conf,
             row_probs_ptr,
             &gpu_stats,
-            /*force_non_fused=*/false);
+            /*force_non_fused=*/force_non_fused);
 
         if (std::getenv("DIFFUSION_DEBUG_DEVICE_LOGITS") != nullptr) {
             DIFF_LOGW("[device_logits] device_sample rows=%d stride=%lld used_compact=%d ok=%d\n",
@@ -2264,7 +2337,7 @@ bool DiffusionSampler::try_sample_with_gpu(
                 fast_conf,
                 nullptr,
                 &fast_stats,
-                /*force_non_fused=*/false
+                /*force_non_fused=*/force_non_fused
             );
         }
 
