@@ -79,8 +79,19 @@ def _repetition_metrics(text: str) -> Dict[str, float]:
             run = 1
     return {"dup_word_rate": dup / (len(words) - 1), "max_dup_run": float(max_run)}
 
-def _compute_token_counts(prompt, tokens):
-    """Return (prompt_tokens, total_tokens, generated_tokens, has_prompt_prefix)."""
+def _compute_token_counts(prompt, tokens, mask_token_id=None, eos_token_id=None):
+    """Return (prompt_tokens, total_tokens, generated_tokens, raw_generated_tokens, has_prompt_prefix).
+    
+    Args:
+        prompt: Prompt token list
+        tokens: Full token list (prompt + generated)
+        mask_token_id: Mask token ID to filter out (optional)
+        eos_token_id: EOS token ID to filter out (optional)
+    
+    Returns:
+        (prompt_tokens, total_tokens, meaningful_generated_tokens, raw_generated_tokens, has_prompt_prefix)
+        where meaningful_generated_tokens excludes mask/EOS padding tokens.
+    """
     prompt_tokens = len(prompt) if prompt is not None else 0
     total_tokens = len(tokens) if tokens is not None else 0
     has_prefix = False
@@ -89,14 +100,30 @@ def _compute_token_counts(prompt, tokens):
             has_prefix = (tokens[:prompt_tokens] == prompt)
         except Exception:
             has_prefix = False
-    generated_tokens = (total_tokens - prompt_tokens) if has_prefix else total_tokens
-    return prompt_tokens, total_tokens, generated_tokens, has_prefix
+    
+    # Raw generated tokens (including padding/control tokens)
+    raw_generated_tokens = (total_tokens - prompt_tokens) if has_prefix else total_tokens
+    
+    # Filter out control tokens to get meaningful generated tokens
+    if has_prefix and prompt_tokens < total_tokens:
+        gen_tokens_list = tokens[prompt_tokens:]
+        meaningful_tokens = gen_tokens_list
+        if mask_token_id is not None:
+            meaningful_tokens = [t for t in meaningful_tokens if t != mask_token_id]
+        if eos_token_id is not None:
+            meaningful_tokens = [t for t in meaningful_tokens if t != eos_token_id]
+        generated_tokens = len(meaningful_tokens)
+    else:
+        generated_tokens = raw_generated_tokens
+    
+    return prompt_tokens, total_tokens, generated_tokens, raw_generated_tokens, has_prefix
 
 class DiffusionProfiler:
-    def __init__(self, model_path: str, n_ctx: int = 8192, n_gpu_layers: int = 0):
+    def __init__(self, model_path: str, n_ctx: int = 8192, n_gpu_layers: int = 0, tokenizer=None):
         self.model = llama_diffusion_profiled.LlamaDiffusionProfiled(
             model_path, n_ctx, n_gpu_layers
         )
+        self.tokenizer = tokenizer  # Store tokenizer for eos_token_id lookup
         self.is_warmed_up = False
     
     def warmup(
@@ -209,14 +236,22 @@ class DiffusionProfiler:
         end_time = time.time()
         total_wall_time = (end_time - start_time) * 1000  # Convert to ms
         
-        prompt_tokens, total_tokens, generated_tokens, has_prefix = _compute_token_counts(prompt, tokens)
+        # Get eos_token_id from tokenizer if available (for filtering)
+        eos_token_id = None
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            eos_token_id = getattr(self.tokenizer, 'eos_token_id', None)
+        
+        prompt_tokens, total_tokens, generated_tokens, raw_generated_tokens, has_prefix = _compute_token_counts(
+            prompt, tokens, mask_token_id=mask_token_id, eos_token_id=eos_token_id
+        )
         return {
             'tokens': tokens,
             'profile': profile,
             'wall_time_ms': total_wall_time,
             'prompt_tokens': prompt_tokens,
             'total_tokens': total_tokens,
-            'generated_tokens': generated_tokens,
+            'generated_tokens': generated_tokens,  # meaningful tokens (excluding mask/EOS padding)
+            'raw_generated_tokens': raw_generated_tokens,  # raw count including padding
             'has_prompt_prefix': has_prefix,
             'config': {
                 'gen_length': gen_length,
@@ -311,6 +346,7 @@ class DiffusionProfiler:
             'prompt_tokens': run_results[0].get('prompt_tokens', 0),
             'total_tokens': run_results[0].get('total_tokens', len(run_results[0].get('tokens', []))),
             'generated_tokens': run_results[0].get('generated_tokens', len(run_results[0].get('tokens', []))),
+            'raw_generated_tokens': run_results[0].get('raw_generated_tokens', run_results[0].get('generated_tokens', len(run_results[0].get('tokens', [])))),
             'has_prompt_prefix': run_results[0].get('has_prompt_prefix', False),
             'config': run_results[0]['config'],
             'profile': {}
@@ -362,10 +398,14 @@ class DiffusionProfiler:
         prompt_tokens = int(result.get('prompt_tokens', 0))
         total_tokens = int(result.get('total_tokens', len(result.get('tokens', []))))
         gen_tokens = int(result.get('generated_tokens', total_tokens))
+        raw_gen_tokens = int(result.get('raw_generated_tokens', gen_tokens))
         wall_s = (result['wall_time_ms'] / 1000) if result['wall_time_ms'] > 0 else 0.0
         total_tps = (total_tokens / wall_s) if wall_s > 0 else 0.0
         gen_tps = (gen_tokens / wall_s) if wall_s > 0 else 0.0
-        lines.append(f"Tokens: gen={gen_tokens} total={total_tokens} prompt={prompt_tokens}")
+        if raw_gen_tokens != gen_tokens:
+            lines.append(f"Tokens: gen={gen_tokens} (raw={raw_gen_tokens}) total={total_tokens} prompt={prompt_tokens}")
+        else:
+            lines.append(f"Tokens: gen={gen_tokens} total={total_tokens} prompt={prompt_tokens}")
         lines.append(f"Throughput (gen): {gen_tps:.2f} tokens/sec")
         lines.append(f"Throughput (total): {total_tps:.2f} tokens/sec")
 
@@ -1020,7 +1060,7 @@ def main():
     # 4) profiler
     n_ctx = int(os.environ.get("TEST_PROFILING_N_CTX", "8192"))
     n_gpu_layers = int(os.environ.get("TEST_PROFILING_N_GPU_LAYERS", "35"))
-    profiler = DiffusionProfiler(MODEL_PATH, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers)
+    profiler = DiffusionProfiler(MODEL_PATH, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers, tokenizer=tokenizer)
 
     # 5) 质量门槛（与 quality_speed_baseline.py 的 dup_rate/max_run 一致，并额外加一个字符级兜底）
     QUALITY_MAX_DUP_RATE = float(os.environ.get("TEST_PROFILING_QUALITY_MAX_DUP_RATE", "0.05"))
@@ -1044,7 +1084,7 @@ def main():
         return {"dup_char_rate": dup / (len(chars) - 1), "max_char_run": float(max_run)}
 
     def _quality_pass(tokens: List[int], prompt_ids: List[int]) -> Dict[str, object]:
-        _, _, _, has_prefix = _compute_token_counts(prompt_ids, tokens)
+        _, _, _, _, has_prefix = _compute_token_counts(prompt_ids, tokens)
         gen_ids = tokens[len(prompt_ids):] if has_prefix else tokens
         text = tokenizer.decode(gen_ids, skip_special_tokens=False)
         text = _clean_generated_text(text)

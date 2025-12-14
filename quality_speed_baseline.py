@@ -165,7 +165,14 @@ def run_case(
 
     # Token-accurate generated part (do NOT truncate at EOS: diffusion may place EOS-like tokens transiently).
     gen_tokens_list = out_tokens[prompt_len:] if total_tokens >= prompt_len else out_tokens
-    generated_tokens = len(gen_tokens_list)
+    
+    # Filter out control tokens to get actual meaningful generated tokens
+    # This includes mask tokens, EOS tokens, and other padding tokens
+    # Note: We count meaningful tokens for speed calculation, not raw token count (which may include padding)
+    meaningful_tokens = _filter_token_id(gen_tokens_list, mask_id)
+    meaningful_tokens = _filter_token_id(meaningful_tokens, eos_id)
+    generated_tokens = len(meaningful_tokens)
+    raw_generated_tokens = len(gen_tokens_list)  # Keep original count for reference
 
     # Decode WITHOUT dropping special tokens; we can post-filter known control tokens.
     decoded_full = tokenizer.decode(out_tokens, skip_special_tokens=False)
@@ -186,9 +193,10 @@ def run_case(
         "elapsed_sec": elapsed,
         "prompt_tokens": prompt_len,
         "total_tokens": total_tokens,
-        "generated_tokens": generated_tokens,
+        "generated_tokens": generated_tokens,  # meaningful tokens (excluding mask/EOS padding)
+        "raw_generated_tokens": raw_generated_tokens,  # raw count including padding tokens
         "tokens": total_tokens,  # backward-compat alias
-        "tokens_per_sec": gen_tokens_per_sec,  # default: generated tokens/sec
+        "tokens_per_sec": gen_tokens_per_sec,  # meaningful tokens/sec (for accurate speed measurement)
         "gen_tokens_per_sec": gen_tokens_per_sec,
         "dup_word_rate": rep["dup_word_rate"],
         "max_dup_run": rep["max_dup_run"],
@@ -342,7 +350,8 @@ def main():
                 lines.append(
                     f"[{p['name']}] block={b} micro={m} steps={denoising_steps} "
                     f"elapsed={res['elapsed_sec']:.2f}s gen_tps={res['gen_tokens_per_sec']:.2f} "
-                    f"gen={res['generated_tokens']} total={res['total_tokens']} prompt={res['prompt_tokens']} "
+                    f"gen={res['generated_tokens']} (raw={res.get('raw_generated_tokens', res['generated_tokens'])}) "
+                    f"total={res['total_tokens']} prompt={res['prompt_tokens']} "
                     f"dup_rate={res['dup_word_rate']:.3f} max_run={int(res['max_dup_run'])}"
                 )
                 lines.append(res["output_text"])

@@ -857,6 +857,8 @@ void DiffusionSampler::denoise_block(
                         const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
                         const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
                         const bool allow_gpu_sampling = !env_flag("DIFFUSION_DISABLE_GPU_SAMPLER") && !env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+                        const bool allow_fused = env_flag("DIFFUSION_GPU_ALLOW_FUSED");
+                        const bool force_non_fused = !allow_fused || env_flag("DIFFUSION_GPU_FORCE_NON_FUSED");
                         if (!allow_gpu_sampling && gpu_only_mode) {
                             llama_batch_free(batch);
                             throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampling 被禁用 (DIFFUSION_DISABLE_GPU_SAMPLER/DIFFUSION_FORCE_CPU_SAMPLING)");
@@ -907,7 +909,7 @@ void DiffusionSampler::denoise_block(
                                         gpu_confs_out,
                                         nullptr,
                                         &gpu_stats,
-                                        /*force_non_fused=*/false
+                                        /*force_non_fused=*/force_non_fused
                                     );
                                 } else {
                                     ok_gpu = gpu_sampler_->sample_from_device_ptr_strided(
@@ -920,7 +922,7 @@ void DiffusionSampler::denoise_block(
                                         gpu_confs_out,
                                         nullptr,
                                         &gpu_stats,
-                                        /*force_non_fused=*/false
+                                        /*force_non_fused=*/force_non_fused
                                     );
                                 }
                                 if (ok_gpu && static_cast<int>(gpu_tokens_out.size()) == out_count && static_cast<int>(gpu_confs_out.size()) == out_count) {
@@ -1033,6 +1035,8 @@ void DiffusionSampler::denoise_block(
                 const bool gpu_only_mode = env_flag("DIFFUSION_GPU_ONLY") || config_.gpu_only_mode;
                 const bool device_logits_env = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
                 const bool allow_gpu_sampling = !env_flag("DIFFUSION_DISABLE_GPU_SAMPLER") && !env_flag("DIFFUSION_FORCE_CPU_SAMPLING");
+                const bool allow_fused = env_flag("DIFFUSION_GPU_ALLOW_FUSED");
+                const bool force_non_fused = !allow_fused || env_flag("DIFFUSION_GPU_FORCE_NON_FUSED");
 
                 if (!allow_gpu_sampling && gpu_only_mode) {
                     llama_batch_free(batch);
@@ -1107,7 +1111,7 @@ void DiffusionSampler::denoise_block(
                                     gpu_confs_out,
                                     nullptr,
                                     &gpu_stats,
-                                    /*force_non_fused=*/false
+                                    /*force_non_fused=*/force_non_fused
                                 );
                             } else {
                                 ok_gpu = gpu_sampler_->sample_from_device_ptr_strided(
@@ -1120,7 +1124,7 @@ void DiffusionSampler::denoise_block(
                                     gpu_confs_out,
                                     nullptr,
                                     &gpu_stats,
-                                    /*force_non_fused=*/false
+                                    /*force_non_fused=*/force_non_fused
                                 );
                             }
                             if (ok_gpu && static_cast<int>(gpu_tokens_out.size()) == out_count && static_cast<int>(gpu_confs_out.size()) == out_count) {
