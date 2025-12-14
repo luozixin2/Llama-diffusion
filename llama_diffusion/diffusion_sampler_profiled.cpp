@@ -6,6 +6,9 @@
 #include <cmath>
 #include <cassert>
 #include "diffusion_logging.h"
+#if defined(DIFFUSION_ENABLE_CUDA)
+#include <cuda_runtime.h>
+#endif
 
 namespace diffusion {
 
@@ -19,7 +22,9 @@ std::vector<llama_token> DiffusionSamplerProfiled::generate_internal_profiled(
     const size_t total_length = static_cast<size_t>(num_blocks) * config_.block_length;
     
     std::vector<llama_token> sequence(total_length, config_.mask_token_id);
-    std::copy(prompt.begin(), prompt.end(), sequence.begin());
+    for (size_t i = 0; i < prompt_length; ++i) {
+        sequence[i] = sanitize_token_for_model(prompt[i]);
+    }
     
     DiffusionProfiler::instance().record_custom("num_blocks", num_blocks);
     DiffusionProfiler::instance().record_custom("total_length", total_length);
@@ -61,11 +66,15 @@ std::vector<llama_token> DiffusionSamplerProfiled::generate_internal_profiled(
         {
             PROFILE_SECTION("prefill_batch_preparation");
             for (size_t i = 0; i < prefill_length; i++) {
-                batch.token[i] = sequence[i];
+                batch.token[i] = sanitize_token_for_model(sequence[i]);
                 batch.pos[i] = static_cast<llama_pos>(i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
                 batch.logits[i] = false;
+            }
+            // Keep 1 dummy output to avoid ggml-cuda GET_ROWS launch with grid.x=0 when n_outputs==0.
+            if (prefill_length > 0) {
+                batch.logits[prefill_length - 1] = true;
             }
             batch.n_tokens = static_cast<int>(prefill_length);
         }
@@ -149,6 +158,29 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
         }
     }
 
+    // Micro-freeze scheduling (defaults ON):
+    // - Once a micro has no masks, it is considered "done" and we can stop requesting logits for it.
+    auto env_flag = [](const char* key) {
+        const char* v = std::getenv(key);
+        if (!v) return false;
+        if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+        return true;
+    };
+    auto env_flag_default_true = [&](const char* key) {
+        const char* v = std::getenv(key);
+        if (!v) return true;
+        if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
+        return true;
+    };
+    const bool freeze_done_micro = env_flag_default_true("DIFFUSION_FREEZE_DONE_MICRO");
+    const bool done_micro_no_logits = env_flag_default_true("DIFFUSION_DONE_MICRO_NO_LOGITS");
+    std::vector<char> frozen_micros(static_cast<size_t>(micro_count), 0);
+    if (freeze_done_micro) {
+        for (int m = 0; m < micro_count; ++m) {
+            if (masks_per_micro[m] == 0) frozen_micros[static_cast<size_t>(m)] = 1;
+        }
+    }
+
     // partial KV/logits reuse 需要跨 step 追踪“哪些微块的 token 在上一轮被更新过”
     std::vector<char> dirty_micros(static_cast<size_t>(micro_count), 1);
 
@@ -200,12 +232,6 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
             if (pos >= 0 && pos < config_.block_length) active_pos2idx[pos] = i;
         }
         const bool need_entropy_probs = (config_.remasking_strategy == RemaskingStrategy::ENTROPY_BOUNDED);
-        auto env_flag = [](const char* key) {
-            const char* v = std::getenv(key);
-            if (!v) return false;
-            if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') return false;
-            return true;
-        };
 
         // 需要清理/重算的微块：仍含 mask 的微块 + 上一轮 token 发生过更新的微块
         micros_to_decode.clear();
@@ -329,26 +355,47 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
         {
             PROFILE_SECTION("batch_preparation");
             if (do_partial_kv) {
+                int logits_true = 0;
+                last_logits_positions_.clear();
                 for (int i = 0; i < decode_count; i++) {
                     const int pos = decode_positions[i];
-                    batch.token[i] = current_block[pos];
+                    const llama_token tok = current_block[pos];
+                    batch.token[i] = (tok == config_.mask_token_id) ? mask_token_id_for_model_ : sanitize_token_for_model(tok);
                     batch.pos[i] = static_cast<llama_pos>(block_start + pos);
                     batch.n_seq_id[i] = 1;
                     batch.seq_id[i][0] = 0;
                     batch.logits[i] = (current_block[pos] == config_.mask_token_id);
+                    if (batch.logits[i]) {
+                        logits_true++;
+                        last_logits_positions_.push_back(pos);
+                    }
                 }
                 batch.n_tokens = decode_count;
-                last_logits_count_ = decode_count;
+                last_logits_count_ = logits_true;
             } else {
+                const bool mask_only_logits = env_flag("DIFFUSION_MASK_ONLY_LOGITS");
+                int logits_true = 0;
+                last_logits_positions_.clear();
                 for (int i = 0; i < config_.block_length; i++) {
-                    batch.token[i] = current_block[i];
+                    const llama_token tok = current_block[i];
+                    batch.token[i] = (tok == config_.mask_token_id) ? mask_token_id_for_model_ : sanitize_token_for_model(tok);
                     batch.pos[i] = static_cast<llama_pos>(block_start + i);
                     batch.n_seq_id[i] = 1;
                     batch.seq_id[i][0] = 0;
-                    batch.logits[i] = true;
+                    if (mask_only_logits) {
+                        batch.logits[i] = (current_block[i] == config_.mask_token_id);
+                    } else if (freeze_done_micro && done_micro_no_logits && frozen_micros[static_cast<size_t>(i / micro_size)]) {
+                        batch.logits[i] = false;
+                    } else {
+                        batch.logits[i] = true;
+                    }
+                    if (batch.logits[i]) {
+                        logits_true++;
+                        last_logits_positions_.push_back(i);
+                    }
                 }
                 batch.n_tokens = config_.block_length;
-                last_logits_count_ = config_.block_length;
+                last_logits_count_ = logits_true;
             }
         }
 
@@ -368,15 +415,29 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                     sampler_metrics_.kv_rm_full_calls++;
                     sampler_metrics_.kv_rm_tokens += config_.block_length;
                     llama_batch b2 = llama_batch_init(config_.block_length, 0, 1);
+                    int logits_true2 = 0;
+                    last_logits_positions_.clear();
+                    const bool mask_only_logits = env_flag("DIFFUSION_MASK_ONLY_LOGITS");
                     for (int i = 0; i < config_.block_length; i++) {
-                        b2.token[i] = current_block[i];
+                        const llama_token tok = current_block[i];
+                        b2.token[i] = (tok == config_.mask_token_id) ? mask_token_id_for_model_ : sanitize_token_for_model(tok);
                         b2.pos[i] = static_cast<llama_pos>(block_start + i);
                         b2.n_seq_id[i] = 1;
                         b2.seq_id[i][0] = 0;
-                        b2.logits[i] = true;
+                        if (mask_only_logits) {
+                            b2.logits[i] = (current_block[i] == config_.mask_token_id);
+                        } else if (freeze_done_micro && done_micro_no_logits && frozen_micros[static_cast<size_t>(i / micro_size)]) {
+                            b2.logits[i] = false;
+                        } else {
+                            b2.logits[i] = true;
+                        }
+                        if (b2.logits[i]) {
+                            logits_true2++;
+                            last_logits_positions_.push_back(i);
+                        }
                     }
                     b2.n_tokens = config_.block_length;
-                    last_logits_count_ = config_.block_length;
+                    last_logits_count_ = logits_true2;
                     sampler_metrics_.llama_decode_calls++;
                     sampler_metrics_.llama_decode_tokens += b2.n_tokens;
                     if (llama_decode(ctx_, b2) != 0) {
@@ -649,13 +710,135 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
 
                     diffusion::ProfilerTimer total_timer;
                     double gpu_elapsed_ms = 0.0;
-                    if (allow_gpu_sampling && try_sample_with_gpu(
-                            n_vocab,
-                            need_entropy_probs,
-                            sampled_block,
-                            confidences_block,
-                            entropy_ptr_block,
-                            &gpu_elapsed_ms)) {
+                    if (allow_gpu_sampling) {
+                        // Prefer active-subset GPU sampling when entropy is not needed.
+                        const bool mask_only_logits = env_flag("DIFFUSION_MASK_ONLY_LOGITS");
+                        if (mask_only_logits && !need_entropy_probs && use_gpu_sampler_ && gpu_sampler_) {
+                            diffusion::ProfilerTimer gpu_timer_total;
+                            GpuSampler::Stats gpu_stats{};
+                            bool ok_gpu = false;
+
+                            std::vector<int> logits_override(active_count);
+                            for (int i = 0; i < active_count; ++i) logits_override[i] = active_positions[i];
+
+                            const bool device_logits_env_local = env_flag("LLAMA_ENABLE_DEVICE_LOGITS");
+                            const bool device_logits_async = env_flag("LLAMA_DEVICE_LOGITS_ASYNC");
+                            const bool skip_sync_after_output_ids = env_flag("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS");
+                            int64_t stride_tokens = 0;
+                            if (device_logits_env_local && !skip_sync_after_output_ids) {
+                                llama_synchronize(ctx_);
+                            }
+                            const float* logits_dev = llama_get_logits_device(ctx_, &stride_tokens);
+                            int out_count = 0;
+                            const int32_t* out_ids = llama_get_logits_output_ids(ctx_, &out_count);
+#if defined(DIFFUSION_ENABLE_CUDA)
+                            if (device_logits_env_local && !skip_sync_after_output_ids) {
+                                cudaDeviceSynchronize();
+                            } else if (device_logits_env_local && device_logits_async && skip_sync_after_output_ids) {
+                                // Skip-sync is an experimental perf knob; may degrade quality if logits are not ready.
+                            }
+#endif
+
+                            if (logits_dev && out_ids && out_count > 0 && stride_tokens >= n_vocab) {
+                                std::vector<llama_token> gpu_tokens_out;
+                                std::vector<float> gpu_confs_out;
+                                if (stride_tokens == n_vocab) {
+                                    ok_gpu = gpu_sampler_->sample_from_device_ptr(
+                                        logits_dev,
+                                        static_cast<size_t>(out_count) * static_cast<size_t>(n_vocab),
+                                        config_.remasking_strategy,
+                                        rng_,
+                                        gpu_tokens_out,
+                                        gpu_confs_out,
+                                        nullptr,
+                                        &gpu_stats,
+                                        /*force_non_fused=*/false
+                                    );
+                                } else {
+                                    ok_gpu = gpu_sampler_->sample_from_device_ptr_strided(
+                                        logits_dev,
+                                        stride_tokens,
+                                        out_count,
+                                        config_.remasking_strategy,
+                                        rng_,
+                                        gpu_tokens_out,
+                                        gpu_confs_out,
+                                        nullptr,
+                                        &gpu_stats,
+                                        /*force_non_fused=*/false
+                                    );
+                                }
+                                if (ok_gpu && static_cast<int>(gpu_tokens_out.size()) == out_count && static_cast<int>(gpu_confs_out.size()) == out_count) {
+                                    for (int i = 0; i < active_count; ++i) {
+                                        const int li = logits_override[i];
+                                        const int oi = (li >= 0 && li < config_.block_length) ? static_cast<int>(out_ids[li]) : -1;
+                                        if (oi < 0 || oi >= out_count) { ok_gpu = false; break; }
+                                        sampled_tokens_active[i] = gpu_tokens_out[oi];
+                                        confidences_active[i] = gpu_confs_out[oi];
+                                    }
+                                }
+                                if (ok_gpu) {
+                                    sampled = true;
+                                    DiffusionProfiler::instance().record_custom("sampler_gpu_subset_device_logits", 1.0);
+                                    DiffusionProfiler::instance().record_custom("sampler_gpu_subset_rows", static_cast<double>(out_count));
+                                    DiffusionProfiler::instance().record_custom("sampler_gpu_subset_active_rows", static_cast<double>(active_count));
+                                }
+                            }
+
+                            if (!sampled) {
+                                std::vector<float*> logits_ptrs;
+                                logits_ptrs.reserve(static_cast<size_t>(active_count));
+                                int out_count_host = 0;
+                                const int32_t* out_ids_host = llama_get_logits_output_ids(ctx_, &out_count_host);
+                                bool ok_host = (out_ids_host != nullptr);
+                                for (int i = 0; i < active_count; ++i) {
+                                    const int li = logits_override[i];
+                                    if (!ok_host || li < 0 || li >= config_.block_length || out_ids_host[li] < 0) {
+                                        ok_host = false;
+                                        break;
+                                    }
+                                    const float* lp = llama_get_logits_ith(ctx_, li);
+                                    if (!lp) { ok_host = false; break; }
+                                    logits_ptrs.push_back(const_cast<float*>(lp));
+                                }
+                                if (ok_host) {
+                                    std::vector<llama_token> gpu_tokens;
+                                    std::vector<float> gpu_confs;
+                                    ok_gpu = gpu_sampler_->sample_from_scatter_ptrs(
+                                        logits_ptrs,
+                                        n_vocab,
+                                        config_.remasking_strategy,
+                                        rng_,
+                                        gpu_tokens,
+                                        gpu_confs,
+                                        nullptr,
+                                        &gpu_stats
+                                    );
+                                    DiffusionProfiler::instance().record_custom("sampler_gpu_subset_device_logits", 0.0);
+                                    DiffusionProfiler::instance().record_custom("sampler_gpu_subset_rows", static_cast<double>(active_count));
+                                    DiffusionProfiler::instance().record_custom("sampler_gpu_subset_active_rows", static_cast<double>(active_count));
+                                    if (ok_gpu && static_cast<int>(gpu_tokens.size()) == active_count && static_cast<int>(gpu_confs.size()) == active_count) {
+                                        sampled_tokens_active = std::move(gpu_tokens);
+                                        confidences_active = std::move(gpu_confs);
+                                        sampled = true;
+                                    }
+                                }
+                            }
+
+                            DiffusionProfiler::instance().record_custom("sampler_gpu_subset_total_ms", gpu_timer_total.elapsed_ms());
+                        }
+
+                        // Prefill buffers with current_block so that positions without logits (e.g. frozen micro-blocks)
+                        // keep their current tokens and don't accidentally introduce token=0 garbage.
+                        sampled_block = current_block;
+                        std::fill(confidences_block.begin(), confidences_block.end(), -INFINITY);
+                        if (!sampled && try_sample_with_gpu(
+                                n_vocab,
+                                need_entropy_probs,
+                                sampled_block,
+                                confidences_block,
+                                entropy_ptr_block,
+                                &gpu_elapsed_ms)) {
                         DiffusionProfiler::instance().record_custom("sampler_gpu_total_ms", gpu_elapsed_ms);
                         double overhead = std::max(0.0, total_timer.elapsed_ms() - gpu_elapsed_ms);
                         DiffusionProfiler::instance().record_custom("sampler_gpu_overhead_ms", overhead);
@@ -672,7 +855,9 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                             }
                         }
                         sampled = true;
-                    } else {
+                        }
+                    }
+                    if (!sampled) {
                         if (gpu_only_mode) {
                             llama_batch_free(batch);
                             throw std::runtime_error("[DiffusionSampler] gpu_only_mode=true 但 GPU sampler 不可用或执行失败，已禁止回退到 host logits。");
@@ -748,6 +933,9 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
         {
             PROFILE_SECTION("update_block_tokens");
             std::fill(next_dirty.begin(), next_dirty.end(), 0);
+            // Optional safety for partial-KV under causal attention: propagate dirty to the suffix.
+            const bool partial_kv_dirty_suffix = env_flag("DIFFUSION_PARTIAL_KV_DIRTY_SUFFIX");
+            int min_dirty_micro = micro_count;
             for (size_t i = 0; i < transfer_indices.size(); ++i) {
                 if (!transfer_indices[i]) continue;
                 if (current_block[i] == config_.mask_token_id) {
@@ -756,10 +944,26 @@ void DiffusionSamplerProfiled::denoise_block_profiled(
                     current_block[i] = sampled_tokens_active[static_cast<size_t>(idx)];
                     remaining_masks--;
                     masks_per_micro[i / micro_size] = std::max(0, masks_per_micro[i / micro_size] - 1);
-                    next_dirty[i / micro_size] = 1;
+                    const int m = static_cast<int>(i / static_cast<size_t>(micro_size));
+                    next_dirty[static_cast<size_t>(m)] = 1;
+                    if (partial_kv_dirty_suffix) {
+                        min_dirty_micro = std::min(min_dirty_micro, m);
+                    }
+                }
+            }
+            if (partial_kv_dirty_suffix && min_dirty_micro < micro_count) {
+                for (int m = min_dirty_micro; m < micro_count; ++m) {
+                    next_dirty[static_cast<size_t>(m)] = 1;
                 }
             }
             dirty_micros.swap(next_dirty);
+
+            // Update frozen micros after mask updates (monotonic).
+            if (freeze_done_micro) {
+                for (int m = 0; m < micro_count; ++m) {
+                    if (masks_per_micro[m] == 0) frozen_micros[static_cast<size_t>(m)] = 1;
+                }
+            }
         }
     }
 }

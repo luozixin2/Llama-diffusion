@@ -930,6 +930,12 @@ def main():
     profiler = DiffusionProfiler(MODEL_PATH, n_ctx=8192, n_gpu_layers=35)
     
     # 定义测试配置（仅包含质量过关的配置）
+    # Allow tweaking strict GPU-only mode / device-logits async for debugging or CI stability.
+    GPU_ONLY = os.environ.get("TEST_PROFILING_GPU_ONLY", "1")
+    DEVICE_LOGITS_ASYNC = os.environ.get("TEST_PROFILING_DEVICE_LOGITS_ASYNC", "1")
+    DEBUG_DEVICE_LOGITS = os.environ.get("TEST_PROFILING_DEBUG_DEVICE_LOGITS", "").strip()
+    DEBUG_DEVICE_LOGITS = DEBUG_DEVICE_LOGITS if DEBUG_DEVICE_LOGITS not in ("", "0", "false", "False", "no", "No") else None
+
     test_configs = [
         # CPU 基线（关闭 GPU 相关环境）
         {
@@ -1012,10 +1018,10 @@ def main():
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
             'env_overrides': {
-                'DIFFUSION_GPU_ONLY': '1',
+                'DIFFUSION_GPU_ONLY': GPU_ONLY,
                 'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
             },
         },
         {
@@ -1027,10 +1033,10 @@ def main():
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
             'env_overrides': {
-                'DIFFUSION_GPU_ONLY': '1',
+                'DIFFUSION_GPU_ONLY': GPU_ONLY,
                 'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
             },
         },
         {
@@ -1042,10 +1048,10 @@ def main():
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
             'env_overrides': {
-                'DIFFUSION_GPU_ONLY': '1',
+                'DIFFUSION_GPU_ONLY': GPU_ONLY,
                 'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
             },
         },
         {
@@ -1057,10 +1063,10 @@ def main():
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
             'env_overrides': {
-                'DIFFUSION_GPU_ONLY': '1',
+                'DIFFUSION_GPU_ONLY': GPU_ONLY,
                 'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
             },
         },
         {
@@ -1072,10 +1078,10 @@ def main():
             'remasking_strategy': 'low_confidence_dynamic',
             'use_gpu_sampler': True,
             'env_overrides': {
-                'DIFFUSION_GPU_ONLY': '1',
+                'DIFFUSION_GPU_ONLY': GPU_ONLY,
                 'LLAMA_ENABLE_DEVICE_LOGITS': '1',
-                'LLAMA_DEVICE_LOGITS_ASYNC': '1',
-                'DIFFUSION_DEBUG_DEVICE_LOGITS': None,
+                'LLAMA_DEVICE_LOGITS_ASYNC': DEVICE_LOGITS_ASYNC,
+                'DIFFUSION_DEBUG_DEVICE_LOGITS': DEBUG_DEVICE_LOGITS,
             },
         },
     ]

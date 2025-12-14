@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -120,6 +121,37 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+        }
+    }
+
+    // env: LLAMA_GRAPH_CACHE_SIZE
+    // Keep multiple graphs keyed by n_outputs etc. This is important for workloads where n_outputs varies across calls.
+    // Default: 1 (legacy single-graph behavior). Multi-graph caching is experimental and requires explicit opt-in.
+    {
+        const char * LLAMA_GRAPH_CACHE_SIZE = getenv("LLAMA_GRAPH_CACHE_SIZE");
+        if (LLAMA_GRAPH_CACHE_SIZE && LLAMA_GRAPH_CACHE_SIZE[0] != '\0') {
+            const int v = atoi(LLAMA_GRAPH_CACHE_SIZE);
+            graph_cache_capacity = (size_t) (v > 0 ? v : 1);
+        } else {
+            graph_cache_capacity = 1;
+        }
+        if (graph_cache_capacity < 1) graph_cache_capacity = 1;
+        LLAMA_LOG_INFO("%s: graph cache size = %zu\n", __func__, graph_cache_capacity);
+
+        // NOTE: ggml-cuda currently maintains a single CUDA graph instance per CUDA backend context.
+        // When we allow multiple llama-level graphs (varying n_outputs, n_pos, etc), allocations can change across calls,
+        // and CUDA graph replay may become unsafe (observed SET_ROWS illegal memory access).
+        // Default to disabling CUDA graphs when LLAMA_GRAPH_CACHE_SIZE > 1, unless explicitly overridden.
+        const bool keep_cuda_graphs = ([]() {
+            const char * v = getenv("LLAMA_GRAPH_CACHE_KEEP_CUDA_GRAPHS");
+            return v && v[0] != '\0' && atoi(v) != 0;
+        })();
+        if (graph_cache_capacity > 1 && !keep_cuda_graphs) {
+            if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
+                setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+                LLAMA_LOG_WARN("%s: LLAMA_GRAPH_CACHE_SIZE=%zu -> setting GGML_CUDA_DISABLE_GRAPHS=1 for safety (set LLAMA_GRAPH_CACHE_KEEP_CUDA_GRAPHS=1 to override)\n",
+                               __func__, graph_cache_capacity);
+            }
         }
     }
 
@@ -794,33 +826,100 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
+    llm_graph_result * res = gf_res_prev.get();
+
+    const bool use_graph_cache = !graph_reuse_disable && graph_cache_capacity > 1;
+    graph_cache_key key = {
+        /*.gtype     =*/ gtype,
+        /*.n_tokens  =*/ (uint32_t) ubatch.n_tokens,
+        /*.n_seqs_unq=*/ (uint32_t) ubatch.n_seqs_unq,
+        /*.n_pos     =*/ (uint32_t) ubatch.n_pos,
+        /*.n_outputs =*/ (uint32_t) n_outputs,
+    };
+
+    if (use_graph_cache) {
+        auto it = graph_cache.find(key);
+        if (it == graph_cache.end()) {
+            graph_cache_lru.push_front(key);
+            graph_cache_entry entry;
+            entry.res.reset(new llm_graph_result(this->graph_max_nodes()));
+            entry.lru_it = graph_cache_lru.begin();
+            auto ins = graph_cache.emplace(key, std::move(entry));
+            it = ins.first;
+        } else {
+            // touch LRU
+            graph_cache_lru.splice(graph_cache_lru.begin(), graph_cache_lru, it->second.lru_it);
+            it->second.lru_it = graph_cache_lru.begin();
+        }
+
+        // evict LRU entries if needed
+        while (graph_cache.size() > graph_cache_capacity) {
+            const graph_cache_key k_evict = graph_cache_lru.back();
+            graph_cache_lru.pop_back();
+            graph_cache.erase(k_evict);
+        }
+
+        res = it->second.res.get();
+    }
+
+    auto * gf = res->get_gf();
 
     // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    // in order to correctly reuse a graph, its full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+    const bool same_key = graph_key_current_valid && (key == graph_key_current);
+    const bool can_reuse = !graph_reuse_disable && res->can_reuse(gparams);
 
+    if (can_reuse && same_key) {
         n_reused++;
     } else {
-        res->reset();
+        // If we are switching between cached graphs (different key), we still need to reset/allocate the scheduler
+        // for the target graph, but we can avoid rebuilding the graph topology if res already holds it.
+        const bool need_rebuild = !can_reuse;
+        if (need_rebuild) {
+            res->reset();
+            gf = res->get_gf();
+        }
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
+        if (need_rebuild || !gf) {
+            gf = model.build_graph(gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        } else if (use_graph_cache && !same_key) {
+            // Important: when switching to an existing cached graph after a scheduler reset, the ggml tensors may still
+            // carry stale buffer/data pointers from the previous allocation. This can lead to illegal memory accesses
+            // in CUDA ops (e.g. SET_ROWS/GET_ROWS). Clear them to force a clean (re)allocation/binding.
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                ggml_tensor * t = gf->nodes[i];
+                if (!t) continue;
+                // Never touch model parameters (weights) - their buffers point into the model's persistent memory.
+                if (t->flags & GGML_TENSOR_FLAG_PARAM) {
+                    continue;
+                }
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+            // For leafs, be more conservative: only clear INPUT tensors (e.g. token ids / pos / out_ids).
+            // Clearing other leafs may break backend inference for unused/persistent tensors and cause alloc failures.
+            for (int i = 0; i < gf->n_leafs; ++i) {
+                ggml_tensor * t = gf->leafs[i];
+                if (!t) continue;
+                if (t->flags & GGML_TENSOR_FLAG_PARAM) {
+                    continue;
+                }
+                if ((t->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
+                    continue;
+                }
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -828,6 +927,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        graph_key_current_valid = true;
+        graph_key_current = key;
     }
 
     // set the input data for the input tensors

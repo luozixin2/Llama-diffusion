@@ -9,6 +9,8 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <list>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -295,6 +297,52 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Graph cache: keep multiple graphs keyed by (gtype, n_tokens, n_seqs_unq, n_outputs) to avoid rebuilds when
+    // n_outputs changes (e.g. diffusion micro-freeze scheduling).
+    // Capacity can be controlled via env: LLAMA_GRAPH_CACHE_SIZE (default: 16). Set to 1 to keep legacy behavior.
+    struct graph_cache_key {
+        llm_graph_type gtype;
+        uint32_t n_tokens;
+        uint32_t n_seqs_unq;
+        uint32_t n_pos;
+        uint32_t n_outputs;
+
+        bool operator==(const graph_cache_key & other) const noexcept {
+            return gtype == other.gtype &&
+                   n_tokens == other.n_tokens &&
+                   n_seqs_unq == other.n_seqs_unq &&
+                   n_pos == other.n_pos &&
+                   n_outputs == other.n_outputs;
+        }
+    };
+
+    struct graph_cache_key_hash {
+        size_t operator()(const graph_cache_key & k) const noexcept {
+            // simple hash combine
+            size_t h = 1469598103934665603ull;
+            auto mix = [&](uint64_t v) {
+                h ^= (size_t) v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            };
+            mix((uint64_t) k.gtype);
+            mix((uint64_t) k.n_tokens);
+            mix((uint64_t) k.n_seqs_unq);
+            mix((uint64_t) k.n_pos);
+            mix((uint64_t) k.n_outputs);
+            return h;
+        }
+    };
+
+    struct graph_cache_entry {
+        llm_graph_result_ptr res;
+        std::list<graph_cache_key>::iterator lru_it;
+    };
+
+    size_t graph_cache_capacity = 1; // 1 = legacy single-graph behavior
+    bool graph_key_current_valid = false;
+    graph_cache_key graph_key_current = { LLM_GRAPH_TYPE_DEFAULT, 0, 0, 0, 0 };
+    std::unordered_map<graph_cache_key, graph_cache_entry, graph_cache_key_hash> graph_cache;
+    std::list<graph_cache_key> graph_cache_lru;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

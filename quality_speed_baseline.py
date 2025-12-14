@@ -187,10 +187,12 @@ def main():
     # GPU sampler optimizations: device logits for faster GPU sampling
     if args.use_gpu_sampler:
         os.environ.setdefault("LLAMA_ENABLE_DEVICE_LOGITS", "1")
-        os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "1")
+        # Default to sync mode for quality stability; profiling scripts can override to "1".
+        os.environ.setdefault("LLAMA_DEVICE_LOGITS_ASYNC", "0")
     
     # Skip synchronization after get_output_ids to reduce host overhead
-    os.environ.setdefault("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS", "1")
+    # NOTE: Setting this to "1" can improve perf but may degrade quality when device logits are async.
+    os.environ.setdefault("DIFFUSION_SKIP_SYNC_AFTER_OUTPUT_IDS", "0")
     
     if args.seed >= 0:
         os.environ["DIFFUSION_SEED"] = str(args.seed)

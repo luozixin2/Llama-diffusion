@@ -119,6 +119,14 @@ public:
     bool use_gpu_sampler_ = false;
     SamplerTelemetry sampler_metrics_;
     int last_logits_count_ = 0;
+    // For the last llama_decode call, record which block positions had logits requested (batch.logits[i] == true).
+    // This allows GPU sampling to work even when n_outputs < block_length (e.g. frozen micro-blocks).
+    std::vector<int> last_logits_positions_;
+    // The diffusion "mask token" may come from tokenizer specials and can be out-of-vocab for the gguf model.
+    // We keep config_.mask_token_id as the logical marker, but map it to an in-vocab placeholder when feeding llama.cpp.
+    llama_token mask_token_id_for_model_ = 0;
+    int vocab_size_ = 0;
+    llama_token oov_token_fallback_id_ = 0;
     // Reusable buffers for full-block GPU sampling in micro-block path
     std::vector<llama_token> gpu_sampled_block_buffer_;
     std::vector<float> gpu_conf_block_buffer_;
@@ -129,6 +137,10 @@ public:
 #endif
 
     int get_vocab_size();
+    llama_token sanitize_token_for_model(llama_token t) const {
+        if (t < 0 || t >= vocab_size_) return oov_token_fallback_id_;
+        return t;
+    }
 
     void denoise_block(
         std::vector<llama_token>& current_block,
